@@ -19,17 +19,22 @@ map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
 
 - `-r` — exact region codes, comma-separated (`N6E1` ≠ `N6E10`); omit = all 411 regions
 - `-l` — levels: L0 = whole-region outline, L1–L3 increasing detail (default `123`)
-- Output: `OUT_DIR/<REGION>_L<level>.osm` — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*`.
+- Output: `OUT_DIR/<REGION>_L<level>.osm` — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*` and decoded annotation payloads (`tm:surface`, `tm:elev`, `tm:water_class/type`, `tm:netclass`, `tm:xfree`, `tm:roadinfo`, `tm:city_display/size/admin/overlap` — see `TravelMap_format/MAP_IDX_format.md` §8).
 - N6E2 L2 ≈ 560 MB in ~6 s. A full-world conversion is multi-GB — convert per region and/or gzip.
 
 ## 3. Road names from RNW (optional)
 
 ```bash
-rnw_extract_rs <CCP_dir> RNW.jsonl            # ~45 s for all 8,257 files
+rnw_extract_rs <CCP_dir> RNW.jsonl [-b W,S,E,N|none]   # ~70 s for all 8,257 files (whole EUR)
 rnw_join_rs    RNW.jsonl /tmp/pl/N6E2_L2.osm /tmp/pl/N6E2_L2_rnw.osm   # ~10 s
 ```
 
-Adds `name`/`name:alt` and `rn_class/rn_netclass/rn_link/rn_sec` to road ways (`tm:layer="road"`); all other elements pass through unchanged. Note: the extractor's cluster filter is currently tuned to the N6E2 area (~12–37°E, 46.5–57.5°N).
+Adds `name`/`name:alt` and `rn_class/rn_netclass/rn_link/rn_sec` to road ways (`tm:layer="road"`); all other elements pass through unchanged.
+
+- `-b W,S,E,N` — geographic sanity filter (degrees) for the cluster scan. Default
+  `-30,30,60,75` covers the whole EUR dataset (Iceland..Turkey). Use a tighter box to
+  speed up a single-area conversion; `none` disables it (diagnostics only — see
+  `TravelMap_format/RNW_format.md` §9 for why the filter matters).
 
 ## 4. Verify / load
 

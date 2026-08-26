@@ -10,7 +10,10 @@
 //   - every object carries id + version="1" + timestamp (dataset date), as in
 //     regular OSM data exports.
 //   - tags: `name`, `name:alt` ('; ' separated), `ref` (standard OSM keys) and
-//     `tm:kind/tm:layer/tm:tile/tm:profile/tm:state/tm:feature/tm:type`.
+//     `tm:kind/tm:layer/tm:tile/tm:profile/tm:state/tm:feature/tm:type`, plus the
+//     decoded annotation payloads (see MAP_IDX_format.md §8):
+//     `tm:surface`, `tm:elev`, `tm:water_class`/`tm:water_type`,
+//     `tm:netclass`/`tm:xfree`/`tm:roadinfo`, `tm:city_display/size/admin/overlap`.
 //
 // The binary format is identical to the Python converter's docstring; see
 // map2osm.py in the parent directory for the full reverse-engineering notes.
@@ -292,16 +295,69 @@ fn set_cat(c: &mut Cats, t: u8) {
     }
 }
 
-fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<String>, Cats) {
+// Decode the payload of a single annotation into OSM tags. Only types whose
+// on-disk layout is verified are emitted; raw values are preserved so a future
+// OSM->TravelMap writer can reconstruct the bytes exactly (see MAP_IDX_format.md §8).
+fn ann_tags(blk: &[u8], pos: usize, size: usize, typ: u8) -> Vec<Tag> {
+    let mut out = Vec::new();
+    let p = pos + 2; // payload starts after {u8 size, u8 type}
+    macro_rules! tag {
+        ($k:expr, $v:expr) => {
+            out.push(Tag { k: $k.to_string(), v: $v });
+        };
+    }
+    match typ {
+        // road surface cover: payload = u16 (enConvertSurface maps it to an internal enum)
+        0x01 if size >= 4 && p + 2 <= blk.len() => {
+            tag!("tm:surface", u16le(blk, p).to_string());
+        }
+        // elevation: payload = s8 (relative elevation, pass-through)
+        0x03 if size >= 3 && p + 1 <= blk.len() => {
+            tag!("tm:elev", (blk[p] as i8).to_string());
+        }
+        // water: payload = u16; low nibble = class code, high nibble = type code
+        0x10 if size >= 4 && p + 2 <= blk.len() => {
+            let v = u16le(blk, p);
+            tag!("tm:water_class", (v & 0xF).to_string());
+            tag!("tm:water_type", ((v >> 4) & 0xF).to_string());
+        }
+        // road info: payload = {u16, u32}
+        //   u16 bits 0-2 = network class; bit 10 -> flag byte bit0;
+        //   bit 3 / bit 11 -> inverted flags; u32 bits 0-3 -> flags;
+        //   "intersection-free" (userdef road class) = u32 bit 10.
+        0x11 if size >= 8 && p + 6 <= blk.len() => {
+            let w = u16le(blk, p);
+            let d = u32le(blk, p + 2);
+            tag!("tm:netclass", (w & 7).to_string());
+            tag!("tm:xfree", ((d >> 10) & 1).to_string());
+            tag!("tm:roadinfo", format!("{:04x}:{:08x}", w, d));
+        }
+        // city type: payload = u16
+        //   bits 0-3 display level (1..14), bits 4-7 size class (inverted scale),
+        //   bits 8-10 admin level (0..14 -> 1..15), bit 15 name-overlapping flag.
+        0x21 if size >= 4 && p + 2 <= blk.len() => {
+            let v = u16le(blk, p);
+            tag!("tm:city_display", (v & 0xF).to_string());
+            tag!("tm:city_size", ((v >> 4) & 0xF).to_string());
+            tag!("tm:city_admin", ((v >> 8) & 7).to_string());
+            tag!("tm:city_overlap", ((v >> 15) & 1).to_string());
+        }
+        _ => {}
+    }
+    out
+}
+
+fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<String>, Cats, Vec<Tag>) {
     let start = (desc & 0xFFFF) as usize;
     let count = ((desc >> 16) & 0xFFFF) as usize;
     if count == 0 || count > 32 {
-        return (None, None, Cats::default());
+        return (None, None, Cats::default(), Vec::new());
     }
     let mut pos = start * 4;
     let mut names = None;
     let mut ref_ = None;
     let mut cats = Cats::default();
+    let mut tags = Vec::new();
     for _ in 0..count {
         if pos + 2 > blk.len() {
             break;
@@ -312,6 +368,7 @@ fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<Stri
             break;
         }
         set_cat(&mut cats, typ);
+        tags.extend(ann_tags(blk, pos, size, typ));
         if (typ == 0x7A || typ == 0x14) && pos + 4 <= blk.len() {
             let v = u16le(blk, pos + 2) as usize;
             if let Some(rec) = read_text_record(blk, v * 4) {
@@ -324,7 +381,7 @@ fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<Stri
         }
         pos += size;
     }
-    (names, ref_, cats)
+    (names, ref_, cats, tags)
 }
 
 fn layer_name(kind: &str, c: &Cats) -> String {
@@ -515,7 +572,7 @@ fn parse_block(
             let w4 = u16le(blk, p + 6);
             let t0 = u16le(blk, p + 8) as u32;
             let t1 = u16le(blk, p + 10) as u32;
-            let (names, ref_, cats) = parse_annotations(blk, (t1 << 16) | t0);
+            let (names, ref_, cats, ann) = parse_annotations(blk, (t1 << 16) | t0);
             if li < 2 {
                 let pidx = w3 as usize;
                 let cnt2 = w4 as usize;
@@ -530,7 +587,8 @@ fn parse_block(
                 }
                 if !pts.is_empty() {
                     let kind = if li == 0 { "polygon" } else { "line" };
-                    let tags = make_tags(kind, state, feat, k, rp, &names, &ref_, &cats);
+                    let mut tags = make_tags(kind, state, feat, k, rp, &names, &ref_, &cats);
+                    tags.extend(ann);
                     feats.push(Feature::Way { pts, tags });
                 }
             } else {
@@ -542,7 +600,8 @@ fn parse_block(
                 if dlon == 0 && dlat == 0 {
                     continue;
                 }
-                let tags = make_tags("poi", state, feat, k, rp, &names, &ref_, &cats);
+                let mut tags = make_tags("poi", state, feat, k, rp, &names, &ref_, &cats);
+                tags.extend(ann);
                 feats.push(Feature::Poi { lon: cx + (dlon << sh), lat: cy + (dlat << sh), tags });
             }
         }

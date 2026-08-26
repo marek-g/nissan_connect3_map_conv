@@ -412,25 +412,71 @@ packed sequence, each `{u8 size, u8 type, payload[size-2]}` (`size` counts itsel
 
 Dispatch: `dap_map_tclAnnotationConverter::u16WriteAttrib` @ `0x00920744`.
 
-| type | converter (Ghidra name) | payload / meaning |
-|------|-------------------------|-------------------|
-| 0x01 | `u16ConvertSurface` | road surface class |
-| 0x03 | elevation | numeric |
-| 0x04 | `u16ConvertDCMInfo` | DCM (3D/city model) info — very common on polygons |
-| 0x10 | `u16ConvertWater` | `{u16}` → water class + water type (`u8ConvertWaterClass`/`Type` @0x0091cefc/d110) |
-| 0x11 | road info | `{u16, u32}`; u16 bits 0–2 = network class, bit 10 = intersection-free (`u16ConvertRoadClass` @0x0092015c) |
-| 0x14 | road number | `{u16 v}` → **text record** at `v*4` (block-relative), bare digits |
-| 0x21 | city type | population/type code (not text) — marks city/village name POIs |
-| 0x22 | rest area | |
-| 0x23 | parking | |
-| 0x30 | fuel / gas station | |
-| 0x31–0x33, 0x42–0x46, 0x49 | `u16ConvertListOfAnnotation` | nested annotation list |
-| 0x34 | restaurant | |
-| 0x35 | brand chain | |
-| 0x41, 0x47, 0x48 | specification | |
-| 0x51 | POI image id | |
-| 0x52 | POI landmarks | |
-| 0x7A | `u16ConvertName` @0x0091f384 | `{u16 v}` → **text record** at `v*4` (block-relative) |
+On-disk payload layouts (verified against N6E1 L2 data + Ghidra; `size` = header byte,
+payload = `size - 2` bytes):
+
+| type | size | payload | meaning / converter |
+|------|------|---------|---------------------|
+| 0x01 | 4 | `u16` | road surface cover → `enConvertSurface` @0x0091cd84 (table below) |
+| 0x03 | 3 | `s8` | relative elevation, signed byte pass-through (`u16ConvertElevation` @0x0091fd40) |
+| 0x04 | 8 | `{u16, u8, u8, u8, u8}` | DCM (3D/city model) info — `dap_map_tclDCMAnnotation::bReadWithOutBase` @0x008d9784; first two values are written ×10, 3rd byte = class → `u8ConvertDCMClass` @0x0091cf8c (`0x00`→1, `0x20..0x32`→2..20), last 2 bytes unused by the converter |
+| 0x10 | 4 | `u16` | water: low nibble = class code, high nibble = type code (`u8ConvertWaterClass`/`Type` @0x0091cefc/d110; tables below) |
+| 0x11 | 8 | `{u16, u32}` | road info — bit layout below (`u16ReadRoadInfo` @0x009200e8 does `bCheck(6)` + readU16 + readU32) |
+| 0x14 | 8 | `{u16 textRef, u16 mid, u16 status}` | road number: `textRef*4` = **text record** offset (bare digits); `status` bits 4–5 mode / bit 6 → `u8RoadStatus2Status` @0x0091d3d8; `mid` + `status&0xF` feed the name-prefix interning (`u32SkipPrefixOffset`) — shared name prefixes are stored once |
+| 0x21 | 4 | `u16` | city type — bit layout below (marks city/village name POIs) |
+| 0x22 | 4 | `u16` | rest area → u8 pass-through |
+| 0x23 | ? | ? | parking (category flag only in the converter) |
+| 0x30 | ? | ? | fuel / gas station (category flag only) |
+| 0x31–0x33, 0x42–0x46, 0x49 | 4 each | `u16` per element | "list" = a **run of consecutive same-type annotations** in the stream (`u16ConvertListOfAnnotation` @0x0091f8b0 pops following same-type entries and writes a count u8 first); each element converts via `u8ConvertMap2FastMap(u16, type)` |
+| 0x34 | ? | ? | restaurant (category flag only) |
+| 0x35 | ? | ? | brand chain (category flag only) |
+| 0x41, 0x47, 0x48 | 4 | `u16` | specification → `u8ConvertMap2FastMap(u16, type)` @0x0091f830 |
+| 0x51 | ? | ? | POI image id |
+| 0x52 | ? | ? | POI landmarks |
+| 0x7A | 4 | `u16 v` | name — **text record** at `v*4` (block-relative), multi-language |
+
+#### Road info (0x11) bit layout
+
+Payload `{u16 w, u32 d}` (on-disk order: u16 first). Verified from the call
+conventions of both consumers (`u8RoadInfo2Flags(u32,u16)` @0x0091d398 and
+`u16ConvertRoadClass(u16,u32)` @0x0092015c, checked at assembly level):
+
+| field | source | use |
+|-------|--------|-----|
+| network class | `w & 7` (bits 0–2) | `u8GetUserDefRoadClass` |
+| intersection-free | `d >> 10 & 1` (**u32** bit 10) | `u8GetUserDefRoadClass` (traced as "intersection free") |
+| flag byte bit 0 | `w >> 10 & 1` (**u16** bit 10) | output flags |
+| flag byte bit 1 | `(w & 0x800) == 0` (inverted u16 bit 11) | output flags |
+| flag byte bit 2 | `(w & 8) == 0` (inverted u16 bit 3) | output flags |
+| flag byte bits 3/4/5/6 | `d & 1 / 2 / 8 / 4` (u32 bits 0/1/3/2) | output flags |
+
+Note the two distinct "bit 10"s: u16 bit 10 feeds the flag byte, u32 bit 10 is the
+intersection-free flag.
+
+#### City type (0x21) bit layout
+
+Payload `u16 v`, split by `u8ConvertCityType2{DisplayLvl,Inhabitants,AdminLvl,NameOverlapping}` @0x0091d4c4/d3fc/d588/d670:
+
+| bits | field | values |
+|------|-------|--------|
+| 0–3 | display level | 1..14 (0 = none) |
+| 4–7 | size class (inverted scale) | `0x1` = largest … `0xC` = smallest (→ internal 12..1); other values → 0 |
+| 8–10 | admin level | 0..14 → internal 1..15; other → 0 |
+| 15 | name-overlapping flag | set → 1, clear → 2 |
+
+#### Water (0x10) value tables
+
+class = `u16 & 0xF`: `0..5` → internal 2..7, `0xF` → 1, else 0.
+type = `(u16 >> 4) & 0xF`: `0,1,2,3,4,6` → internal 1..6 (in that order), else 0.
+
+#### Surface (0x01) value table
+
+`enConvertSurface(u16)` maps raw → internal enum:
+`0x11`→1, `0x10`→0xF, `0x20`→0xB, `0x21`→0xC, `0x22`→0xD, `0x30`→0x17, `0x31`→0x15,
+`0x32`→0x16, `0x33`→0x18, `0x40`→0x20, `0x41`→0x1F, `0x42`→0x21, `0x43`→0x22,
+`0x50`→0x2A, `0x51`→0x29, `0x52`→0x2B, `0x53`→0x2C, `0x54`→0x2D, `0x60`→0xE,
+`0x61`→0x33, `0x62`→0x34, `0x63`→0x35, `0x64`→0x36; else 0.
+Observed raw values in N6E1 L2: 82–100 (0x52–0x64) dominate.
 
 Key facts (all verified on data):
 
@@ -438,6 +484,11 @@ Key facts (all verified on data):
   offsets — `u32CalcPos(v) = v << 2` @ `0x008d5654`.
 - The MAP header field `u16@2 = 52` is only an info-string table (copyright etc.),
   **not** a global text-section table.
+- The converter emits the decoded payloads as OSM tags: `tm:surface` (0x01 raw u16),
+  `tm:elev` (0x03 s8), `tm:water_class`/`tm:water_type` (0x10 nibbles),
+  `tm:netclass`/`tm:xfree`/`tm:roadinfo` (0x11; `tm:roadinfo` = raw `u16:u32` hex for
+  round-trip fidelity), `tm:city_display/size/admin/overlap` (0x21). Raw values are
+  preserved so an OSM→TravelMap writer can reconstruct the exact bytes.
 
 ### Text record grammar
 
@@ -477,7 +528,9 @@ are deduplicated into single `<node>` elements written before the ways; every ob
 carries `id` + `version="1"` + `timestamp` (dataset date) so JOSM/osmium accept the file.
 Tags: `name`, `name:alt` (`'; '`-separated variants), `ref`, plus the original
 converter properties under a custom namespace: `tm:kind/tm:layer/tm:tile/tm:profile/
-tm:state/tm:feature/tm:type`.
+tm:state/tm:feature/tm:type`, and decoded annotation payloads (see §8):
+`tm:surface`, `tm:elev`, `tm:water_class`, `tm:water_type`, `tm:netclass`, `tm:xfree`,
+`tm:roadinfo`, `tm:city_display`, `tm:city_size`, `tm:city_admin`, `tm:city_overlap`.
 
 Example (Poland):
 

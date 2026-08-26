@@ -3,7 +3,7 @@
 // Python version; formatting uses native Rust conventions (plain float
 // display, raw UTF-8 in strings instead of \uXXXX escapes).
 //
-// Usage: rnw_extract_rs <CCP_DIR> <out.jsonl>
+// Usage: rnw_extract_rs <CCP_DIR> <out.jsonl> [-b W,S,E,N|none]
 //
 // Format notes: see rnw_extract.py in the parent directory.
 
@@ -13,6 +13,41 @@ use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+
+// Geographic sanity filter for the 16KB-aligned cluster scan. The scan is a
+// heuristic (the runtime locates clusters via the CCP container index), so a
+// plausible reference position helps reject false positives in padding.
+// Default covers the whole EUR dataset (Iceland..Turkey, Morocco..N. Scandinavia).
+struct BBox {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+impl BBox {
+    fn contains(&self, lon_pau: f64, lat_pau: f64) -> bool {
+        self.west * PAU < lon_pau
+            && lon_pau < self.east * PAU
+            && self.south * PAU < lat_pau
+            && lat_pau < self.north * PAU
+    }
+
+    fn parse(spec: &str) -> Option<BBox> {
+        if spec.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let mut it = spec.split(',');
+        let west: f64 = it.next()?.parse().ok()?;
+        let south: f64 = it.next()?.parse().ok()?;
+        let east: f64 = it.next()?.parse().ok()?;
+        let north: f64 = it.next()?.parse().ok()?;
+        if it.next().is_some() || !(west < east && south < north) {
+            return None;
+        }
+        Some(BBox { west, south, east, north })
+    }
+}
 
 const PAU: f64 = (1i64 << 31) as f64 / 180.0;
 const BLOCK: usize = 0x4000;
@@ -133,7 +168,7 @@ struct Road {
     sec: u32,
 }
 
-fn parse_cluster(d: &[u8], S: usize, end: usize) -> Option<Vec<Road>> {
+fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<Vec<Road>> {
     let cd = &d[S..end];
     let A = u16le(cd, 0);
     let B = u16le(cd, 2);
@@ -149,11 +184,10 @@ fn parse_cluster(d: &[u8], S: usize, end: usize) -> Option<Vec<Road>> {
     if lf & 0x30 == 0 {
         return None;
     }
-    // N6E2 region 18..36 E / 47.25..56.7 N plus margin
-    let lonf = lon as f64;
-    let latf = lat as f64;
-    if !(17.0 * PAU < lonf && lonf < 37.0 * PAU && 46.5 * PAU < latf && latf < 57.5 * PAU) {
-        return None;
+    if let Some(bb) = bbox {
+        if !bb.contains(lon as f64, lat as f64) {
+            return None;
+        }
     }
     if !(shift >= 0 && shift <= 12) || ooff >= cd.len() || ocnt > 0x4000 {
         return None;
@@ -366,7 +400,7 @@ fn parse_cluster(d: &[u8], S: usize, end: usize) -> Option<Vec<Road>> {
     Some(roads)
 }
 
-fn find_clusters(d: &[u8]) -> Vec<usize> {
+fn find_clusters(d: &[u8], bbox: &Option<BBox>) -> Vec<usize> {
     let mut starts = Vec::new();
     let n = d.len();
     let stop = n.saturating_sub(0x20);
@@ -377,7 +411,7 @@ fn find_clusters(d: &[u8]) -> Vec<usize> {
         if A != 0 && B != 0 {
             let lon = i32le(d, S + 8) as f64;
             let lat = i32le(d, S + 12) as f64;
-            if 12.0 * PAU < lon && lon < 27.0 * PAU && 47.0 * PAU < lat && lat < 56.0 * PAU {
+            if bbox.as_ref().map_or(true, |bb| bb.contains(lon, lat)) {
                 let lf = u16le(d, S + 0x16);
                 if lf & 0x30 != 0 && lf & !0x7FF == 0 {
                     let ooff = u16le(d, S + 0x12) as usize;
@@ -394,7 +428,7 @@ fn find_clusters(d: &[u8]) -> Vec<usize> {
     starts
 }
 
-fn extract_file(path: &Path) -> Vec<Road> {
+fn extract_file(path: &Path, bbox: &Option<BBox>) -> Vec<Road> {
     let d = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -402,11 +436,11 @@ fn extract_file(path: &Path) -> Vec<Road> {
             return Vec::new();
         }
     };
-    let starts = find_clusters(&d);
+    let starts = find_clusters(&d, bbox);
     let mut out = Vec::new();
     for (i, &S) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(d.len());
-        if let Some(c) = parse_cluster(&d, S, end) {
+        if let Some(c) = parse_cluster(&d, S, end, bbox) {
             out.extend(c);
         }
     }
@@ -473,12 +507,48 @@ fn write_line(fh: &mut impl Write, f_field: &str, r: &Road) -> io::Result<()> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let base = args.get(1).cloned().unwrap_or_else(|| {
+    let mut bbox_spec = "-30,30,60,75".to_string(); // whole EUR dataset
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-b" && i + 1 < args.len() {
+            bbox_spec = args[i + 1].clone();
+            i += 2;
+        } else if let Some(spec) = args[i].strip_prefix("-b=") {
+            bbox_spec = spec.to_string();
+            i += 1;
+        } else {
+            positional.push(args[i].clone());
+            i += 1;
+        }
+    }
+    let base = positional.get(0).cloned().unwrap_or_else(|| {
         "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/"
             .to_string()
             + "CRYPTNAV/DATA/DATA/RNW/CCP"
     });
-    let outp = args.get(2).cloned().unwrap_or_else(|| "/tmp/opencode/rnw_roads.jsonl".to_string());
+    let outp = positional
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/opencode/rnw_roads.jsonl".to_string());
+    let bbox = match BBox::parse(&bbox_spec) {
+        Some(b) => Some(b),
+        None if bbox_spec.eq_ignore_ascii_case("none") => None,
+        None => {
+            eprintln!(
+                "invalid -b '{}' (expected W,S,E,N in degrees or 'none')",
+                bbox_spec
+            );
+            exit(1);
+        }
+    };
+    eprintln!(
+        "bbox: {}",
+        match &bbox {
+            Some(b) => format!("{},{},{},{}", b.west, b.south, b.east, b.north),
+            None => "none".to_string(),
+        }
+    );
 
     let base_path = PathBuf::from(&base);
     let entries = match fs::read_dir(&base_path) {
@@ -529,7 +599,7 @@ fn main() {
     let mut fh = BufWriter::new(file);
     let (mut total, mut named, mut geom) = (0u64, 0u64, 0u64);
     for (dd, fn_) in &files {
-        let roads = extract_file(&dd.join(fn_));
+        let roads = extract_file(&dd.join(fn_), &bbox);
         let f_field = format!(
             "{}/{}",
             dd.file_name().unwrap().to_string_lossy(),

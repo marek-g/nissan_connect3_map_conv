@@ -29,9 +29,9 @@ Region folders overlapping N6E2: `POL`, `CHS` (AT/CZ/SK), `EEU` (HU/UA/BY…),
 
 | off | size | field | notes |
 |-----|------|-------|-------|
-| 0x00 | u16 | A | cluster ID (unique within dataset) |
+| 0x00 | u16 | A | cluster ID. **Not unique per file** — 702/8257 files contain duplicates (checked on the EUR dataset); do not use as a key without the file id |
 | 0x02 | u16 | flags | bit 0x40 → coordType 4 (rel24), else 3 (rel16) |
-| 0x04 | u32 | C | global sequence number (~unique, increasing) |
+| 0x04 | u32 | C | sequence number. **Not monotonic within a file** (only ~3111/8257 files are strictly increasing); do not use for ordering/validation |
 | 0x08 | s32 | refLon | PAU = deg·2³¹/180 |
 | 0x0C | s32 | refLat | |
 | 0x10 | s8 | shift | delta scale (0–12 observed) |
@@ -63,6 +63,40 @@ Starts at `S + ooff + ptsize·ocnt`. Strict bit order 0–10 of `listFlags`:
 
 `ListDesc = {u16 listOffset, u16 count}`: jump to `listOffset`, read `count`
 elements sequentially, restore stream position. (`rnw_tclListDesc<T>::bRead`.)
+
+### 3a. ClusterInfo (bits 2/3) — adjacency / external refs (partially decoded)
+
+`nav_tclClusterInfo` describes a **neighbouring cluster**. In-memory layout (from the
+constructor @0x00890fe0):
+
+```
++0x00  rnw_tclClusterIDInternal   {u16 fileId, file offset, u16 size}
++0x0c  rnw_tclCoordInfo           (coordType + ref position)
++0x1c  rnw_tclOutline             (variable-length point list — cluster boundary)
++0x30  u16 status
+```
+
+On-disk element layout is **not fully decoded** (the variable-length outline makes the
+elements non-fixed-size). Verified by data inspection of the EUR dataset:
+
+- Each element embeds a **fileId** in the high 16 bits of a u32 (e.g. `55 4e`=20053,
+  `fb 4e`=20219, `15 4f`=20245) with a low-16 offset/index — i.e. it names the
+  neighbouring NAV file + position.
+- Two trailing u32s in several elements decode as plausible PAU coordinates
+  (`value * 180 / 2^31` degrees), consistent with a neighbour's reference position.
+- Elements are variable-length (the outline), so `count` elements do **not** occupy a
+  fixed `count × N` span; the reader must consume them structurally.
+
+This is what resolves **external DirectCellRef refs (bit 15)**: a zerocell in cluster A
+whose road continues into a neighbour refers to that neighbour's onecell index, and the
+ClusterInfo list identifies which file/cluster that is. Consequence of leaving it
+undecoded: rel8 roads whose FROM node lives in the neighbouring cluster are emitted as
+single-point (the local TO node only) and are excluded from the distance-based join
+index (`pts.len() >= 2`). ~571k of the 22.3M extracted EUR roads are single-point.
+
+> The runtime locates clusters via the CCP container index, **not** by scanning. The
+> extractor's 16KB-aligned scan is a heuristic; the reference lon/lat in the header
+> therefore doubles as a validation signal (see §9).
 
 ## 4. Position list (bit 8) — node positions
 
@@ -163,9 +197,17 @@ Other annotation types appear in onecell lists (e.g. 0x17) — not yet mapped.
 ## 9. Extraction + join pipeline
 
 ```
-rnw_extract_rs [CCP_DIR] [OUT.jsonl]        # all N6E2 region folders; ~45 s for 8,257 files (I/O bound)
+rnw_extract_rs [CCP_DIR] [OUT.jsonl] [-b W,S,E,N|none]
 rnw_join_rs    RNW.jsonl MAP_L2.osm OUT.osm # OSM XML in and out; ~10 s for N6E2 L2
 ```
+
+`-b` sets the geographic sanity filter (degrees) for the 16KB-aligned cluster scan.
+Default `-30,30,60,75` covers the whole EUR dataset (Iceland..Turkey, Morocco..N.
+Scandinavia). The old hardcoded N6E2 box silently dropped ~88% of clusters (141k of
+161k); with the default box the full dataset yields **22.3M roads** (~71 s, I/O bound)
+vs 1.83M before. `none` disables the filter and is for diagnostics only — without it,
+padding/continuation blocks that pass the structural checks are accepted and emit
+garbage multi-kilobyte shape lists (the ref lon/lat is what normally rejects them).
 
 Zero-dependency Rust (std only); build with `cargo build --release` in each
 project directory (binaries land in the shared cargo target dir
@@ -201,10 +243,13 @@ Caveats:
   the same cluster (rare); the extractor therefore usually emits
   `shapePts + [toNode]`. The join is distance-based, so the missing start
   node does not affect matching.
-- External refs (bit 15) / ClusterInfo adjacency not resolved — only needed
-  for cross-cluster FROM-node assignment.
-- Roads with a single shape point and no local TO node have no geometry
-  (267k of 682k in POL; excluded from the join index).
+- External refs (bit 15) / ClusterInfo adjacency not fully resolved (§3a) — only
+  needed for cross-cluster FROM-node assignment.
+- Roads whose only local point is the TO node are emitted single-point and are
+  excluded from the join index (`pts.len() >= 2`). On the full EUR dataset this is
+  ~571k of 22.3M roads (POL alone: ~681k extracted, most multi-point).
+- Cluster IDs (A) are not unique per file and sequence numbers (C) are not
+  monotonic within a file — neither is safe as a key/ordering signal.
 
 ## 10. Dead ends (for the record)
 
