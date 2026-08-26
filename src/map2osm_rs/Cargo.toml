@@ -1,0 +1,11 @@
+[package]
+name = "map2osm"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "map2osm_rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

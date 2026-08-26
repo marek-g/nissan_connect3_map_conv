@@ -1,0 +1,11 @@
+[package]
+name = "rnw_join"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rnw_join_rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
