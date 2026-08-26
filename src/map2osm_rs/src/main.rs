@@ -15,6 +15,7 @@
 // The binary format is identical to the Python converter's docstring; see
 // map2osm.py in the parent directory for the full reverse-engineering notes.
 
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -49,18 +50,61 @@ fn pau_to_deg(v: i64) -> f64 {
     (v as f64) * 180.0 / (1i64 << 31) as f64
 }
 
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
+#[derive(Serialize, Clone)]
+struct Tag {
+    #[serde(rename = "@k")]
+    k: String,
+    #[serde(rename = "@v")]
+    v: String,
+}
+
+#[derive(Serialize)]
+struct Node {
+    #[serde(rename = "@id")]
+    id: i64,
+    #[serde(rename = "@version")]
+    version: String,
+    #[serde(rename = "@timestamp")]
+    timestamp: String,
+    #[serde(rename = "@lat")]
+    lat: String,
+    #[serde(rename = "@lon")]
+    lon: String,
+    #[serde(rename = "tag", skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<Tag>,
+}
+
+#[derive(Serialize)]
+struct NdRef {
+    #[serde(rename = "@ref")]
+    reference: i64,
+}
+
+#[derive(Serialize)]
+struct Way {
+    #[serde(rename = "@id")]
+    id: i64,
+    #[serde(rename = "@version")]
+    version: String,
+    #[serde(rename = "@timestamp")]
+    timestamp: String,
+    #[serde(rename = "nd")]
+    nds: Vec<NdRef>,
+    #[serde(rename = "tag", skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<Tag>,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "osm")]
+struct OsmData {
+    #[serde(rename = "@version")]
+    version: String,
+    #[serde(rename = "@generator")]
+    generator: String,
+    #[serde(rename = "node")]
+    nodes: Vec<Node>,
+    #[serde(rename = "way")]
+    ways: Vec<Way>,
 }
 
 struct Region {
@@ -374,8 +418,6 @@ fn feature_type(kind: &str, feat: u32) -> i64 {
     }
 }
 
-type Tag = (&'static str, String);
-
 enum Feature {
     Poi { lon: i64, lat: i64, tags: Vec<Tag> },
     Way { pts: Vec<(i64, i64)>, tags: Vec<Tag> },
@@ -392,29 +434,29 @@ fn make_tags(
     cats: &Cats,
 ) -> Vec<Tag> {
     let mut tags = vec![
-        ("tm:kind", kind.to_string()),
-        ("tm:layer", layer_name(kind, cats)),
-        ("tm:tile", k.to_string()),
-        ("tm:profile", rp.to_string()),
-        ("tm:state", state.to_string()),
-        ("tm:feature", feat.to_string()),
-        ("tm:type", feature_type(kind, feat).to_string()),
+        Tag { k: "tm:kind".to_string(), v: kind.to_string() },
+        Tag { k: "tm:layer".to_string(), v: layer_name(kind, cats) },
+        Tag { k: "tm:tile".to_string(), v: k.to_string() },
+        Tag { k: "tm:profile".to_string(), v: rp.to_string() },
+        Tag { k: "tm:state".to_string(), v: state.to_string() },
+        Tag { k: "tm:feature".to_string(), v: feat.to_string() },
+        Tag { k: "tm:type".to_string(), v: feature_type(kind, feat).to_string() },
     ];
     if let Some(names) = names {
         if !names.is_empty() {
-            tags.push(("name", names[0].clone()));
+            tags.push(Tag { k: "name".to_string(), v: names[0].clone() });
             let alts: Vec<&str> = names[1..]
                 .iter()
                 .filter(|s| *s != &names[0])
                 .map(|s| s.as_str())
                 .collect();
             if !alts.is_empty() {
-                tags.push(("name:alt", alts.join("; ")));
+                tags.push(Tag { k: "name:alt".to_string(), v: alts.join("; ") });
             }
         }
     }
     if let Some(r) = ref_ {
-        tags.push(("ref", r.clone()));
+        tags.push(Tag { k: "ref".to_string(), v: r.clone() });
     }
     tags
 }
@@ -531,13 +573,6 @@ fn to_osm(f: Feature) -> Option<OsmFeat> {
     }
 }
 
-fn write_tags<W: Write>(w: &mut W, tags: &[Tag]) -> io::Result<()> {
-    for (k, v) in tags {
-        w.write_all(format!("<tag k=\"{}\" v=\"{}\"/>", esc(k), esc(v)).as_bytes())?;
-    }
-    Ok(())
-}
-
 fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io::Result<(usize, usize)> {
     let mut maps: HashMap<String, Vec<u8>> = HashMap::new();
     // pass 1: assign node ids (dedup by coordinate) + remember POI tags
@@ -578,37 +613,24 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io:
             }
         }
     }
-    // nodes (all before ways, so <nd ref> never points forward)
-    w.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
-    w.write_all(format!("<osm version=\"0.6\" generator=\"{}\">\n", esc(GENERATOR)).as_bytes())?;
+
+    let mut nodes = Vec::with_capacity(key_order.len());
     for key in &key_order {
         let nid = node_ids[key];
         let (lon_s, lat_s) = key.split_once(',').unwrap();
-        match poi_tags.get(key) {
-            Some(tags) => {
-                w.write_all(
-                    format!(
-                        "<node id=\"{}\" version=\"1\" timestamp=\"{}\" lat=\"{}\" lon=\"{}\">",
-                        nid, TIMESTAMP, lat_s, lon_s
-                    )
-                    .as_bytes(),
-                )?;
-                write_tags(w, tags)?;
-                w.write_all(b"</node>\n")?;
-            }
-            None => {
-                w.write_all(
-                    format!(
-                        "<node id=\"{}\" version=\"1\" timestamp=\"{}\" lat=\"{}\" lon=\"{}\"/>\n",
-                        nid, TIMESTAMP, lat_s, lon_s
-                    )
-                    .as_bytes(),
-                )?;
-            }
-        }
+        let tags = poi_tags.remove(key).unwrap_or_default();
+        nodes.push(Node {
+            id: nid,
+            version: "1".to_string(),
+            timestamp: TIMESTAMP.to_string(),
+            lat: lat_s.to_string(),
+            lon: lon_s.to_string(),
+            tags,
+        });
     }
+
     // pass 2: ways
-    let mut nway = 0usize;
+    let mut ways = Vec::new();
     for (k, ents, box_) in iter_tiles(region, level) {
         for &(rp, ln, off) in &ents {
             let feats = match parse_block(region, level, rp, ln, off as usize, box_.0, box_.1, k, &mut maps) {
@@ -636,22 +658,38 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io:
                 }
                 let wid = next_id;
                 next_id += 1;
-                w.write_all(
-                    format!("<way id=\"{}\" version=\"1\" timestamp=\"{}\">\n", wid, TIMESTAMP)
-                        .as_bytes(),
-                )?;
-                for r in &refs {
-                    w.write_all(format!("<nd ref=\"{}\"/>", r).as_bytes())?;
-                }
-                w.write_all(b"\n")?;
-                write_tags(w, &tags)?;
-                w.write_all(b"</way>\n")?;
-                nway += 1;
+                let nds = refs.into_iter().map(|reference| NdRef { reference }).collect();
+                ways.push(Way {
+                    id: wid,
+                    version: "1".to_string(),
+                    timestamp: TIMESTAMP.to_string(),
+                    nds,
+                    tags,
+                });
             }
         }
     }
-    w.write_all(b"</osm>\n")?;
-    Ok((key_order.len(), nway))
+
+	let ways_len = ways.len();
+	
+    let osm = OsmData {
+        version: "0.6".to_string(),
+        generator: GENERATOR.to_string(),
+        nodes,
+        ways,
+    };
+
+	w.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
+
+	let mut xml_buf = String::new();
+    let mut serializer = quick_xml::se::Serializer::new(&mut xml_buf);
+    serializer.indent(' ', 4); // 4 spacje wcięcia
+    osm.serialize(serializer).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+	w.write_all(xml_buf.as_bytes())?;
+
+	w.write_all(b"\n")?;
+
+    Ok((key_order.len(), ways_len))
 }
 
 fn main() {
