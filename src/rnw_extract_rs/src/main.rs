@@ -170,11 +170,11 @@ struct Road {
     fw: u32,
 }
 
-fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<Vec<Road>> {
-    let cd = &d[S..end];
-    let A = u16le(cd, 0);
-    let B = u16le(cd, 2);
-    if A == 0 || B == 0 {
+fn parse_cluster(d: &[u8], start: usize, end: usize, bbox: &Option<BBox>) -> Option<Vec<Road>> {
+    let cd = &d[start..end];
+    let cluster_id = u16le(cd, 0);
+    let hdr_flags = u16le(cd, 2);
+    if cluster_id == 0 || hdr_flags == 0 {
         return None;
     }
     let lon = i32le(cd, 8) as i64;
@@ -194,7 +194,7 @@ fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<
     if !(shift >= 0 && shift <= 12) || ooff >= cd.len() || ocnt > 0x4000 {
         return None;
     }
-    let ctype: u8 = if B & 0x40 != 0 { 4 } else { 3 };
+    let ctype: u8 = if hdr_flags & 0x40 != 0 { 4 } else { 3 };
     let ptsize = if ctype == 4 { 6 } else { 4 };
     if ooff + ptsize * ocnt as usize > cd.len() {
         return None;
@@ -264,10 +264,12 @@ fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<
                         let v = u16le(cd, r);
                         let oi = (v & 0x3FF) as i32 - 1;
                         if oi >= 0 && oi < oc_ as i32 {
-                            if v & 0x4000 != 0 {
-                                from_node[oi as usize] = i as i32;
-                            } else {
+                            // bit 15: set = TO node, clear = FROM node (1-based idx).
+                            // Confirmed vs rnw_tclBaseExtensionGenerate::u16AddFromAndToZerocell.
+                            if v & 0x8000 != 0 {
                                 to_node[oi as usize] = i as i32;
+                            } else {
+                                from_node[oi as usize] = i as i32;
                             }
                         }
                     }
@@ -408,26 +410,26 @@ fn find_clusters(d: &[u8], bbox: &Option<BBox>) -> Vec<usize> {
     let mut starts = Vec::new();
     let n = d.len();
     let stop = n.saturating_sub(0x20);
-    let mut S = 0usize;
-    while S < stop {
-        let A = u16le(d, S);
-        let B = u16le(d, S + 2);
-        if A != 0 && B != 0 {
-            let lon = i32le(d, S + 8) as f64;
-            let lat = i32le(d, S + 12) as f64;
+    let mut start = 0usize;
+    while start < stop {
+        let cluster_id = u16le(d, start);
+        let hdr_flags = u16le(d, start + 2);
+        if cluster_id != 0 && hdr_flags != 0 {
+            let lon = i32le(d, start + 8) as f64;
+            let lat = i32le(d, start + 12) as f64;
             if bbox.as_ref().map_or(true, |bb| bb.contains(lon, lat)) {
-                let lf = u16le(d, S + 0x16);
+                let lf = u16le(d, start + 0x16);
                 if lf & 0x30 != 0 && lf & !0x7FF == 0 {
-                    let ooff = u16le(d, S + 0x12) as usize;
-                    let ocnt = u16le(d, S + 0x14);
-                    let shift = d[S + 0x10];
+                    let ooff = u16le(d, start + 0x12) as usize;
+                    let ocnt = u16le(d, start + 0x14);
+                    let shift = d[start + 0x10];
                     if shift <= 128 && ooff < BLOCK && ocnt <= 0x4000 {
-                        starts.push(S);
+                        starts.push(start);
                     }
                 }
             }
         }
-        S += BLOCK;
+        start += BLOCK;
     }
     starts
 }
@@ -442,9 +444,9 @@ fn extract_file(path: &Path, bbox: &Option<BBox>) -> Vec<Road> {
     };
     let starts = find_clusters(&d, bbox);
     let mut out = Vec::new();
-    for (i, &S) in starts.iter().enumerate() {
+    for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(d.len());
-        if let Some(c) = parse_cluster(&d, S, end, bbox) {
+        if let Some(c) = parse_cluster(&d, start, end, bbox) {
             out.extend(c);
         }
     }

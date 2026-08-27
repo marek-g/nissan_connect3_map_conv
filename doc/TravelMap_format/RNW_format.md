@@ -95,13 +95,15 @@ point count, then `u16 status`).
 **fileId == NAV filename number**: the fid values in ci lists match the `NAVnnnnn.DAT`
 names exactly (e.g. a cluster in `NAV27284.DAT` references neighbours with fid 27284,
 24905, 21825…). Interior clusters reference same-file neighbours (fid == own file);
-boundary clusters reference neighbouring files. This is what resolves **external
-DirectCellRef refs (bit 15)**: a zerocell in cluster A whose road continues into a
-neighbour names that neighbour's onecell, and the ci1/ci2 list identifies the target
-file + cluster. Consequence of not yet wiring this into the extractor: rel8 roads whose
-FROM node lives in the neighbouring cluster are emitted single-point (local TO node
-only) and excluded from the distance-based join index (`pts.len() >= 2`) — ~571k of the
-22.3M extracted EUR roads.
+boundary clusters reference neighbouring files. The runtime uses the ci1/ci2 lists to
+load a neighbour cluster when it needs geometry beyond its own boundary. This is **not**
+a road/node identifier: neither `rnw_tclOnecellInternal` nor
+`rnw_tclZerocellInternal` carries a global ID (their onecell refs are
+`rnw_tclLocalOneCellRef`, zerocell refs `rnw_tclDirectCellRef`, both local-indexed).
+Cross-cluster node identity is by **position** — a boundary node is duplicated at the
+same absolute coordinate in each adjacent cluster, so stitching across clusters is a
+coordinate match, not an ID lookup. (An earlier theory that bit-15 DCR refs named a
+neighbour's onecell was wrong; see the correction note in §5.)
 
 > The runtime locates clusters via the CCP container index, **not** by scanning. The
 > extractor's 16KB-aligned scan is a heuristic; the reference lon/lat in the header
@@ -128,15 +130,27 @@ Record: **6B** `{u16 f1, u16 listFlags, u16 offz}`; descriptors at `offz`:
 **DirectCellRef element = one u16 `v`** (`rnw_tclDirectCellRef::bRead`
 @0x00892508: `idx = (v & 0x3FF) - 1`, flags stored raw):
 
-- onecell index = `(v & 0x3FF) - 1` — **1-based**, 10 bits
-- bit 14 set → this zerocell is the road's **FROM** (start) node,
-  else the **TO** (end) node (`bIsDirectionFrom` @0x008921e8 = `(v^0x8000)>>15`)
-- bit 15 set → external reference (target onecell in a neighbouring cluster;
-  resolved via ClusterInfo — not needed for local geometry)
+- onecell index = `(v & 0x3FF) - 1` — **1-based**, 10 bits. Confirmed 1-based
+  empirically: `raw & 0x3FF == onecellCount` occurs (impossible if 0-based), and
+  the value is never 0.
+- **bit 15** (`0x8000`): set → this zerocell is the road's **TO** (end) node,
+  clear → the **FROM** (start) node. Confirmed against
+  `rnw_tclBaseExtensionGenerate::u16AddFromAndToZerocell` @0x009167e8, which writes
+  `from[onecell]=(v&0x3FF)` when bit 15 clear and `to[onecell]` when set.
+  (Bits 13/14 are always 0 in the data.)
+
+> **Correction (was documented as "bit 14 = FROM, bit 15 = external ref").** Both
+> were wrong. The extractor originally tested bit 14 (`0x4000`) to pick FROM/TO — a
+> bit that is always 0 — so `from_node` was never assigned and ~218k relative-shape
+> roads collapsed to a single point. Testing bit 15 instead resolves them
+> (POL: single-point 219,342 → 597; see §9). There is **no external/cross-cluster
+> reference in the DCR list**: across POL+N6E1 every one of 24.4M refs has a
+> local-range index. Cross-cluster node identity is by *position* (boundary nodes
+> are duplicated at identical absolute coordinates in both clusters), not by ref.
 
 `vAddCobZCToOC` @0x00890108 writes these into onecells:
-FROM → onecell+0x28, TO → onecell+0x2A. Local clusters contain mostly TO refs;
-FROM refs usually arrive from the neighbouring cluster's DCR list.
+FROM → onecell+0x28, TO → onecell+0x2A. Both FROM and TO refs are present in the
+local cluster's zerocell DCR lists (each endpoint node has its own local zerocell).
 
 ## 6. Onecell (bit 5) — road segments
 
@@ -272,6 +286,14 @@ project directory (binaries land in the shared cargo target dir
 ways (`tm:layer == "road"`) with RNW names/attributes, and writes a new OSM
 XML file; all other elements pass through unchanged.
 
+Extractor geometry (from/to fix): each road is `[fromNode] + shapePts + [toNode]`,
+with from/to chosen by DCR bit 15 (§5). A prior build tested the always-zero bit 14,
+so `from_node` was never assigned and ~218k relative-shape roads emitted as a single
+point. After the fix (POL): single-point/empty roads **219,342 → 597** (−99.7 %),
+roads with usable geometry in the join index **462k → 681k**, and the named-road MAP
+cross-check improved **94.6 % → 96.7 %**. The remaining 597 have neither endpoint node
+in the local cluster and are dropped from the join index (`pts.len() >= 2`).
+
 Results on N6E2 L2 (70,504 MAP road ways):
 - 1,830,749 RNW roads extracted from 8,257 files; 703,145 named (38%).
 - **6,844 previously-unnamed MAP roads gained names**. All matched roads also get
@@ -295,17 +317,15 @@ Output format notes:
   `osmium cat → PBF`.
 
 Caveats:
-- FROM nodes are only known locally when a DCR ref with bit 14 is present in
-  the same cluster (rare); the extractor therefore usually emits
-  `shapePts + [toNode]`. The join is distance-based, so the missing start
-  node does not affect matching.
-- The ClusterInfo format is fully decoded (§3a), but the extractor does not yet load
-  neighbour files, so external refs (bit 15) are unresolved: cross-cluster FROM-node
-  recovery needs a multi-file cluster index plus the neighbour-selection rule for a
-  bit-15 DirectCellRef (which ci entry / onecell it names).
-- Roads whose only local point is the TO node are emitted single-point and are
-  excluded from the join index (`pts.len() >= 2`). On the full EUR dataset this is
-  ~571k of 22.3M roads (POL alone: ~681k extracted, most multi-point).
+- Both FROM and TO nodes are resolved from the **local** cluster's zerocell DCR lists
+  (bit 15 picks the direction, §5). The extractor emits `[fromNode] + shapePts +
+  [toNode]`. The join is distance-based, so an occasional missing endpoint does not
+  break matching.
+- A road is emitted single-point (or empty) only when **neither** endpoint node has a
+  local zerocell ref — a genuine degenerate case, ~0.09 % of POL roads (597 of
+  681,682). These are excluded from the join index (`pts.len() >= 2`). No multi-file /
+  cross-cluster recovery is needed for the common case: there are no external DCR refs,
+  and boundary nodes are duplicated by position (§3a/§5).
 - Cluster IDs (A) are not unique per file and sequence numbers (C) are not
   monotonic within a file — neither is safe as a key/ordering signal.
 
