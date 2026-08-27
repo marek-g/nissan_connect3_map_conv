@@ -164,8 +164,10 @@ struct Road {
     name: Option<Vec<String>>,
     rc: u32,
     nc: u32,
+    rt: u32,
     link: u32,
     sec: u32,
+    fw: u32,
 }
 
 fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<Vec<Road>> {
@@ -393,8 +395,10 @@ fn parse_cluster(d: &[u8], S: usize, end: usize, bbox: &Option<BBox>) -> Option<
             name: names,
             rc: hdr & 0x7,
             nc: (hdr >> 4) & 0x7,
+            rt: (hdr >> 8) & 0xF,
             link: (hdr >> 13) & 1,
             sec: (hdr >> 15) & 1,
+            fw: (hdr >> 30) & 1,
         });
     }
     Some(roads)
@@ -479,8 +483,8 @@ fn write_line(fh: &mut impl Write, f_field: &str, r: &Road) -> io::Result<()> {
         _ => s.push_str("null"),
     }
     s.push_str(&format!(
-        ", \"rc\": {}, \"nc\": {}, \"link\": {}, \"sec\": {}",
-        r.rc, r.nc, r.link, r.sec
+        ", \"rc\": {}, \"nc\": {}, \"rt\": {}, \"link\": {}, \"sec\": {}, \"fw\": {}",
+        r.rc, r.nc, r.rt, r.link, r.sec, r.fw
     ));
     s.push_str(", \"pts\": ");
     match &r.pts {

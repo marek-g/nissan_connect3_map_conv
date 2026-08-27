@@ -29,7 +29,11 @@ rnw_extract_rs <CCP_dir> RNW.jsonl [-b W,S,E,N|none]   # ~70 s for all 8,257 fil
 rnw_join_rs    RNW.jsonl /tmp/pl/N6E2_L2.osm /tmp/pl/N6E2_L2_rnw.osm   # ~10 s
 ```
 
-Adds `name`/`name:alt` and `rn_class/rn_netclass/rn_link/rn_sec` to road ways (`tm:layer="road"`); all other elements pass through unchanged.
+Adds `name`/`name:alt` (to unnamed roads) and, to every matched road way
+(`tm:layer="road"`), the RNW class attributes `rn_class/rn_netclass/rn_roadtype/
+rn_link/rn_sec/rn_freeway` plus a derived OSM `highway=*` tag (motorway…unclassified,
+from the runtime's display-class table — see `TravelMap_format/RNW_format.md` §6a).
+All other elements pass through unchanged.
 
 - `-b W,S,E,N` — geographic sanity filter (degrees) for the cluster scan. Default
   `-30,30,60,75` covers the whole EUR dataset (Iceland..Turkey). Use a tighter box to

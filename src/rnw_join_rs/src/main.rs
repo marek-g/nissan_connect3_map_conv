@@ -401,8 +401,60 @@ struct RnwRoad {
     name: Option<String>,
     rc: Option<i64>,
     nc: Option<i64>,
+    rt: Option<i64>,
     link: Option<i64>,
     sec: Option<i64>,
+    fw: Option<i64>,
+}
+
+// rnw_tclMAPConverter::enConvertRoadSubattrDisplayClass @0x00888b14 — the
+// runtime's own road rendering hierarchy, derived from (roadClass, networkClass).
+// Lower value = more important road. dc=2 is the motorway tier (the only class
+// that carries the freeway bit); dc=12/13 are the common local roads.
+fn display_class(rc: i64, nc: i64) -> Option<i64> {
+    match rc {
+        0 | 1 => match nc {
+            0 => Some(2),
+            1 => Some(6),
+            2 => Some(7),
+            3 => Some(8),
+            7 => Some(9),
+            _ => None,
+        },
+        2 => Some(9),
+        3 => Some(10),
+        4 => Some(11),
+        5 | 7 => Some(12),
+        6 => Some(13),
+        _ => None,
+    }
+}
+
+// Map the runtime display class onto the OSM highway=* hierarchy (monotonic in
+// importance). rn_link (onecell bit 13, bIsLink) marks a ramp/connecting road,
+// which OSM encodes with the *_link variant for the major classes.
+fn highway_tag(dc: i64, link: bool) -> &'static str {
+    let base = match dc {
+        2 => "motorway",
+        6 => "trunk",
+        7 | 8 => "primary",
+        9 | 10 => "secondary",
+        11 => "tertiary",
+        12 => "residential",
+        13 => "unclassified",
+        _ => return "",
+    };
+    if link {
+        match base {
+            "motorway" => return "motorway_link",
+            "trunk" => return "trunk_link",
+            "primary" => return "primary_link",
+            "secondary" => return "secondary_link",
+            "tertiary" => return "tertiary_link",
+            _ => {}
+        }
+    }
+    base
 }
 
 fn load_rnw(path: &str) -> (Vec<RnwRoad>, HashMap<(i32, i32), Vec<u32>>) {
@@ -483,11 +535,19 @@ fn load_rnw(path: &str) -> (Vec<RnwRoad>, HashMap<(i32, i32), Vec<u32>>) {
                 JVal::Int(i) => Some(*i),
                 _ => None,
             }),
+            rt: v.get("rt").and_then(|x| match x {
+                JVal::Int(i) => Some(*i),
+                _ => None,
+            }),
             link: v.get("link").and_then(|x| match x {
                 JVal::Int(i) => Some(*i),
                 _ => None,
             }),
             sec: v.get("sec").and_then(|x| match x {
+                JVal::Int(i) => Some(*i),
+                _ => None,
+            }),
+            fw: v.get("fw").and_then(|x| match x {
                 JVal::Int(i) => Some(*i),
                 _ => None,
             }),
@@ -683,7 +743,7 @@ fn main() {
 
     // matching
     let mut updates: HashMap<i64, Vec<(String, String)>> = HashMap::new();
-    let (mut enriched, mut cross_ok, mut cross_tot) = (0u64, 0u64, 0u64);
+    let (mut enriched, mut cross_ok, mut cross_tot, mut with_highway) = (0u64, 0u64, 0u64, 0u64);
     for &(wid, ref rw) in &road_ways {
         let (refs, tags) = rw;
         let coords: Option<Vec<(f64, f64)>> = if refs.iter().all(|r| nodes.contains_key(r)) {
@@ -832,16 +892,28 @@ fn main() {
                 }
                 enriched += 1;
             }
-            new_tags.push(("rn_class".to_string(), fmt_i(attrs.rc)));
-            new_tags.push(("rn_netclass".to_string(), fmt_i(attrs.nc)));
-            new_tags.push(("rn_link".to_string(), fmt_i(attrs.link)));
-            new_tags.push(("rn_sec".to_string(), fmt_i(attrs.sec)));
         } else {
             cross_tot += 1;
             let tname = tags.iter().find(|(k, _)| k == "name").unwrap();
             let tname_up = tname.1.to_uppercase();
             if names.iter().any(|n| n.to_uppercase() == tname_up) {
                 cross_ok += 1;
+            }
+        }
+        // class attributes + OSM highway, added to every matched road
+        new_tags.push(("rn_class".to_string(), fmt_i(attrs.rc)));
+        new_tags.push(("rn_netclass".to_string(), fmt_i(attrs.nc)));
+        new_tags.push(("rn_roadtype".to_string(), fmt_i(attrs.rt)));
+        new_tags.push(("rn_link".to_string(), fmt_i(attrs.link)));
+        new_tags.push(("rn_sec".to_string(), fmt_i(attrs.sec)));
+        new_tags.push(("rn_freeway".to_string(), fmt_i(attrs.fw)));
+        if let (Some(rc), Some(nc)) = (attrs.rc, attrs.nc) {
+            if let Some(dc) = display_class(rc, nc) {
+                let hw = highway_tag(dc, attrs.link == Some(1));
+                if !hw.is_empty() {
+                    new_tags.push(("highway".to_string(), hw.to_string()));
+                    with_highway += 1;
+                }
             }
         }
         updates.insert(wid, new_tags);
@@ -883,5 +955,6 @@ fn main() {
         exit(1);
     }
     println!("unnamed roads enriched: {}", enriched);
+    println!("roads with highway tag: {}", with_highway);
     println!("named cross-check: {}/{} agree", cross_ok, cross_tot);
 }

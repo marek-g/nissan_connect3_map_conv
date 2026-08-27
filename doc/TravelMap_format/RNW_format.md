@@ -64,35 +64,44 @@ Starts at `S + ooff + ptsize·ocnt`. Strict bit order 0–10 of `listFlags`:
 `ListDesc = {u16 listOffset, u16 count}`: jump to `listOffset`, read `count`
 elements sequentially, restore stream position. (`rnw_tclListDesc<T>::bRead`.)
 
-### 3a. ClusterInfo (bits 2/3) — adjacency / external refs (partially decoded)
+### 3a. ClusterInfo (bits 2/3) — adjacency / external refs (decoded)
 
-`nav_tclClusterInfo` describes a **neighbouring cluster**. In-memory layout (from the
-constructor @0x00890fe0):
+`nav_tclClusterInfo` describes a **neighbouring cluster**. Decoded from
+`nav_tclClusterInfo::bRead` @0x008910cc + `rnw_tclOutline::bRead` @0x00892d70 and
+validated on the POL dataset (2634/2634 elements parse with plausible coordinates).
+
+Each element is a **fixed 24-byte** record; the outline *points* are stored separately
+at a cluster-relative offset (not inline), which is why `bRead` does a skip→read-status→
+seek-back double pass:
 
 ```
-+0x00  rnw_tclClusterIDInternal   {u16 fileId, file offset, u16 size}
-+0x0c  rnw_tclCoordInfo           (coordType + ref position)
-+0x1c  rnw_tclOutline             (variable-length point list — cluster boundary)
-+0x30  u16 status
++0x00  u32  clusterFileOffset   offset of the neighbour cluster within its NAV file
++0x04  u16  size                neighbour cluster size (bytes)
++0x06  u16  fileId              neighbour's NAV file id == the number in NAV<fileId>.DAT
++0x08  s32  refLon              outline reference position (PAU)
++0x0c  s32  refLat
++0x10  s8   shift               outline delta scale
++0x11  u8   ?                   (observed 0x05; subtracted into an internal count)
++0x12  u16  pointsOffset        cluster-relative offset of the outline point list
++0x14  u16  pointsCount         number of outline points
++0x16  u16  status              bit 0x1000 set -> coordType 4 (rel24) else 3 (rel16)
 ```
 
-On-disk element layout is **not fully decoded** (the variable-length outline makes the
-elements non-fixed-size). Verified by data inspection of the EUR dataset:
+The `pointsOffset` point list holds `pointsCount × rnw_tclPositionInternal`
+(coordType from the status bit — same encoding as §4/§7). In-memory the object is 50
+bytes (`ClusterIDInternal` 12B incl. vptr, `CoordInfo` 16B, `Outline` 20B = ref pos +
+point count, then `u16 status`).
 
-- Each element embeds a **fileId** in the high 16 bits of a u32 (e.g. `55 4e`=20053,
-  `fb 4e`=20219, `15 4f`=20245) with a low-16 offset/index — i.e. it names the
-  neighbouring NAV file + position.
-- Two trailing u32s in several elements decode as plausible PAU coordinates
-  (`value * 180 / 2^31` degrees), consistent with a neighbour's reference position.
-- Elements are variable-length (the outline), so `count` elements do **not** occupy a
-  fixed `count × N` span; the reader must consume them structurally.
-
-This is what resolves **external DirectCellRef refs (bit 15)**: a zerocell in cluster A
-whose road continues into a neighbour refers to that neighbour's onecell index, and the
-ClusterInfo list identifies which file/cluster that is. Consequence of leaving it
-undecoded: rel8 roads whose FROM node lives in the neighbouring cluster are emitted as
-single-point (the local TO node only) and are excluded from the distance-based join
-index (`pts.len() >= 2`). ~571k of the 22.3M extracted EUR roads are single-point.
+**fileId == NAV filename number**: the fid values in ci lists match the `NAVnnnnn.DAT`
+names exactly (e.g. a cluster in `NAV27284.DAT` references neighbours with fid 27284,
+24905, 21825…). Interior clusters reference same-file neighbours (fid == own file);
+boundary clusters reference neighbouring files. This is what resolves **external
+DirectCellRef refs (bit 15)**: a zerocell in cluster A whose road continues into a
+neighbour names that neighbour's onecell, and the ci1/ci2 list identifies the target
+file + cluster. Consequence of not yet wiring this into the extractor: rel8 roads whose
+FROM node lives in the neighbouring cluster are emitted single-point (local TO node
+only) and excluded from the distance-based join index (`pts.len() >= 2`) — ~571k of the
+22.3M extracted EUR roads.
 
 > The runtime locates clusters via the CCP container index, **not** by scanning. The
 > extractor's 16KB-aligned scan is a heuristic; the reference lon/lat in the header
@@ -146,9 +155,55 @@ descriptors at `offf` (bit order):
 Bits 1 and 5 are **mutually exclusive** (`bRead` @0x00892978: bit 5 is read
 only when bit 1 is absent; bit 1 forces a type-2 CoordInfo copy).
 
-`hdr` bits (verified): 0–2 roadClass, 3 gateway, 4–6 networkClass,
-13 link, 15 secundary. Observed (rc,nc) pairs concentrate on
-(5,7) 792k, (6,7) 837k, (3,3) 107k, (2,2) 49k — the rest are rare.
+`hdr` bits (verified via the `rnw_tclOnecellInternal` accessors):
+
+| bit(s) | field | accessor |
+|--------|-------|----------|
+| 0–2    | roadClass (`rc`) | `u8GetRoadClass` @0x008888ac = `hdr & 7` |
+| 3      | gateway | `bIsGateway` |
+| 4–6    | networkClass (`nc`) | `u8GetNetworkClass` @0x008888b8 = `(hdr>>4)&7` |
+| 8–11   | roadType (`rt`) | `u8GetRoadType` @0x008888c8 = `(hdr>>8)&0xF` (valid 0–10) |
+| 13     | link (ramp/connecting) | `bIsLink` |
+| 15     | secundary | `bIsSecundary` |
+| 30     | freeway | `bIsFreeway` @0x00888998 = `(hdr>>30)&1` |
+
+Other onecell predicates exist (`bIsFerry/bIsTunnel/bIsBridge/bIsRoundAbout/
+bIsOnewayTo/bIsOnewayFrom/bIsParallel/bIsLongRamp/bIsRestricted/…`) — not yet
+bit-mapped or emitted. Observed (rc,nc) pairs concentrate on (5,7), (6,7), (3,3),
+(2,2); the rest are rare. Valid `nc` values are {0,1,2,3,7}
+(`bIsTpNavNetClassValid` @0x00b5a474).
+
+### 6a. Road class → OSM `highway=*`
+
+The runtime classifies roads for rendering via
+`rnw_tclMAPConverter::enConvertRoadSubattrDisplayClass(rc, nc)` @0x00888b14, a
+2-D lookup producing an ordered **display class** (lower = more important):
+
+| rc \ nc | 0 | 1 | 2 | 3 | 7 | any |
+|---------|---|---|---|---|---|-----|
+| 0, 1    | 2 | 6 | 7 | 8 | 9 |     |
+| 2       |   |   |   |   |   | 9   |
+| 3       |   |   |   |   |   | 10  |
+| 4       |   |   |   |   |   | 11  |
+| 5, 7    |   |   |   |   |   | 12  |
+| 6       |   |   |   |   |   | 13  |
+
+(`rc` is the dominant axis; `nc` only subdivides `rc` 0/1.) Direction is confirmed
+by the data: **dc=2 is the only class carrying the freeway bit** (all freeway
+onecells are rc=0,nc=0) and its joined roads are motorway interchanges
+(`WĘZEŁ …`); dc=12/13 are ~84% of all POL onecells (local streets). `rnw_join_rs`
+maps display class → OSM `highway` monotonically, and appends `_link` for the major
+classes when `bIsLink` is set:
+
+| dc | 2 | 6 | 7/8 | 9/10 | 11 | 12 | 13 |
+|----|---|---|-----|------|----|----|----|
+| highway | motorway | trunk | primary | secondary | tertiary | residential | unclassified |
+
+The exact userdef rendering-class table (`dap_tclRoadClassConvr`, an 8×8 nibble
+matrix loaded from app config via `bSetRoadClassConv`) is **not** in the dataset, so
+the middle tiers (primary/secondary/tertiary) are assigned by ordinal position rather
+than a named source table. The joiner emits `highway` plus the raw `rn_class`,
+`rn_netclass`, `rn_roadtype`, `rn_link`, `rn_sec`, `rn_freeway` on every matched road.
 
 ## 7. Geometry decoding rules (validated vs MAP)
 
@@ -219,8 +274,9 @@ XML file; all other elements pass through unchanged.
 
 Results on N6E2 L2 (70,504 MAP road ways):
 - 1,830,749 RNW roads extracted from 8,257 files; 703,145 named (38%).
-- **6,844 previously-unnamed MAP roads gained names** (all matched roads also
-  get RNW class attributes `rn_class/rn_netclass/rn_link/rn_sec`).
+- **6,844 previously-unnamed MAP roads gained names**. All matched roads also get
+  the RNW class attributes (`rn_class/rn_netclass/rn_roadtype/rn_link/rn_sec/
+  rn_freeway`) and a derived OSM `highway=*` tag (see §6a).
 - Named-road cross-check: 12,031/13,795 (87%) component names agree with the
   existing MAP name. Disagreements are concentrated in Budapest
   embankments/bridges where parallel named sections lie <30 m apart
@@ -230,8 +286,8 @@ Results on N6E2 L2 (70,504 MAP road ways):
   ≤30 m from it; names/attributes are combined over all components.
 
 Output format notes:
-- JSONL: one road per line, keys `f,k,name,alt,rc,nc,link,sec,pts`; non-ASCII
-  names as raw UTF-8, floats in native Rust display; `pts` = `[lon, lat]`
+- JSONL: one road per line, keys `f,k,name,alt,rc,nc,rt,link,sec,fw,pts`;
+  non-ASCII names as raw UTF-8, floats in native Rust display; `pts` = `[lon, lat]`
   degree pairs or null (no geometry).
 - OSM output uses the canonical map2osm layout: one line per `<node>`; a
   `<way>` keeps all its `<nd>` on one line and all its `<tag>` on one line
@@ -243,8 +299,10 @@ Caveats:
   the same cluster (rare); the extractor therefore usually emits
   `shapePts + [toNode]`. The join is distance-based, so the missing start
   node does not affect matching.
-- External refs (bit 15) / ClusterInfo adjacency not fully resolved (§3a) — only
-  needed for cross-cluster FROM-node assignment.
+- The ClusterInfo format is fully decoded (§3a), but the extractor does not yet load
+  neighbour files, so external refs (bit 15) are unresolved: cross-cluster FROM-node
+  recovery needs a multi-file cluster index plus the neighbour-selection rule for a
+  bit-15 DirectCellRef (which ci entry / onecell it names).
 - Roads whose only local point is the TO node are emitted single-point and are
   excluded from the join index (`pts.len() >= 2`). On the full EUR dataset this is
   ~571k of 22.3M roads (POL alone: ~681k extracted, most multi-point).
