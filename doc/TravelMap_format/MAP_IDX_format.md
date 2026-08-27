@@ -577,3 +577,65 @@ See `new_file_format_rnw.md` for the RNW format.
 5. **POI cell deltas are SIGNED s16** (list-2 cells: `{state, feature, s16 dlon, s16 dlat, ...}`).
    Reading them unsigned shifts every POI with a negative delta by up to
    `65535 << shift` PAU (5.6° at L1, 0.7° at L2; e.g. LE MANS would land in the North Sea).
+
+---
+
+## 11. Generating your own `.MAP`/`.IDX` — write-side status
+
+The firmware contains only the **reader** (`DAPIAPP.OUT`). The build tools that emit these
+files ("TpMap2 (Map-Data) for TravelMap", "Linker-SW / MK10_2021.1" per the info strings)
+are not present, so a byte-exact write layout must be inferred from the reader + the data.
+What a generator must produce, and what is still not fully pinned:
+
+### `.IDX` — fully known (writable)
+
+- 32 B header: `binOff`, `spare`(=32), `west/south/east/north` (PAU), `partOff`(×4).
+- Info-string region `[0x20 .. partOff*4)`: u16 offset list + packed ASCII (metadata, §below).
+- Partition table: 4 × 12 B at `partOff*4`.
+- Tile tables: L0 @ `binOff`, L1/L2/L3 @ `u32b>>8`; slot = `{u16 regProf, u16 length(words),
+  u32 offset}`.
+- **`multi` slot (decoded this pass):** `{u16 0x4000, u16 count, u32 ptr}` → `count` × 8-byte
+  real slots at `ptr`. Used when one tile spans several profile files (e.g. L0 = whole region →
+  one sub-slot per profile). Verified: N6E1AA L0 → 9 sub-slots, each resolving to a valid block
+  (`0xFFFF…` marker) in its `<REGION>1<prof>.MAP`.
+- `regProf` field = `0x400 | prof` (bit 10 is a flag; the file name comes from the two base32
+  digits of `prof`); bit 14 = multi, bit 15 = empty.
+
+### `.MAP` header — mostly known
+
+- 32 B header: `binOff`(first block), `infoTbl`(=0x34), `fileSize`, `west/south/east/north`,
+  then 4 × u16:
+  - `@0x18` = **8**, `@0x1a` = **4** — constant across all observed files.
+  - `@0x1c` = `0x400 | ((binOff − 0x7b4) >> 1)` — derived from the first-block offset
+    (0x7b4→0, 0x7bc→4, 0x7c4→8, 0x7cc→c; 0x7b4 is the smallest observed `binOff`).
+  - `@0x1e` = `0x8400 | regProf` (the profile number). **The runtime does not read this field:**
+    its in-memory `dap_map_tclMapFileHeader` (ctor @0x008d8e1c) stores only file offsets
+    0x00–0x1C and omits @0x1E — the profile is taken from the IDX slot instead.
+- Info-string region `[0x20 .. infoTbl)`: same metadata format as the IDX — a short u16 offset
+  list (`{0x44, 0x74, 0x84, 0xbc, …}`) + packed NUL-terminated ASCII: copyright, build
+  date/time, config author, product ("TpMap2 (Map-Data) for TravelMap"), project name, and a
+  default-file list. **Not used by the geometry path** — display/diagnostic only.
+- Binary blocks `[binOff .. fileSize)`: contiguous, 4-byte aligned. Each =
+  `{u32 marker = 0xFFFF | (len<<16)}` + 3 × `{u16 start, u16 count}` + cells (12 B) + point pool
+  + annotation/text (§5/§8). `start[i+1] = start[i] + count[i]*3`; `len` (words) spans to the
+  next block.
+
+### Still not fully pinned (all avoidable for a minimal working file)
+
+- **Purpose of header @0x18 / @0x1a / @0x1c:** stored by the runtime but their consumption is not
+  traced; empirically 8/4 are constant and @0x1c tracks `binOff`. Safe writer strategy: copy them
+  from an existing file of the same profile, or emit `8 / 4 / 0x400|((binOff−base)>>1)`.
+- **Premium POI payload** (list 2, `feature & 0xF000 == 0xF000`): the 8-byte payload is skipped by
+  `bSkipPremiumPOI` @0x008d5f00; its content is unknown. Avoid by not emitting premium POIs.
+- **Annotation payloads 0x23 / 0x30 / 0x34 / 0x35 / 0x51 / 0x52:** size/payload undecoded (the
+  converter treats them as category flags). Avoid by not emitting those types, or copy raw bytes
+  from a reference file.
+- **Checksum/CRC:** none observed in any header or block; unverified whether an external tool
+  validates one.
+
+### Minimal viable `.MAP`/`.IDX` pair (readable for geometry)
+
+Get the IDX right (header + partition table + tile tables pointing at real block offsets), and
+write the MAP binary blocks with correct markers / cells / points / annotations plus a
+self-consistent 32 B header (`binOff`, `fileSize`, bbox). The metadata info-string region and the
+premium / unknown-annotation payloads can be omitted or copied verbatim from a reference file.
