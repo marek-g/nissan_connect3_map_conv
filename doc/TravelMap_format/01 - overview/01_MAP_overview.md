@@ -6,8 +6,8 @@ defined the first time it appears, and each part of the file is explained not ju
 but for *why* it exists and *what job* it does.
 
 For the precise byte-level layout (offsets, sizes, bit fields) see
-[`MAP_IDX_format.md`](./MAP_IDX_format.md). For how to build your own files, see
-[`writer_guide.md`](./writer_guide.md). This document is the "understanding" layer underneath both.
+[`MAP_format.md`](../02%20-%20details/MAP_format.md). For how to build your own files, see
+[`writer_guide.md`](../03%20-%20writer%20guide/writer_guide.md). This document is the "understanding" layer underneath both.
 
 ---
 

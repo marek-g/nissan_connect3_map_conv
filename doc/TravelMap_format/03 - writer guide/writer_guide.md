@@ -1,6 +1,6 @@
 # Writing `.IDX` / `.MAP` — a practical guide for generating your own files
 
-Companion to [`MAP_IDX_format.md`](./MAP_IDX_format.md) (the format reference, read-path) and
+Companion to [`MAP_format.md`](../02%20-%20details/MAP_format.md) (the format reference, read-path) and
 its §11 (write-side status). This document is the **how-to**: what bytes to emit, in what order,
 and — most importantly — how to deal with the fields whose exact meaning we have not fully
 pinned down.

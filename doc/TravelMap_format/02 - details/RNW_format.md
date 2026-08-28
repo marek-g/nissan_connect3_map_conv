@@ -1,7 +1,7 @@
 # RNW (Road Network) Database Format — Bosch TravelMap / Nissan LCN2KAI
 
 Reverse engineered from `DAPIAPP.OUT` (Ghidra) and validated against the MAP
-converter output (`new_file_format_eng.md`) for region **N6E2**
+converter output (`MAP_format.md`) for region **N6E2**
 (18.00–36.00°E, 47.25–56.70°N: eastern Poland, Slovakia, NE Hungary, western
 Ukraine/Belarus, Baltic coast).
 

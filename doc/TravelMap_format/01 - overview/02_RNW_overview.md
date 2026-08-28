@@ -5,13 +5,13 @@ LCN2KAI) in words a non-programmer can follow. It is intentionally verbose: ever
 defined the first time it appears, and each part of the file is explained not just for *what* it is
 but for *why* it exists and *what job* it does.
 
-It is the companion to [`simple_overview.md`](./simple_overview.md), which covers the `.IDX`/`.MAP`
+It is the companion to [`01_MAP_overview.md`](./01_MAP_overview.md), which covers the `.IDX`/`.MAP`
 files (the *drawing* side of the map). This one covers the **road network** — the part the car uses
 to actually *calculate a route*.
 
 For the precise byte-level layout (offsets, sizes, bit fields) see
-[`RNW_format.md`](./RNW_format.md). For how to build your own files, see
-[`writer_guide.md`](./writer_guide.md). This document is the "understanding" layer underneath both.
+[`RNW_format.md`](../02%20-%20details/RNW_format.md). For how to build your own files, see
+[`writer_guide.md`](../03%20-%20writer%20guide/writer_guide.md). This document is the "understanding" layer underneath both.
 
 ---
 

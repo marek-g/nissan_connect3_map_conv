@@ -19,7 +19,7 @@ map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
 
 - `-r` — exact region codes, comma-separated (`N6E1` ≠ `N6E10`); omit = all 411 regions
 - `-l` — levels: L0 = whole-region outline, L1–L3 increasing detail (default `123`)
-- Output: `OUT_DIR/<REGION>_L<level>.osm` — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*` and decoded annotation payloads (`tm:surface`, `tm:elev`, `tm:water_class/type`, `tm:netclass`, `tm:xfree`, `tm:roadinfo`, `tm:city_display/size/admin/overlap` — see `TravelMap_format/MAP_IDX_format.md` §8).
+- Output: `OUT_DIR/<REGION>_L<level>.osm` — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*` and decoded annotation payloads (`tm:surface`, `tm:elev`, `tm:water_class/type`, `tm:netclass`, `tm:xfree`, `tm:roadinfo`, `tm:city_display/size/admin/overlap` — see `TravelMap_format/02 - details/MAP_format.md` §8).
 - N6E2 L2 ≈ 560 MB in ~6 s. A full-world conversion is multi-GB — convert per region and/or gzip.
 
 ## 3. Road names from RNW (optional)
@@ -32,13 +32,13 @@ rnw_join_rs    RNW.jsonl /tmp/pl/N6E2_L2.osm /tmp/pl/N6E2_L2_rnw.osm   # ~10 s
 Adds `name`/`name:alt` (to unnamed roads) and, to every matched road way
 (`tm:layer="road"`), the RNW class attributes `rn_class/rn_netclass/rn_roadtype/
 rn_link/rn_sec/rn_freeway` plus a derived OSM `highway=*` tag (motorway…unclassified,
-from the runtime's display-class table — see `TravelMap_format/RNW_format.md` §6a).
+from the runtime's display-class table — see `TravelMap_format/02 - details/RNW_format.md` §6a).
 All other elements pass through unchanged.
 
 - `-b W,S,E,N` — geographic sanity filter (degrees) for the cluster scan. Default
   `-30,30,60,75` covers the whole EUR dataset (Iceland..Turkey). Use a tighter box to
   speed up a single-area conversion; `none` disables it (diagnostics only — see
-  `TravelMap_format/RNW_format.md` §9 for why the filter matters).
+  `TravelMap_format/02 - details/RNW_format.md` §9 for why the filter matters).
 
 ## 4. Verify / load
 

@@ -4,7 +4,7 @@ Complete documentation of the `.IDX` / `.MAP` / `MAPWORLD.MAP` file format, reve
 engineered from the `DAPIAPP.OUT` binary (Ghidra, project "Nissan Ghidra Project") and
 verified against the firmware data.
 
-Converter implementing this format: [`map2osm_rs/`](./map2osm_rs/) (OSM XML, Rust;
+Converter implementing this format: [`map2osm_rs/`](../../../src/map2osm_rs/) (OSM XML, Rust;
 build with `cargo build --release`). Road-name enrichment: `rnw_extract_rs` +
 `rnw_join_rs` (also OSM XML in/out).
 
@@ -544,7 +544,7 @@ use per-region files and/or gzip the output.
 Road-name enrichment pipeline: `rnw_extract_rs [CCP_DIR] RNW.jsonl`, then
 `rnw_join_rs RNW.jsonl <REGION>_L2.osm <REGION>_L2_rnw.osm` adds `name`/`name:alt` and
 `rn_class/rn_netclass/rn_link/rn_sec` tags to the road ways (OSM XML in and out).
-See `new_file_format_rnw.md` for the RNW format.
+See `RNW_format.md` for the RNW format.
 
 ---
 
