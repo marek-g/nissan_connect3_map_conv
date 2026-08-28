@@ -284,3 +284,26 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
 - [ ] Onecell shape bits 1 and 5 are mutually exclusive (rel8 vs absolute); pick one per road.
 - [ ] Descriptor bits are walked in strict order 0–10; a missing `listFlags` bit shifts every later
       descriptor and corrupts the parse.
+
+---
+
+## 8. Converting FROM OSM XML — drop the closing vertex
+
+When the MAP/IDX writer reads polygons back from OSM XML (e.g. `map2osm_rs` output, or hand-edited
+OSM), remember the two formats disagree on how a ring is stored:
+
+- **OSM:** a closed way repeats its first node as the last `<nd>` — that repeated vertex is what makes
+  it an area (`<nd ref="1001"/> … <nd ref="1001"/>`).
+- **Bosch (`.MAP`):** a polygon cell lists each vertex **once** (open loop); the reader closes it
+  implicitly. The `count` field is the number of *distinct* vertices.
+
+So when writing a polygon cell from an OSM way, **drop the final node if it equals the first** before
+computing `count` and emitting the point pool:
+
+```
+OSM way nodes:      A B C D A        (5 refs, closed)
+Bosch point list:   A B C D         (4 distinct vertices; count = 4)
+```
+
+`map2osm_rs` does the reverse on export: it takes Bosch's open vertex list and appends the first
+vertex to close the ring, so polygons come out as valid OSM areas.

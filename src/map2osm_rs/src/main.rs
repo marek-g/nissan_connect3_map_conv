@@ -477,7 +477,7 @@ fn feature_type(kind: &str, feat: u32) -> i64 {
 
 enum Feature {
     Poi { lon: i64, lat: i64, tags: Vec<Tag> },
-    Way { pts: Vec<(i64, i64)>, tags: Vec<Tag> },
+    Way { pts: Vec<(i64, i64)>, tags: Vec<Tag>, closed: bool },
 }
 
 fn make_tags(
@@ -589,7 +589,7 @@ fn parse_block(
                     let kind = if li == 0 { "polygon" } else { "line" };
                     let mut tags = make_tags(kind, state, feat, k, rp, &names, &ref_, &cats);
                     tags.extend(ann);
-                    feats.push(Feature::Way { pts, tags });
+                    feats.push(Feature::Way { pts, tags, closed: li == 0 });
                 }
             } else {
                 if feat & 0xF000 == 0xF000 {
@@ -621,9 +621,14 @@ enum OsmFeat {
 fn to_osm(f: Feature) -> Option<OsmFeat> {
     match f {
         Feature::Poi { lon, lat, tags } => Some(OsmFeat::Node { key: fmt_key(lon, lat), tags }),
-        Feature::Way { pts, tags } => {
-            let keys: Vec<String> = pts.iter().map(|(lo, la)| fmt_key(*lo, *la)).collect();
-            if keys.len() > 1 && keys.first() == keys.last() {
+        Feature::Way { pts, tags, closed } => {
+            let mut keys: Vec<String> = pts.iter().map(|(lo, la)| fmt_key(*lo, *la)).collect();
+            // Bosch stores polygon vertices once (open loop); OSM areas must be closed rings,
+            // so repeat the first vertex at the end.
+            if closed && keys.len() >= 3 && keys.first() != keys.last() {
+                keys.push(keys[0].clone());
+            }
+            if closed {
                 (keys.len() >= 3).then_some(OsmFeat::Way { keys, tags })
             } else {
                 (keys.len() >= 2).then_some(OsmFeat::Way { keys, tags })
