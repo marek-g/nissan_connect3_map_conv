@@ -232,8 +232,8 @@ Each road stores:
   short roads have no extra points — just the two end nodes.
 - **Its attributes** (4.10): what kind of road it is, whether it is a link/ramp, and its name(s).
 
-So a complete road is: *start-node → [optional bend points] → end-node*, plus "this is a primary
-road called X." That single line is one edge the routing engine can travel.
+So a complete road is: *start-node → [optional bend points] → end-node*, plus what kind of road it is
+and its name (4.10). That single line is one edge the routing engine can travel.
 
 ### 4.7 The position list — where the nodes really are
 
@@ -298,19 +298,118 @@ entry describes an adjacent cluster — which file it is in, where it starts, ho
 reference point — so the car can load it when a route runs into the boundary.
 
 Here is the subtle but important part. Because node numbers are only meaningful *within* one cluster
-(4.8), two clusters that share a border **do not** share node IDs. Instead, the shared junction simply
-appears in *both* clusters at the *same real-world position*. When the car stitches two clusters
-together, it joins them by **matching positions**: "this node in cluster A is at exactly the same spot
-as that node in cluster B, so they are the same junction." It is a coordinate match, not an ID lookup.
-This is why getting the coordinates right (4.2, 4.7) is what makes the whole network come together.
+(4.8), two clusters that share a border **do not** share node IDs. The shared junction appears in
+*both* clusters as distinct nodes, and the runtime relates them **logically — never by position**:
 
-### 4.12 Optional extra detail (finer versions of a road)
+- An **explicit link** (the main path): a crossing road segment carries an *Overlaps* list naming the
+  exact neighbour segment in the adjacent cluster (`RNW_format.md` §3b).
+- A **border-marker test** (fallback, only if no link resolves): the runtime checks whether the
+  onecell's end node is a "border/crossing" zerocell — rim / cpx-crossing flag or a `0x31` annotation
+  (`RNW_format.md` §3c/§5). This too is non-positional.
 
-Advanced clusters can also carry **extra-detail versions** of some roads — a more precise shape that
-is used when you zoom in close, while a coarser version is used at a distance. You do not need to
-understand the mechanics to use the format; the point is only that a road may have more than one
-"level of detail," and the reader picks the one appropriate to the current zoom. (These are the
-so-called up/down cell links.)
+The runtime does **not** match the two copies by coordinate. (The two stored copies do differ by a few
+PAU, ~0.06–0.08 m, but that is not how the app identifies them.) `rnw2osm_rs` must emit one shared OSM
+`<node>` for roads to connect, so it performs that unification itself in the same order — links → marker
+→ proximity — where the **proximity** step (`-s`, default 1.0 m) is an OSM-side necessity with no
+counterpart in the runtime. `--no-snap` drops it (marker + links only); `-s 0` drops both (links only).
+
+A corollary worth knowing: **clusters overlap by design.** (a) A road that crosses a boundary is stored
+in *both* neighbouring clusters, so their road/node footprints bleed into each other near the edge.
+(b) Some clusters are **major-road overlays** — they contain only high-priority roads
+(motorway / trunk / secondary, no residential or unclassified) and therefore span many ordinary tiles,
+appearing as one large cluster that overlaps a lot of neighbours. Seeing overlapping outlines is normal,
+not an error; the overlap is the stitching mechanism plus these overlay layers.
+
+### 4.12 Two copies of a road: primary and secondary (a level-of-detail pair)
+
+Some roads are stored **twice** — as two copies sitting on top of each other, one more detailed than the
+other. The map tags them **primary** and **secondary** (a *level-of-detail* pair). The **primary** is the
+full, precise shape — usually the copy that carries the road's name — and it is what the car actually draws.
+The **secondary** is a coarser companion copy of the same stretch of road; it often has no name of its own.
+
+You can tell a secondary apart because a flag in the road's header (`bIsSecundary`, header bit 15) marks it
+as such. The two copies are not in different places: they cover the *same* stretch of road, so on a map they
+overlap exactly. That is why, if you decode everything raw, a busy interchange can look "doubled" — each
+motorway segment appearing once as its primary and again as a coincident secondary copy. The Balice I
+interchange is a clean example: the shaped, named primary in one cluster, a 2-point unnamed secondary in its
+neighbour, with an identical bounding box.
+
+The car never draws the secondary by itself. Before rendering it resolves every road to its **primary** — if
+the copy in hand is a secondary, it follows that copy's overlap links (4.11) to the matching primary and uses
+that instead (`RNW_format.md` §6). From the driver's point of view there is only ever one road; the pair is an
+internal detail of how the map is stored.
+
+The practical consequence for a converter: emit the **primaries** and you reproduce exactly the map the car
+shows — each road once, at full detail. The secondaries can be set aside (or emitted on their own, to inspect
+the raw duplicates), but they add nothing the primaries do not already cover. No cluster is secondary-only, so
+dropping them never blanks an area.
+
+### 4.13 Two tiers of clusters: coarse and fine (a second, independent detail axis)
+
+Primary/secondary (4.12) is one way the map holds two levels of detail — *two copies of the same road*. There
+is a **second, different** axis: the clusters themselves come in **two interleaved tiers**.
+
+- The **coarse tier** — larger patches, the main roads. Its clusters have a non-zero value in the header's
+  `flags` word (the `u16@2` field: `0x0001`, `0x0008`, and a few other combinations).
+- The **fine tier** — smaller patches laid over the same ground, carrying the **dense residential grid**
+  (the little streets you only see when zoomed in). Its clusters have `flags = 0x0000`.
+
+The two tiers sit on top of each other geographically. A coarse road "refines" into the fine tier through its
+*down-cells* — but that refinement is only **one step deep** (a coarse onecell points at fine onecells; the
+fine onecells have no down-cells of their own). So the map has exactly two tiers, not a deep pyramid.
+
+Why this matters: `flags = 0x0000` is a *valid* cluster, not a marker for "no cluster here." A reader that
+skips any header whose `flags` word is zero silently throws away the entire fine tier — which in a city is
+roughly **half the roads**, and specifically the residential streets. (Symptom: motorways and main roads are
+all present, but the small streets of a housing estate vanish.) The real test for "is this a cluster?" is the
+`listFlags` descriptor pattern plus plausible outline fields — not the `flags` word. The converter exposes
+this as `--level 0` (coarse tier only) / `--level 1` (coarse + fine, the default).
+
+### 4.14 Putting the layers together: two independent "detail" axes (and which option you want)
+
+The two mechanisms above are easy to mix up — both are "a level of detail" — but they act on *different
+things*. Keep them separate and the whole layered structure becomes simple:
+
+| | **Tier** — coarse / fine (§4.13) | **Twin** — primary / secondary (§4.12) |
+|---|---|---|
+| What it is | two interleaved sets of *clusters* covering the same ground at different density | two *copies of one single road*, one detailed, one simplified |
+| How to see it in the data | cluster header `flags` word: fine tier = `0x0000`, coarse ≠ 0 | onecell header bit 15 (`bIsSecundary`) |
+| Same roads or different? | mostly **different** — the fine tier *adds* the residential grid; a minority of main roads appear in both | **exactly the same** stretch, drawn twice |
+| Converter switch | `--level 0` / `--level 1` | default = primary only; `--secondary` = the twin layer |
+
+A picture. Ask two independent questions:
+
+1. **How finely should the road web be drawn over this territory?** Coarse strokes (main roads) or the fine
+   strokes too (the little streets)? → that is the *tier*, chosen with `--level`.
+2. **For each stroke, keep the crisp original or its rough backup copy?** → that is the *twin*, chosen with
+   `--secondary`.
+
+Because the questions are independent, the options combine freely.
+
+> Don't confuse either of these with the `.MAP` file's own zoom levels (**L0–L3**, see
+> `01_MAP_overview.md`): that is a *third*, separate mechanism belonging to the pre-built tile store. The RNW
+> `--level` in this document is only about the coarse/fine **cluster** tier.
+
+**Which combination to use**
+
+| goal | command |
+|---|---|
+| a complete, detailed street map — the normal case | *(default)* = `--level 1`, primary layer |
+| a lightweight overview: main roads only, smaller and faster | `--level 0` |
+| inspect the simplified twin copies in isolation (diagnostics, not a usable map) | `--secondary` |
+| the twin copies of both tiers (pure experimentation) | `--level 1 --secondary` |
+
+For everyday use just take the default. `--secondary` is a magnifying glass for poking at the storage, not a
+map you would navigate.
+
+**Why `--level 1` does not double-draw the roads.** The two tiers are ~90% complementary — the fine tier
+mostly *adds* streets rather than redrawing the coarse ones — but a minority of main roads exist in both
+(measured: in one housing-estate box, 2167 fine roads were added to 1706 coarse ones, and only ~9% of the
+coarse roads had a fine counterpart nearby). To keep the output clean, when you select `--level 1` the
+converter drops a coarse road **only** if it is fully refined into fine sub-segments that are present in the
+run — decided by the data's own down-cell links (§4.13), not by a geometry guess. That means it never removes
+a road that has no fine counterpart and never loses a name; the summary line reports how many were dropped as
+`refined_dropped=N` (e.g. 1010 for the Kraków box).
 
 ---
 
@@ -462,6 +561,15 @@ network, which is why it can be switched off without breaking navigation.
   cluster; its position comes from the position list.
 - **Road / segment (onecell)** — a line in the graph: a stretch of road running from one node to
   another, with optional bend points and attributes.
+- **Primary / secondary** — the *twin* axis: the two level-of-detail copies some roads are stored as: a
+  full, named primary (what the car draws) and a coarser companion secondary covering the same stretch. A
+  header flag (`bIsSecundary`, bit 15) marks the secondary; the runtime resolves every road to its primary
+  before rendering (4.12). Converter: default = primary only, `--secondary` = the twin layer.
+- **Coarse / fine tier** — the *tier* axis: two interleaved sets of clusters covering the same ground at
+  different density (4.13). A coarse tier (main roads; cluster header `flags` word ≠ 0) and a fine tier
+  (the dense residential grid; `flags = 0x0000`). A coarse road refines into the fine tier via down-cells,
+  one step deep. Converter: `--level 0` = coarse only, `--level 1` = both (default). The two axes are
+  independent — see the combined picture and option table in 4.14.
 - **From / to node** — a road's two ends; each is stored as a node index plus one flag bit
   (clear = from, set = to), counted from 1, always local to the cluster.
 - **Position list** — one coordinate per node, in the same order as the nodes; pairing them gives each

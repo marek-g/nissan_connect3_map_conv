@@ -311,8 +311,10 @@ fn parse_cluster(d: &[u8], start: usize, end: usize, bbox: &Option<BBox>) -> Opt
                     ann_cnt = c2;
                 }
                 1 => shape1 = Some((o2, c2)),
-                2 => q += 4, // two inline u16 (upcell refs)
-                3 | 4 => {}   // downcells / overlaps: not needed for geometry
+                // bit 2 = two inline u16 upcell refs: the 4B slot read above IS the
+                // payload (no ListDesc, no extra bytes). Consuming 8 misaligns every
+                // later descriptor and corrupts the absolute (bit-5) shape.
+                2 | 3 | 4 => {}   // bit 2 upcell refs / downcells / overlaps: not geometry
                 5 => shape5 = Some((o2, c2)),
                 _ => unreachable!(),
             }
@@ -348,13 +350,18 @@ fn parse_cluster(d: &[u8], start: usize, end: usize, bbox: &Option<BBox>) -> Opt
                         )
                     })
                     .collect();
-                let tn = to_node[k];
-                if !nodes.is_empty() && tn >= 0 && tn < nodes.len() as i32 {
-                    let (tx, ty) = nodes[tn as usize];
-                    let (dl_, dt_) = dvec[dvec.len() - 1];
+                // Ghidra-confirmed (vCoordReduced2Absolute @0x00892638): rel8 shape pts are
+                // DIFFERENTIAL — chained from the FROM node: pt_i = pt_{i-1} + delta_i, pt_{-1}=fromNode.
+                let fn_ = from_node[k];
+                if !nodes.is_empty() && fn_ >= 0 && fn_ < nodes.len() as i32 {
+                    let (mut ax, mut ay) = nodes[fn_ as usize];
                     pts = Some(
                         dvec.iter()
-                            .map(|&(dx, dy)| (tx + dx - dl_, ty + dy - dt_))
+                            .map(|&(dx, dy)| {
+                                ax += dx;
+                                ay += dy;
+                                (ax, ay)
+                            })
                             .collect(),
                     );
                 }

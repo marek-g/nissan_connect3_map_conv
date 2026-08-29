@@ -282,6 +282,9 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
 - [ ] Position-list count must equal the zerocell (node) count, index-aligned (§4).
 - [ ] DCR indices are **1-based** (`(v&0x3FF)-1`) and local to the cluster; bit 15 sets direction.
 - [ ] Onecell shape bits 1 and 5 are mutually exclusive (rel8 vs absolute); pick one per road.
+- [ ] Onecell descriptor stream: each set bit is **one 4-byte slot** in bit order, and **bit 2 is the
+      two inline u16 upcell refs inside its own slot — no extra bytes**. Emitting 8 for bit 2 shifts
+      the absolute (bit-5) shape read and renders roads "połamana" (see `RNW_format.md` §6 note).
 - [ ] Descriptor bits are walked in strict order 0–10; a missing `listFlags` bit shifts every later
       descriptor and corrupts the parse.
 

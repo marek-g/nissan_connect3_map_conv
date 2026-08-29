@@ -32,7 +32,7 @@ per-file build-metadata header block (see §11).
 | off | size | field | notes |
 |-----|------|-------|-------|
 | 0x00 | u16 | A | cluster ID. **Not unique per file** — 702/8257 files contain duplicates (checked on the EUR dataset); do not use as a key without the file id |
-| 0x02 | u16 | flags | bit 0x40 → coordType 4 (rel24), else 3 (rel16) |
+| 0x02 | u16 | flags | bit 0x40 → coordType 4 (rel24), else 3 (rel16). **Not a validity bit** — `0x0000` is a perfectly valid value. The word distinguishes the two cluster *tiers*: coarse clusters carry `0x0001`/`0x0008` (and other combos); the **finer tier** (dense residential grid) carries `0x0000`. A scanner that requires this word to be non-zero silently drops the entire fine tier — ~half the roads in a city |
 | 0x04 | u32 | C | sequence number. **Not monotonic within a file** (only ~3111/8257 files are strictly increasing); do not use for ordering/validation |
 | 0x08 | s32 | refLon | PAU = deg·2³¹/180 |
 | 0x0C | s32 | refLat | |
@@ -111,6 +111,64 @@ neighbour's onecell was wrong; see the correction note in §5.)
 > extractor's 16KB-aligned scan is a heuristic; the reference lon/lat in the header
 > therefore doubles as a validation signal (see §9).
 
+### 3b. Overlap links — explicit cross-cluster onecell continuation
+
+A road that crosses a cluster boundary is **not** stitched by position alone. Each
+onecell can carry an **Overlaps** ListDesc (onecell bit 4); each entry is a
+`rnw_tclLocalOneCellRef`, **4 bytes on disk** (`rnw_tclLocalCellRef::bRead` @0x00892494):
+
+```
++0x00  u16  A    low 10 bits = neighbour onecell index + 1 ; high 6 bits = direction/side flags
++0x02  u16  B    = index into this cluster's ci2 (ClusterInfo) list + 1   (0 = unset)
+```
+
+In memory the ref is 8 bytes: `bRead` expands it to `{…u16 cli=B-1 @+4, i16 cell=(A&0x3FF)-1 @+6}`.
+The consumer, `rnw_tclRefineOCList::oGetOverlapInCluster` @0x0088c084, reads the ci2 index
+from `ref+4` and the neighbour onecell index from `ref+6`, then calls
+`vSet(clusterID, cell, direction)` — i.e. the overlap **names the exact neighbour onecell**
+in the cluster given by `ci2[cli]`. `bRelevantCrossingBetween` @0x0088c78c follows this link
+**first** and only falls back to a position/node-marker test (`bBordersObjectAtTo/From`)
+if the link does not resolve.
+
+`rnw2osm_rs` implements this: it indexes every parsed cluster by its outline origin
+(lon,lat — a near-unique key; only ~16 degenerate/same-file collisions out of 5,784 POL
+clusters), resolves each onecell's overlap refs through `ci2[cli]` to the neighbour
+onecell, and union-finds the shared boundary node so the two ways share one OSM node.
+This is what makes roads connect across cluster boundaries exactly as the app does
+(`--no-stitch` disables it). In practice most boundary nodes already coincide within the
+1.0 m snap radius (they are duplicated at near-identical coordinates in each cluster), so
+the overlap link mainly closes the rarer >1 m cases and guarantees correctness where the
+two clusters' stored boundary node differs slightly. Note the same physical segment is
+stored in **both** adjacent clusters, so the OSM intentionally contains a duplicate way
+per boundary segment (the app dedups these at render time via the overlaps); `rnw2osm_rs`
+emits both rather than masking either.
+
+### 3c. Border markers & the cross-cluster merge order (converter fidelity)
+
+The runtime's `bRelevantCrossingBetween` @0x0088c78c decides whether two onecells from
+neighbouring clusters "cross" by, in order:
+
+1. **Overlap link** (§3b) — distance-free, names the exact neighbour onecell. Primary.
+2. **Border-marker test** `bBordersObjectAtTo/From` @0x0088c5b4/0x0088c618 — only if the link
+   does not resolve. It checks the onecell's TO/FROM **zerocell**: `bIsPartOfCpxCrossing`
+   (flags bit 4) or `bHasRimAnnotation` (flags bit 1) or an annotation of type `0x31` (§5).
+
+Both are **logical** tests — the runtime never merges nodes by coordinate distance. Each
+cluster keeps its own copy of a boundary junction; the two copies stay distinct objects and
+are related through these links/markers, not through matching positions.
+
+Measured (Kraków, 23,268 zerocells): rim 1,946 (8.4%), cpx 1,124 (4.8%), annot-0x31 202
+(0.9%) — the markers flag only ~12% of nodes. They are a **sparse fallback**, not a
+node-identity key: gating a merge on them alone leaves the OSM at ~31% in one component,
+whereas proximity-unifying every duplicated boundary junction reaches ~86%.
+
+`rnw2osm_rs` therefore unifies boundary nodes in that same order, adding proximity only as an
+OSM-side necessity (OSM needs one shared `<node>` for roads to connect — something the runtime
+never expresses): **overlap links → border marker** (a marked node merges with its nearest
+*marked* twin) **→ proximity** (an unmarked node merges with any nearby twin). `-s` sets the
+radius; `--no-snap` drops the proximity step (marker + links only); `-s 0` drops both
+(links only, the purest faithful mode).
+
 ## 4. Position list (bit 8) — node positions
 
 - Element: **4B** `{s16 dlon, s16 dlat}` (type 3) or **6B** `{s24, s24}`
@@ -122,7 +180,17 @@ neighbour's onecell was wrong; see the correction note in §5.)
 
 ## 5. Zerocell (bit 4) — nodes
 
-Record: **6B** `{u16 f1, u16 listFlags, u16 offz}`; descriptors at `offz`:
+Record: **6B** `{u16 flags, u16 listFlags, u16 offz}`; descriptors at `offz`:
+
+- **`flags` (u16@0)** → in-mem `+0x24` (`rnw_tclZerocellInternal::bRead` @0x00894734 reads
+  it straight into `this+0x24`). This holds the **border markers**:
+  - bit 1 (`0x2`) = `bHasRimAnnotation` (@0x0088b3dc: `(u16@+0x24) >> 1 & 1`)
+  - bit 4 (`0x10`) = `bIsPartOfCpxCrossing` (@0x0088b3ec: `(u16@+0x24) >> 4 & 1`)
+
+  A node is a "border/crossing" node if either bit is set **or** it carries an annotation of
+  type `0x31` in its AnnotList — exactly the runtime's `bBordersObjectAtTo/From`
+  @0x0088c5b4/0x0088c618 test. These are sparse and drive cross-cluster *crossing relevance*,
+  not node identity (measured split + merge order in §3c).
 
 | bit | content |
 |-----|---------|
@@ -163,13 +231,37 @@ descriptors at `offf` (bit order):
 |-----|---------|
 | 0   | AnnotList `{u16 off, u16 cnt}` |
 | 1   | shape ListDesc — **forced coordType 2** (see §7) |
-| 2   | two **inline u16** upcell refs (8B total, NOT a ListDesc) |
+| 2   | two **inline u16** upcell refs (the 4-byte slot itself; NOT a ListDesc, no extra bytes) |
 | 3   | Downcells ListDesc |
 | 4   | Overlaps ListDesc |
 | 5   | shape ListDesc — cluster coordType (3/4), absolute |
 
 Bits 1 and 5 are **mutually exclusive** (`bRead` @0x00892978: bit 5 is read
 only when bit 1 is absent; bit 1 forces a type-2 CoordInfo copy).
+
+> **Most onecells carry NO inline shape — they are straight segments.** Only a
+> minority of onecells set bit 1 or bit 5 (≈36–40% in a typical cluster, e.g.
+> cluster 32704: 230 shaped / 572 total). The rest have neither: their geometry is
+> just the segment between their FROM node (`onecell+0x28`) and TO node
+> (`onecell+0x2A`), i.e. `[fromNode, toNode]` with no intermediate points. The
+> in-memory `rnw_tclOnecellInternal` confirms this: it always has a position
+> ListDesc (the optional intermediate shape) **plus** the from/to node indices at
+> `+0x28`/`+0x2A`. Emitting only shaped onecells therefore drops ~60% of the road
+> network — POL goes from 681,682 roads (shaped-only) to **1,929,222** once the
+> straight `[fromNode→toNode]` segments are included. A shapeless onecell with no
+> distinct valid from/to nodes is a marker/degenerate cell and emits nothing.
+
+> **Descriptor walk — bit 2 is 4 bytes, not 8.** The onecell descriptor stream at
+> `offf` is a contiguous pool: each set bit contributes one 4-byte slot *in bit order*,
+> and consecutive onecells' streams are packed back-to-back (verified: onecells with
+> `listFlags=0x025` sit exactly 12 B apart = 3×4B). Bit 2's payload is the two inline u16
+> upcell refs **inside its own 4-byte slot** — there are no extra bytes. Consuming 8 for
+> bit 2 misaligns every later descriptor, so the absolute (bit-5) shape was read from the
+> wrong offset and decoded to a degenerate near-ref loop (roads rendered "połamana",
+> 2–7 km off). Corrected: bit 2 advances the walk by 4 B only. With this fix all
+> `0x025` motorways in NAV25290.DAT drop from ~6 km error to 1–17 m. (Only onecells with a
+> bit-5 shape *after* a set bit-2 are affected; bit-1 shapes precede bit-2 and were never
+> misaligned.)
 
 `hdr` bits (verified via the `rnw_tclOnecellInternal` accessors):
 
@@ -179,8 +271,8 @@ only when bit 1 is absent; bit 1 forces a type-2 CoordInfo copy).
 | 3      | gateway | `bIsGateway` |
 | 4–6    | networkClass (`nc`) | `u8GetNetworkClass` @0x008888b8 = `(hdr>>4)&7` |
 | 8–11   | roadType (`rt`) | `u8GetRoadType` @0x008888c8 = `(hdr>>8)&0xF` (valid 0–10) |
-| 13     | link (ramp/connecting) | `bIsLink` |
-| 15     | secundary | `bIsSecundary` |
+| 13     | link (ramp/connecting) | `bIsLink` @0x008888e8 = `(hdr>>13)&1` |
+| 15     | secondary (LOD copy) | `bIsSecundary` @0x008888f8 = `(hdr>>15)&1` |
 | 30     | freeway | `bIsFreeway` @0x00888998 = `(hdr>>30)&1` |
 
 Other onecell predicates exist (`bIsFerry/bIsTunnel/bIsBridge/bIsRoundAbout/
@@ -188,6 +280,22 @@ bIsOnewayTo/bIsOnewayFrom/bIsParallel/bIsLongRamp/bIsRestricted/…`) — not ye
 bit-mapped or emitted. Observed (rc,nc) pairs concentrate on (5,7), (6,7), (3,3),
 (2,2); the rest are rare. Valid `nc` values are {0,1,2,3,7}
 (`bIsTpNavNetClassValid` @0x00b5a474).
+
+**bit 15 — `bIsSecundary`: the level-of-detail flag.** A road can be stored as two
+onecells covering the *same geometry* at different detail: a **primary** (full shape,
+usually named) and a **secondary** (simplified, often unnamed, fewer points). They are
+spatial coincident — e.g. the Balice I interchange motorway is primary in cluster 28964
+(3-pt shaped, `WĘZEŁ BALICE I`) and secondary in 28840 (2-pt, unnamed) with an identical
+bounding box. The runtime always renders the **primary**:
+`rnw_tclRefineOCList::oGetPrimaryOverlap` @0x0088c884 takes an onecell and, if it is
+secondary, walks its overlap list (`+0x20`) and substitutes the first ref whose own
+`bIsSecundary` is clear (the primary twin), inverting direction if needed; a primary is
+used as-is. So a secondary is never drawn on its own — it is a coarser fallback that
+resolves to its primary. `rnw2osm_rs` mirrors this: by default it emits primaries only
+(each road once, at full detail — the map the app actually shows); `--secondary` emits that
+coarser layer on its own instead, so the stored duplicates can be inspected in isolation.
+In Krzeszowice that is 9,649 primary vs 3,675 secondary onecells; no cluster is
+secondary-only, so dropping them blanks nothing.
 
 ### 6a. Road class → OSM `highway=*`
 
@@ -233,12 +341,24 @@ than any single RNW road.
 median ~1 m of MAP vertices.
 
 **bit-1 roads (rel8, "reduced"):** each on-disk point is `{s8 dlon, s8 dlat}`,
-`delta = s8·256` PAU, **no ref added at read time** (type 2). The cluster
-reader then converts them (`vCoordReduced2Absolute` @0x00892638, only when
-onecell coordType==2): **each point independently = fromNode + delta**.
-Practical placement using the locally-known TO node:
-`pt_i = toNode + (d_i − d_last)` (last shape point coincides with toNode).
-Validated: 24/24 rel8 roads within 16 m (median <5 m).
+`delta = s8·256` PAU (`bReadRel8` @0x008913d0), **no ref added at read time**
+(type 2). The cluster reader then converts them to absolute
+(`vCoordReduced2Absolute` @0x00892638, called from `rnw_tclClusterInternal::bRead`
+@0x008906ec, only when onecell coordType==2 and from-index < zerocell count).
+**The deltas are DIFFERENTIAL (chained), not independent:** the runtime loop keeps a
+running accumulator seeded with the FROM node's position and, for each point, does
+`acc += delta_i; pt_i = acc` (the decompiled `operator=(arStack_3c, prVar2)` reassigns
+the accumulator every iteration). So:
+
+    pt_{-1} = fromNode.position
+    pt_i    = pt_{i-1} + delta_i        (delta_i = {s8,s8}·256 PAU)
+
+Decoding them independently (`fromNode + delta_i`) bunches every point within ±300 m of
+the from-node and leaves a long road's far toNode as a giant jump — the "zigzag" artifact.
+Chained, the A4 in cluster 29148 goes from max-turn 178° to ~5°. (An earlier
+"toNode + (d_i − d_last)" guess was also wrong.) rel8 is a coarse reduced encoding, so
+the last shape point lands within a few hundred m of toNode; the road line still appends
+the exact toNode.
 
 Both node endpoints are exact once the Position list is decoded, so a full
 RNW road polyline = `[fromNode?] + shapePts + [toNode]` reproduces the MAP
@@ -388,8 +508,10 @@ byte-exact write layout is inferred from the reader + data. A region is three th
   `u16LoadClusterIdListAndStoreInQ` @0x008de974 / `u16LoadClusterIndexTile` @0x008df4a0.
 - **Cluster load path:** `u16ReadCluster` @0x0088670c → `u16LoadCluster` @0x0090add4
   (fileId→filename via `vFileId2Name`, then read `{offset,length}` bytes) →
-  `rnw_tclClusterInternal::bRead(..., flags=0x3060313, ...)` → `u16PatchCluster` (post-load
-  fixup). So a cluster is addressed by **(NAV file, offset, length)** from the TCI — **not** by
+   `rnw_tclClusterInternal::bRead(..., flags=0x3060313, ...)` → `u16PatchCluster` (post-load:
+   resolves cross-cluster refs **and** applies any `CONNECT` `.PTH` patch — see
+   [`PTH_overview.md`](../01%20-%20overview/PTH_overview.md)). So a cluster is addressed by
+   **(NAV file, offset, length)** from the TCI — **not** by
   scanning. The extractor's 16KB-aligned scan (§1) is a read-only heuristic that works because
   non-cluster blocks fail the reference-coordinate check.
 - A `NAVnnnnn.DAT` may begin with a **build-metadata block** before its first cluster (e.g.
@@ -411,20 +533,63 @@ by reader**), the Outline (`refLon/refLat/shift/?/ooff/ocnt` + points), then `li
 - The **skip** bits (1,6,7,9,10) are read as a 4-byte `{u16 off,u16 cnt}` and the payload is
   **ignored** by the reader → a writer emits any 4 bytes (e.g. `0,0`) when the bit is set.
   In POL data only bits 0,1,2,3,4,5,8,10 are ever set; 6,7,9 never appear.
-- **Onecell** = `{u32 hdr, u32 x, u16 listFlags, u16 offf}`; the `x` u32 is read into the struct
-  but **never used** in `bRead` (reserved). The onecell's *own* listFlags: bit 1 = shape points
+- **Onecell** = `{u32 hdr, u32 x, u16 listFlags, u16 offf}`; the `x` u32 is the **stored road
+  length** — `u32GetLength` @0x00913c7c returns `x & 0xffffff` (low 24 bits; units not yet pinned).
+  The onecell's *own* listFlags: bit 1 = shape points
   (type-2 rel8), bit 5 = shape points (type-3/4 absolute) — mutually exclusive; then upcells /
   downcells / overlaps. In-memory size 0x30 B (`ListDesc<Onecell>::bRead` @0x008904a8).
 - **Zerocell** = `{u16 f1, u16 listFlags, u16 offz}`; `f1` is a node type/flags field (values
   `0`/`1` common, occasional `0x22xx`) — not fully mapped (§5).
 
+#### Onecell header word (`hdr`, u32) — full attribute bit map
+
+Every bit below is read by a `rnw_tclOnecellInternal` accessor (addresses in DAPIAPP.OUT), so the
+word is now fully accounted for. The converter emits the class fields always and each flag only
+when set.
+
+| bits | field | accessor | converter tag(s) |
+|------|-------|----------|------------------|
+| 0–2  | road class           | `u8GetRoadClass` @0x008888ac     | `rn_class` |
+| 3    | gateway              | `bIsGateway` @0x008888d8         | `rn_gateway` |
+| 4–6  | network class        | `u8GetNetworkClass` @0x008888b8  | `rn_netclass` |
+| 7    | tunnel               | `bIsTunnel` @0x008889a8          | `tunnel=yes`, `rn_tunnel` |
+| 8–11 | road type            | `u8GetRoadType` @0x008888c8      | `rn_roadtype`; `junction=roundabout` when ==2 |
+| 13   | link                 | `bIsLink` @0x008888e8            | `rn_link` |
+| 14   | location link        | `bIsLocationLink` @0x0088b3cc    | `rn_loc_link` |
+| 15   | secondary            | `bIsSecundary` @0x008888f8       | `rn_sec` |
+| 17   | part of cpx crossing | `bIsPartOfCpxCrossing` @0x00888908 | `rn_cpx_crossing` |
+| 18   | part of cpx road     | `bIsPartOfCpxRoad` @0x00888918   | `rn_cpx_road` |
+| 19   | B-data               | `bIsBData` @0x00888928           | `rn_bdata` |
+| 20   | oneway (from)        | `bIsOnewayFrom` @0x00888938      | `oneway=yes`, `rn_oneway_from` |
+| 21   | oneway (to)          | `bIsOnewayTo` @0x00888948        | `oneway=-1`, `rn_oneway_to` |
+| 23   | ferry                | `bIsFerry` @0x00888958           | `rn_ferry` |
+| 26   | restricted           | `bIsRestricted` @0x00888968      | `rn_restricted` |
+| 27   | blocked              | `bIsBlocked` @0x00888978         | `rn_blocked` |
+| 29   | part of object       | `bIsPartOfObject` @0x00888988    | `rn_part_of_object` |
+| 30   | freeway              | `bIsFreeway` @0x00888998         | `rn_freeway` |
+| 31   | bridge               | `bIsBridge` @0x008889b8          | `bridge=yes`, `rn_bridge` |
+
+- Bits **12, 16, 22, 24, 25, 28** have no accessor found → reserved/unused.
+- Road-type derived predicates (not separate bits): rt==1 `bIsLongRamp` @0x008889c4, rt==2
+  `bIsRoundAbout` @0x008889dc, rt==3 `bIsParallel` @0x00913c64, rt==9 `bIsInterconnect` @0x008889f4.
+- **Oneway direction** (from `rnw_tclLineFollower::bFollowLine` @0x009141a8): the road's stored
+  geometry runs from-node → to-node; `onewayFrom`=1 means traffic travels in that (forward)
+  direction, `onewayTo`=1 means it travels to→from (reverse), and neither set = bidirectional.
+
 ### Still not fully pinned (all avoidable for a minimal working file)
 
 - **`A` (u16@0) / `C` (u32@4):** the reader skips both → write `0` or copy from a reference file.
-- **Onecell `x` (u32@+4):** read but unused in `bRead` → reserved; write `0`/copy.
+- **Onecell `x` (u32@+4):** the stored road length — `u32GetLength` @0x00913c7c returns
+  `x & 0xffffff`; only the **units** remain to be pinned. There is **no separate global road id**:
+  a road's identity is its **index in the cluster's onecell list** — every up/down/overlap reference
+  points to a road by that index (the converter emits it as `rnw_oncell_index`, and the raw length
+  as `rn_length`).
 - **Zerocell `f1`:** node type/flags, partially understood; write `0` for simple nodes.
-- **`u16PatchCluster` post-load fixup:** resolves cross-cluster references by position after a
-  load. Avoid the need entirely by keeping all geometry in **one cluster** (no boundaries).
+- **`u16PatchCluster` post-load step:** does two things — (a) resolves cross-cluster references by
+  position, and (b) applies any `CONNECT` `.PTH` patch to the cluster (base + delta merge; see
+  [`PTH_overview.md`](../01%20-%20overview/PTH_overview.md)). For a minimal file: keep all geometry in
+  **one cluster** (no neighbours → no cross-cluster refs) and ship **no `CONNECT` patch** for the region
+  (the patcher treats "no patch" as a clean no-op), so neither path is triggered.
 - **TCI tile/sector partitioning:** the full geographic→tile→cluster mapping. For a minimal
   dataset emit a single tile listing one cluster that covers the whole area.
 - **AEX content:** optional — omit and leave `bRNWLoadAexData` unset.
@@ -435,7 +600,8 @@ by reader**), the Outline (`refLon/refLat/shift/?/ooff/ocnt` + points), then `li
 One `NAVnnnnn.DAT` containing a **single cluster** with all nodes (zerocells), roads (onecells),
 and the position list for the area, plus a minimal `NAV_ROOT.DAT` whose TCI has one tile with one
 8-byte entry `{offset, length, fileId}` pointing at that cluster. Leave the cluster's ci1/ci2
-lists empty (no neighbours) so no cross-cluster patching is triggered, and omit AEX. This is
+lists empty (no neighbours) **and** ship no `CONNECT` patch for the region, so neither the
+cross-cluster fixup nor the `.PTH` patch step in `u16PatchCluster` is triggered; also omit AEX. This is
 enough for the reader to load and route within the region; it will not reproduce the original
 multi-cluster tiling, which is not needed for a conversion target.
 
