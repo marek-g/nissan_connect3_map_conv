@@ -704,15 +704,70 @@ fn push_once(tags: &mut Vec<Tag>, k: &str, v: String) {
     }
 }
 
+// POI feature code (low byte) -> primary OSM category tag(s). Verified against object names
+// in a Kraków L3 extract and the official icon taxonomy in POI_MAPPING.DAT (see MAP_format.md
+// §7 / §7.1). Only codes confirmed by evidence are mapped; anything else is left to tm:feature.
+fn poi_osm(feat: u32) -> Vec<(&'static str, &'static str)> {
+    match feat & 0xFF {
+        0x02 => vec![("amenity", "parking")],
+        0x04 => vec![("amenity", "fuel")],
+        0x05 => vec![("tourism", "hotel")],
+        0x06 => vec![("amenity", "restaurant")],
+        0x07 => vec![("shop", "car")],
+        0x08 => vec![("office", "company")],
+        0x09 => vec![("amenity", "car_rental")],
+        0x10 => vec![("amenity", "school")],
+        0x11 => vec![("amenity", "bar")],
+        0x12 => vec![("leisure", "sports_centre")],
+        0x13 => vec![("amenity", "pharmacy")],
+        0x14 => vec![("shop", "supermarket")],
+        0x15 => vec![("amenity", "bank")],
+        0x16 => vec![("amenity", "place_of_worship")],
+        // 0x17 (dec 23) is a mixed leisure/attraction class: sports clubs (SE/SK/TK), castles,
+        // beaches, squares — verified from names. tourism=attraction is the OSM catch-all.
+        0x17 => vec![("tourism", "attraction")],
+        0x22 => vec![("railway", "station")],
+        _ => Vec::new(),
+    }
+}
+
+// Polygon/area feature code (low byte) -> OSM landuse/natural tag(s). Verified against names +
+// spatial/size analysis of a Kraków-area L3 extract (§7): 0x2B large forests in the south, 0x48
+// water bodies, 0x39 cemeteries, 0x3A shopping/commercial zones, 0x9C small city-centre blocks,
+// 0x38 large unnamed rural open land. The unnamed classes (0x9C urban, 0x38 rural) are best-effort;
+// the exact code always stays in tm:feature.
+fn landuse_osm(feat: u32) -> Vec<(&'static str, &'static str)> {
+    match feat & 0xFF {
+        0x2B => vec![("natural", "wood"), ("landuse", "forest")],
+        0x38 => vec![("landuse", "grass")],
+        0x39 => vec![("landuse", "cemetery")],
+        0x3A => vec![("landuse", "commercial")],
+        0x48 => vec![("natural", "water"), ("water", "lake")],
+        0x9C => vec![("landuse", "residential")],
+        _ => Vec::new(),
+    }
+}
+
 fn add_semantic(tags: &mut Vec<Tag>, kind: &str, cats: &Cats) {
     if kind == "poi" {
-        // POI categories -> amenity (high confidence).
-        if cats.gas {
-            push_once(tags, "amenity", "fuel".into());
-        } else if cats.parking {
-            push_once(tags, "amenity", "parking".into());
-        } else if cats.restaurant {
-            push_once(tags, "amenity", "restaurant".into());
+        // Primary: POI feature code -> OSM category (see poi_osm / §7). Direct and covers more
+        // categories than the annotation flags below.
+        let feat = tag_value(tags, "tm:feature")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        for (k, v) in poi_osm(feat) {
+            push_once(tags, k, v.into());
+        }
+        // Fallback: categories also detectable via annotation, for POIs whose feature code is
+        // not in poi_osm. push_once keeps the feature-based value if it already set the key.
+        if !tags.iter().any(|t| t.k == "amenity") {
+            if cats.gas {
+                push_once(tags, "amenity", "fuel".into());
+            } else if cats.parking {
+                push_once(tags, "amenity", "parking".into());
+            } else if cats.restaurant {
+                push_once(tags, "amenity", "restaurant".into());
+            }
         }
         // Named settlement -> place (best-effort from size class: 0x1 largest .. 0xC smallest).
         if cats.city {
@@ -746,8 +801,21 @@ fn add_semantic(tags: &mut Vec<Tag>, kind: &str, cats: &Cats) {
             };
             push_once(tags, "waterway", ww.into());
         } else if kind == "polygon" {
+            // closed water body (lake/reservoir/pond)
             push_once(tags, "natural", "water".into());
-            push_once(tags, "water", "water".into());
+            push_once(tags, "water", "lake".into());
+        }
+    }
+
+    // Areas -> landuse/natural from the feature code (see landuse_osm / §7). Covers water too,
+    // so a water polygon without a 0x10 annotation still gets natural=water. Best-effort for the
+    // unnamed urban (0x9C) and rural (0x38) classes; push_once keeps any earlier value.
+    if kind == "polygon" {
+        let feat = tag_value(tags, "tm:feature")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        for (k, v) in landuse_osm(feat) {
+            push_once(tags, k, v.into());
         }
     }
 

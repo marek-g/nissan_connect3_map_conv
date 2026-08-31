@@ -390,19 +390,24 @@ extract and against the official icon taxonomy in `POI_MAPPING.DAT` (see §7.1):
 | 0x94 | 4 |
 | 0x9C | 0x23 |
 
-**Verified land-use class (polygon low byte)** — the low byte picks the terrain class, which is
-what the renderer colours. High byte = display scale only. From a Kraków L3 extract:
+ **Verified land-use class (polygon low byte)** — the low byte picks the terrain class, which is
+ what the renderer colours. High byte = display scale only. From a Kraków-area L3 extract
+ (city + suburbs + rural south), with the OSM tag now emitted by the converter:
 
-| feature (low byte) | terrain | evidence (Kraków names / layer) | typical map colour |
-|--------------------|---------|----------------------------------|--------------------|
-| 0x48 | water | WISŁA, ZALEW BAGRY, STAW PŁASZOWSKI (`water_area`) | blue |
-| 0x39 | park / green space | PARK IM. JERZMANOWSKICH, LASEK, CMENTARZ (green subset) | green |
-| 0x3A | built-up / industrial | KRAKOWSKA FABRYKA KABLI, SZPITAL UNIW., BONARKA CITY CENTER | grey/brown |
-| 0x9C | urban blocks / developed (dominant in city centres) | 1506 unnamed `area` polygons | light grey |
-| 0x38, 0x2B | other developed / special areas | BONARKA etc. | grey variants |
+ | feature (low byte) | terrain | evidence (names / size / location) | OSM tag | map colour |
+ |--------------------|---------|-------------------------------------|---------|-----------|
+ | 0x9C | urban blocks (dominant) | 4279 small (~0.04 km²) unnamed, city-centre centroid | `landuse=residential`* | light grey |
+ | 0x38 | rural open land | 737 large (~5.7 km²) unnamed, rural south | `landuse=grass`* | green |
+ | 0x2B | forest / woodland | LAS BRONACZOWA, PUSZCZA NIEPOŁOMICKA (large, south) | `natural=wood` + `landuse=forest` | dark green |
+ | 0x39 | cemetery | CMENTARZ GORZKÓW, CMENTARZ KOMUNALNY, … | `landuse=cemetery` | grey-green |
+ | 0x3A | commercial / shopping | DEKADA, PARK HANDLOWY ZAKOPIANKA, BONARKA CITY CENTER (+ some hospital) | `landuse=commercial`* | brown/grey |
+ | 0x48 | water body | WISŁA, STAW PŁASZOWSKI, ZALEW BAGRY | `natural=water` + `water=lake` | blue |
 
-So the "grey = urban, green = park/forest, blue = water" scheme the user expects is driven by
-these low-byte classes; the exact RGB per class lives in the renderer's style config (see §7.2).
+ \* best-effort: these classes are unnamed and mixed (urban blocks can be residential/commercial/
+ industrial; rural open land can be grass/meadow/farmland; 0x3A mixes shopping with some hospitals).
+ The exact code is preserved in `tm:feature` for a finer pass. So the "grey = urban, green =
+ forest/grass, blue = water" scheme the user expects is driven by these low-byte classes; the exact
+ RGB per class lives in the renderer's style config (see §7.2).
 
 **`tm:state` (cell byte 0–1)** — a constant per dataset/profile, **not** a category: every
 feature in an N6E2 L3 extract carried `state = 16876 (0x41EC)` regardless of kind or feature.
@@ -655,13 +660,19 @@ carries `id` + `version="1"` + `timestamp` (dataset date) so JOSM/osmium accept 
 Tags, three layers:
 
 1. **Standard OSM** (semantic overlay, best-effort, so JOSM/routing can use the file):
-   `name`, `name:alt` (`'; '`-separated variants), `ref`, `amenity` (fuel/parking/
-   restaurant from POI categories), `place` (city/town/village/hamlet from city size
-   class), `waterway` (river/canal/stream/ditch from water type), `natural=water`+
-   `water=water` (water polygons), and roads: `highway` (motorway…service from network
-   class, or `rest_area`; `<class>_link` for ramps/interconnects; `ferry` for ferry
-   routes), `toll=yes`, `junction=roundabout`. Two things are deliberately NOT mapped to
-   standard OSM keys; Ghidra confirms why (DAPIAPP.OUT):
+   `name`, `name:alt` (`'; '`-separated variants), `ref`, and — driven by the POI feature
+   code (§7) — a category tag per point: `amenity` (parking/fuel/restaurant/car_rental/
+   school/bar/pharmacy/bank/place_of_worship), `shop` (car/supermarket), `tourism=hotel`,
+   `leisure` (sports_centre/park), `office=company`, `railway=station`. Plus `place`
+   (city/town/village/hamlet from city size class), areas — driven by the polygon feature
+   code (§7): `landuse` (residential/commercial/cemetery/grass) and `natural=wood`+
+   `landuse=forest` (forests), `natural=water`+`water=lake` (closed water polygons),
+   `waterway` (river/canal/stream/ditch from water type), and roads:
+   `highway` (motorway…service from network class, or `rest_area`; `<class>_link` for
+   ramps/interconnects; `ferry` for ferry routes), `toll=yes`, `junction=roundabout`.
+   Only feature codes confirmed by evidence are mapped; the exact code always stays in
+   `tm:feature`. Two things are deliberately NOT mapped to standard OSM keys; Ghidra
+   confirms why (DAPIAPP.OUT):
     - **oneway / direction** is *not stored in the MAP display format at all* — it lives only
       in RNW routing data (`rnw_tclLocalOneCellRef` u16, bits 13-14: both-clear = two-way,
       bit13 = same-direction-only, bit14 = reverse-direction-only; `bHasLaneIn*Directions`).
