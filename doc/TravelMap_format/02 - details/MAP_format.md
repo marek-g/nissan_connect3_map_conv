@@ -453,6 +453,31 @@ conventions of both consumers (`u8RoadInfo2Flags(u32,u16)` @0x0091d398 and
 Note the two distinct "bit 10"s: u16 bit 10 feeds the flag byte, u32 bit 10 is the
 intersection-free flag.
 
+#### Road info (0x11) sub-attributes
+
+The *same* `{u16 w, u32 d}` also carries road sub-attributes, unpacked by
+`u16ConvertRoadSubAttribs(d,w)` @0x0091eb60 (each gated on its own field being non-zero):
+
+| sub-attribute | source field | values (`u8Road*2RoadSubAttr*`) | OSM mapping |
+|---------------|--------------|----------------------------------|-------------|
+| toll | `w & 0x30` (bits 4–5) | `0x10`→3, `0x20`→2, `0x30`→1, else 0 (`u8RoadToll2…` @0x0091d308) | non-zero → `toll=yes` |
+| ferry | `w & 0xC0` (bits 6–7) | `0x40`→3, `0x80`→2, `0xC0`→1, else 0 (`u8RoadFerry2…` @0x0091d338) | non-zero → `highway=ferry` |
+| closed (DtClose) | `w & 0x300` (bits 8–9) | `u8RoadDf2RoadSubAttrDtClose` @0x0091d368 | kept raw (`tm:closed`), not OSM-mapped |
+| **road type** | `w & 0xF000` (bits 12–15) | see table below (`u8RoadType2…` @0x0091d264; `bIs*` one-cell predicates) | link / roundabout |
+| display class | `d & 0xF0` (bits 4–7) | `u8RoadDispClass2…` @0x0091d178 | kept raw, not OSM-mapped |
+
+Road type values (confirmed via `rnw_tclOnecellInternal::bIs*` on `u8GetRoadType`):
+
+| value | meaning | predicate | OSM |
+|-------|---------|-----------|-----|
+| 1 | long ramp | `bIsLongRamp` @0x008889c4 | `<class>_link` (unclassified → `service_link`) |
+| 2 | roundabout | `bIsRoundAbout` @0x008889dc | `junction=roundabout` |
+| 3 | parallel road | `bIsParallel` @0x00913c64 | (kept raw) |
+| 9 | interconnect / slip road | `bIsInterconnect` @0x008889f4 | `<class>_link` |
+
+So a ramp/interconnect on a motorway becomes `highway=motorway_link`, on a trunk
+`trunk_link`, etc. — matching the OSM convention for slip roads / interchange ramps.
+
 #### City type (0x21) bit layout
 
 Payload `u16 v`, split by `u8ConvertCityType2{DisplayLvl,Inhabitants,AdminLvl,NameOverlapping}` @0x0091d4c4/d3fc/d588/d670:
@@ -515,27 +540,58 @@ Interning on the write side: `u16AddText` / `u16DumpToMem` @ `0x008e0584`.
 ## 9. Converter — Usage
 
 ```
-map2osm_rs   <IDX_file | directory> [-r CODES] [-l LEVELS] [-o OUT_DIR]
+map2osm_rs   <IDX_file | directory> [-r CODES] [-l LEVELS] [-b W,S,E,N|none] [-o OUT_DIR]
 ```
 
 - `-r N6E1,N6E2` — exact region-code filter (when a directory is given); omit for all 411 regions.
 - `-l 0123` — levels to convert (default `123`; **L0 works** — whole-region outline level).
+- `-b W,S,E,N` — bounding box in decimal degrees (west,south,east,north); only tiles whose
+  extent overlaps the box are converted. Same syntax as `rnw2osm_rs`. `none` (default) = no filter.
 - `-o DIR` — writes `DIR/<REGION>_L<level>.osm` (OSM XML; omit for stdout).
 
 Output (see https://wiki.openstreetmap.org/wiki/OSM_XML): POIs → `<node>` with tags,
 lines → open `<way>`, polygons → closed `<way>` (first node repeated); unique coordinates
 are deduplicated into single `<node>` elements written before the ways; every object
 carries `id` + `version="1"` + `timestamp` (dataset date) so JOSM/osmium accept the file.
-Tags: `name`, `name:alt` (`'; '`-separated variants), `ref`, plus the original
-converter properties under a custom namespace: `tm:kind/tm:layer/tm:tile/tm:profile/
-tm:state/tm:feature/tm:type`, and decoded annotation payloads (see §8):
-`tm:surface`, `tm:elev`, `tm:water_class`, `tm:water_type`, `tm:netclass`, `tm:xfree`,
-`tm:roadinfo`, `tm:city_display`, `tm:city_size`, `tm:city_admin`, `tm:city_overlap`.
+Tags, three layers:
 
-Example (Poland):
+1. **Standard OSM** (semantic overlay, best-effort, so JOSM/routing can use the file):
+   `name`, `name:alt` (`'; '`-separated variants), `ref`, `amenity` (fuel/parking/
+   restaurant from POI categories), `place` (city/town/village/hamlet from city size
+   class), `waterway` (river/canal/stream/ditch from water type), `natural=water`+
+   `water=water` (water polygons), and roads: `highway` (motorway…service from network
+   class, or `rest_area`; `<class>_link` for ramps/interconnects; `ferry` for ferry
+   routes), `toll=yes`, `junction=roundabout`. Two things are deliberately NOT mapped to
+   standard OSM keys; Ghidra confirms why (DAPIAPP.OUT):
+    - **oneway / direction** is *not stored in the MAP display format at all* — it lives only
+      in RNW routing data (`rnw_tclLocalOneCellRef` u16, bits 13-14: both-clear = two-way,
+      bit13 = same-direction-only, bit14 = reverse-direction-only; `bHasLaneIn*Directions`).
+      The MAP line's road attribute (0x11) carries no direction, so it cannot be mapped.
+    - **surface** (0x01) is fully decodable (`enConvertSurface`, table in §8) but the binary has
+      no material-name table for the resulting enum, so an OSM `surface=` value would be a guess;
+      the raw code stays in `tm:surface`.
+   Road sub-attributes (link/ramp, toll, ferry, roundabout) ARE mapped — see the 0x11
+   sub-attribute table in §8 for the confirmed bit layout and road-type values.
+2. **Converter properties** (custom namespace): `tm:kind/tm:layer/tm:tile/tm:profile/
+   tm:state/tm:feature/tm:type`.
+3. **Decoded annotation payloads** (see §8) — raw values preserved for an OSM→TravelMap
+   writer: `tm:surface`, `tm:elev`, `tm:dcm`(+`tm:dcm_class`), `tm:water_class`,
+    `tm:water_type`, `tm:netclass`, `tm:xfree`, `tm:road_type`, `tm:toll`, `tm:ferry`,
+    `tm:closed`, `tm:roadinfo`, `tm:roadnum_status`,
+    `tm:roadnum_mid`, `tm:city_display/size/admin/overlap`, `tm:rest_area`,
+   `tm:spec:<type>` (grouped list/specification runs), and `tm:raw:<type>` (lossless
+   hex fallback for any other annotation type, e.g. parking/fuel/restaurant/brand POI
+   categories). Note: polygon cells can carry many annotations (e.g. thousands of DCM),
+   so a lossless conversion is large — use per-region output and/or gzip.
+
+Examples:
 
 ```
+# whole regions, all default levels
 map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
+
+# only tiles overlapping a bounding box (Krzeszowice), detail level
+map2osm_rs .../DATA/DATA/MAP -r N6E2 -l 3 -b 19.50,50.05,19.88,50.28 -o /tmp/krz
 ```
 
 Performance: N6E2 L2 ≈ 560 MB of OSM XML in ~6 s. A full world conversion is multi-GB —

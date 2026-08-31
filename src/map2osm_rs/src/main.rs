@@ -53,6 +53,39 @@ fn pau_to_deg(v: i64) -> f64 {
     (v as f64) * 180.0 / (1i64 << 31) as f64
 }
 
+// PAU per degree of longitude/latitude (inverse of pau_to_deg); matches rnw2osm_rs.
+const PAU: f64 = (1i64 << 31) as f64 / 180.0;
+
+// Bounding box in degrees, same `-b W,S,E,N` syntax as rnw2osm_rs (`none` = disabled).
+// Only tiles whose extent shares any area with the box are converted.
+struct BBox {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+impl BBox {
+    // True if this box overlaps an axis-aligned tile extent given as PAU bounds (w,s,e,n).
+    fn intersects_pau(&self, w: f64, s: f64, e: f64, n: f64) -> bool {
+        self.west * PAU < e && w < self.east * PAU && self.south * PAU < n && s < self.north * PAU
+    }
+    fn parse(spec: &str) -> Option<BBox> {
+        if spec.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let mut it = spec.split(',');
+        let west: f64 = it.next()?.parse().ok()?;
+        let south: f64 = it.next()?.parse().ok()?;
+        let east: f64 = it.next()?.parse().ok()?;
+        let north: f64 = it.next()?.parse().ok()?;
+        if it.next().is_some() || !(west < east && south < north) {
+            return None;
+        }
+        Some(BBox { west, south, east, north })
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct Tag {
     #[serde(rename = "@k")]
@@ -182,8 +215,8 @@ impl Region {
         out
     }
 
-    // tile center (PAU) for tile K of the level
-    fn tile_box(&self, level: usize, k: i64) -> (i64, i64) {
+    // tile extent (PAU) for tile K of the level: (west, south, east, north)
+    fn tile_extent(&self, level: usize, k: i64) -> (i64, i64, i64, i64) {
         let w = self.east - self.west;
         let h = self.north - self.south;
         let (rel_w, rel_s, rel_e, rel_n) = match level {
@@ -211,10 +244,12 @@ impl Region {
         };
         let a = SHIFTS[level] as i64 + 1;
         let al = |x: i64| (x >> a) << a;
-        let w2 = al(self.west + rel_w);
-        let s2 = al(self.south + rel_s);
-        let e2 = al(self.west + rel_e);
-        let n2 = al(self.south + rel_n);
+        (al(self.west + rel_w), al(self.south + rel_s), al(self.west + rel_e), al(self.south + rel_n))
+    }
+
+    // tile center (PAU) for tile K of the level
+    fn tile_box(&self, level: usize, k: i64) -> (i64, i64) {
+        let (w2, s2, e2, n2) = self.tile_extent(level, k);
         ((w2 + e2) / 2, (s2 + n2) / 2)
     }
 }
@@ -295,9 +330,27 @@ fn set_cat(c: &mut Cats, t: u8) {
     }
 }
 
-// Decode the payload of a single annotation into OSM tags. Only types whose
-// on-disk layout is verified are emitted; raw values are preserved so a future
-// OSM->TravelMap writer can reconstruct the bytes exactly (see MAP_IDX_format.md §8).
+// Annotation types that appear as runs of consecutive same-type 4-byte {u16}
+// elements ("list"/specification). Grouped into a single ';'-joined tag.
+const LIST_SPEC_TYPES: [u8; 12] =
+    [0x31, 0x32, 0x33, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49];
+
+fn is_list_spec(t: u8) -> bool {
+    LIST_SPEC_TYPES.contains(&t)
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
+    s
+}
+
+// Decode the payload of a single (non-list) annotation into OSM tags. Verified
+// layouts are decoded to named tm:* tags; anything else falls back to its raw
+// payload hex so an OSM->TravelMap writer can reconstruct the bytes exactly
+// (see MAP_format.md §8). Raw values are the ground truth.
 fn ann_tags(blk: &[u8], pos: usize, size: usize, typ: u8) -> Vec<Tag> {
     let mut out = Vec::new();
     let p = pos + 2; // payload starts after {u8 size, u8 type}
@@ -315,23 +368,78 @@ fn ann_tags(blk: &[u8], pos: usize, size: usize, typ: u8) -> Vec<Tag> {
         0x03 if size >= 3 && p + 1 <= blk.len() => {
             tag!("tm:elev", (blk[p] as i8).to_string());
         }
+        // DCM (3D / city model): payload = {u16, u8, u8, u8, u8}; byte2 = class
+        // (u8ConvertDCMClass: 0x00->1, 0x20..0x32 -> 2..20). Raw kept for round-trip.
+        0x04 if size >= 8 && p + 6 <= blk.len() => {
+            let a = u16le(blk, p);
+            let c = blk[p + 3];
+            tag!(
+                "tm:dcm",
+                format!(
+                    "{:04x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    a,
+                    blk[p + 2],
+                    c,
+                    blk[p + 4],
+                    blk[p + 5]
+                )
+            );
+            let cls = if c == 0 {
+                1u32
+            } else if (0x20..=0x32).contains(&c) {
+                (c - 0x20 + 2) as u32
+            } else {
+                0
+            };
+            if cls != 0 {
+                tag!("tm:dcm_class", cls.to_string());
+            }
+        }
         // water: payload = u16; low nibble = class code, high nibble = type code
         0x10 if size >= 4 && p + 2 <= blk.len() => {
             let v = u16le(blk, p);
             tag!("tm:water_class", (v & 0xF).to_string());
             tag!("tm:water_type", ((v >> 4) & 0xF).to_string());
         }
-        // road info: payload = {u16, u32}
-        //   u16 bits 0-2 = network class; bit 10 -> flag byte bit0;
-        //   bit 3 / bit 11 -> inverted flags; u32 bits 0-3 -> flags;
-        //   "intersection-free" (userdef road class) = u32 bit 10.
+        // road info: payload = {u16 w, u32 d}. Bit layout confirmed via u16ReadRoadInfo +
+        // u16ConvertRoadSubAttribs / u8RoadInfo2Flags / u16ConvertRoadClass (Ghidra):
+        //   w bits 0-2 = network class; bits 4-5 = toll; bits 6-7 = ferry; bits 8-9 = closed
+        //   (DtClose); bits 12-15 = road type (1=long ramp, 2=roundabout, 3=parallel,
+        //   9=interconnect/link); bit 10/11 + d bits -> flags (restricted/blocked/tunnel/…).
+        //   d bits 4-7 = display class; bit 10 = intersection-free.
         0x11 if size >= 8 && p + 6 <= blk.len() => {
             let w = u16le(blk, p);
             let d = u32le(blk, p + 2);
             tag!("tm:netclass", (w & 7).to_string());
             tag!("tm:xfree", ((d >> 10) & 1).to_string());
+            // sub-attributes (u16ConvertRoadSubAttribs), firmware-decoded values:
+            let rt = ((w >> 12) & 0xF) as u32;
+            tag!("tm:road_type", if rt <= 9 { rt.to_string() } else { "0".to_string() });
+            tag!(
+                "tm:toll",
+                match w & 0x30 {
+                    0x10 => "3",
+                    0x20 => "2",
+                    0x30 => "1",
+                    _ => "0",
+                }
+                .to_string()
+            );
+            tag!(
+                "tm:ferry",
+                match w & 0xC0 {
+                    0x40 => "3",
+                    0x80 => "2",
+                    0xC0 => "1",
+                    _ => "0",
+                }
+                .to_string()
+            );
+            tag!("tm:closed", ((w >> 8) & 0x3).to_string());
             tag!("tm:roadinfo", format!("{:04x}:{:08x}", w, d));
         }
+        // note: 0x14 (road number) is handled in parse_annotations (it may repeat on one
+        // way and is joined into single ref / tm:roadnum_* tags there).
         // city type: payload = u16
         //   bits 0-3 display level (1..14), bits 4-7 size class (inverted scale),
         //   bits 8-10 admin level (0..14 -> 1..15), bit 15 name-overlapping flag.
@@ -342,23 +450,53 @@ fn ann_tags(blk: &[u8], pos: usize, size: usize, typ: u8) -> Vec<Tag> {
             tag!("tm:city_admin", ((v >> 8) & 7).to_string());
             tag!("tm:city_overlap", ((v >> 15) & 1).to_string());
         }
+        // rest area: payload = u8 pass-through
+        0x22 if size >= 3 && p + 1 <= blk.len() => {
+            tag!("tm:rest_area", blk[p].to_string());
+        }
+        // Lossless fallback: preserve the raw payload bytes of any other type
+        // (0x23 parking, 0x30 fuel, 0x34 restaurant, 0x35 brand, 0x51 image id,
+        // 0x52 landmarks, ...). No semantic assumption -> nothing is dropped.
+        // 0x7A (name) is excluded: its payload is a text index already resolved
+        // into `name`, so echoing it as raw hex would only be noise.
+        _ if typ != 0x7A && size >= 3 && p + (size - 2) <= blk.len() => {
+            tag!(format!("tm:raw:{:02x}", typ), hex_bytes(&blk[p..p + size - 2]));
+        }
         _ => {}
     }
     out
 }
 
+// Join values with ';', dropping consecutive repeats (a way can carry several road
+// numbers -> ref="60;A53"; identical mid/status codes collapse to one).
+fn join_dedup(items: &[String]) -> String {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        if out.last().map(|l| l == it) != Some(true) {
+            out.push(it.clone());
+        }
+    }
+    out.join(";")
+}
+
 fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<String>, Cats, Vec<Tag>) {
     let start = (desc & 0xFFFF) as usize;
     let count = ((desc >> 16) & 0xFFFF) as usize;
-    if count == 0 || count > 32 {
+    // Polygon cells can carry a large number of annotations (e.g. many DCM
+    // entries). The per-iteration bounds checks below stop the walk at the end
+    // of the block or on a malformed size, so a generous cap is safe.
+    if count == 0 || count > 4096 {
         return (None, None, Cats::default(), Vec::new());
     }
     let mut pos = start * 4;
     let mut names = None;
-    let mut ref_ = None;
+    let mut refs: Vec<String> = Vec::new();
+    let mut rn_mid: Vec<String> = Vec::new();
+    let mut rn_status: Vec<String> = Vec::new();
     let mut cats = Cats::default();
     let mut tags = Vec::new();
-    for _ in 0..count {
+    let mut i = 0usize;
+    while i < count {
         if pos + 2 > blk.len() {
             break;
         }
@@ -368,19 +506,51 @@ fn parse_annotations(blk: &[u8], desc: u32) -> (Option<Vec<String>>, Option<Stri
             break;
         }
         set_cat(&mut cats, typ);
-        tags.extend(ann_tags(blk, pos, size, typ));
-        if (typ == 0x7A || typ == 0x14) && pos + 4 <= blk.len() {
-            let v = u16le(blk, pos + 2) as usize;
-            if let Some(rec) = read_text_record(blk, v * 4) {
-                if typ == 0x7A {
-                    names = Some(rec);
-                } else {
-                    ref_ = rec.into_iter().next();
+        if is_list_spec(typ) && size == 4 && pos + 4 <= blk.len() {
+            // Group the run of consecutive same-type elements into one tag.
+            let mut vals = Vec::new();
+            loop {
+                vals.push(u16le(blk, pos + 2).to_string());
+                pos += size;
+                i += 1;
+                if i < count && pos + 2 <= blk.len() && blk[pos] == 4 && blk[pos + 1] == typ {
+                    continue;
+                }
+                break;
+            }
+            tags.push(Tag { k: format!("tm:spec:{:02x}", typ), v: vals.join(";") });
+        } else if typ == 0x14 && size >= 8 && pos + 8 <= blk.len() {
+            // road number: payload = {u16 textRef, u16 mid, u16 status} @ pos+2. A way can
+            // carry several numbers; collect each (resolved text + raw mid/status) and join
+            // them into single tags below so no key is duplicated.
+            let textref = u16le(blk, pos + 2);
+            rn_mid.push(u16le(blk, pos + 4).to_string());
+            rn_status.push(u16le(blk, pos + 6).to_string());
+            if let Some(rec) = read_text_record(blk, (textref as usize) * 4) {
+                if let Some(t) = rec.into_iter().next() {
+                    refs.push(t);
                 }
             }
+            pos += size;
+            i += 1;
+        } else {
+            tags.extend(ann_tags(blk, pos, size, typ));
+            if typ == 0x7A && pos + 4 <= blk.len() {
+                let v = u16le(blk, pos + 2) as usize;
+                if let Some(rec) = read_text_record(blk, v * 4) {
+                    names = Some(rec);
+                }
+            }
+            pos += size;
+            i += 1;
         }
-        pos += size;
     }
+    // Join multiple road numbers into one tag each (no duplicate keys).
+    if !rn_mid.is_empty() {
+        tags.push(Tag { k: "tm:roadnum_status".to_string(), v: join_dedup(&rn_status) });
+        tags.push(Tag { k: "tm:roadnum_mid".to_string(), v: join_dedup(&rn_mid) });
+    }
+    let ref_ = if refs.is_empty() { None } else { Some(join_dedup(&refs)) };
     (names, ref_, cats, tags)
 }
 
@@ -518,6 +688,116 @@ fn make_tags(
     tags
 }
 
+// Map the decoded tm:* values / categories onto standard OSM keys so the file is
+// usable in JOSM/routing. The raw tm:* tags are kept as ground truth; these are
+// best-effort semantic overlays. Only mappings with a defensible basis are emitted
+// (POI amenities, place for named settlements, waterway/natural for water, highway
+// from network class). surface/oneway/link are deliberately NOT mapped: the raw
+// values are preserved in tm:* but their exact OSM semantics aren't confirmed.
+fn tag_value<'a>(tags: &'a [Tag], k: &str) -> Option<&'a str> {
+    tags.iter().find(|t| t.k == k).map(|t| t.v.as_str())
+}
+
+fn push_once(tags: &mut Vec<Tag>, k: &str, v: String) {
+    if !tags.iter().any(|t| t.k == k) {
+        tags.push(Tag { k: k.to_string(), v });
+    }
+}
+
+fn add_semantic(tags: &mut Vec<Tag>, kind: &str, cats: &Cats) {
+    if kind == "poi" {
+        // POI categories -> amenity (high confidence).
+        if cats.gas {
+            push_once(tags, "amenity", "fuel".into());
+        } else if cats.parking {
+            push_once(tags, "amenity", "parking".into());
+        } else if cats.restaurant {
+            push_once(tags, "amenity", "restaurant".into());
+        }
+        // Named settlement -> place (best-effort from size class: 0x1 largest .. 0xC smallest).
+        if cats.city {
+            let size = tag_value(tags, "tm:city_size").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let place = match size {
+                1..=3 => "city",
+                4..=6 => "town",
+                7..=9 => "village",
+                _ => "hamlet",
+            };
+            push_once(tags, "place", place.into());
+        }
+    }
+
+    // Rest area -> highway=rest_area (OSM convention for service-area nodes).
+    if cats.rest_area {
+        push_once(tags, "highway", "rest_area".into());
+    }
+
+    // Water: lines -> waterway (best-effort), polygons -> natural=water.
+    if cats.water {
+        if kind == "line" {
+            let wt = tag_value(tags, "tm:water_type").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let ww = match wt {
+                1 => "river",
+                2 => "canal",
+                3 => "stream",
+                4 => "ditch",
+                5 => "stream",
+                _ => "other",
+            };
+            push_once(tags, "waterway", ww.into());
+        } else if kind == "polygon" {
+            push_once(tags, "natural", "water".into());
+            push_once(tags, "water", "water".into());
+        }
+    }
+
+    // Roads -> highway from network class (lower class = more major), refined by the
+    // Ghidra-confirmed sub-attributes: ferry routes, link roads (long ramp / interconnect),
+    // roundabouts, and toll. Raw tm:* values stay as ground truth.
+    if kind == "line" && (cats.roadinfo || cats.roadnum) {
+        let nc = tag_value(tags, "tm:netclass").and_then(|s| s.parse::<u32>().ok()).unwrap_or(7);
+        let base = match nc {
+            0 => "motorway",
+            1 => "trunk",
+            2 => "primary",
+            3 => "secondary",
+            4 => "tertiary",
+            5 => "unclassified",
+            6 => "residential",
+            _ => "service",
+        };
+        let rtype = tag_value(tags, "tm:road_type")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let ferry = tag_value(tags, "tm:ferry").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+
+        if ferry != 0 {
+            // a ferry route, not a road class
+            push_once(tags, "highway", "ferry".into());
+        } else if rtype == 1 || rtype == 9 {
+            // long ramp / interconnect -> OSM link road: <class>_link (unclassified has no
+            // *_link value in OSM -> service_link)
+            let link = match base {
+                "unclassified" => "service_link".to_string(),
+                c => format!("{}_link", c),
+            };
+            push_once(tags, "highway", link);
+        } else {
+            push_once(tags, "highway", base.into());
+        }
+        if rtype == 2 {
+            push_once(tags, "junction", "roundabout".into());
+        }
+        if tag_value(tags, "tm:toll")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            != 0
+        {
+            push_once(tags, "toll", "yes".into());
+        }
+    }
+}
+
 // (k, entries, (cx, cy)) for every non-empty tile of the level
 fn iter_tiles(region: &Region, level: usize) -> Vec<(i64, Vec<(u32, u32, u32)>, (i64, i64))> {
     let cnt = region.tables[level].0;
@@ -589,6 +869,7 @@ fn parse_block(
                     let kind = if li == 0 { "polygon" } else { "line" };
                     let mut tags = make_tags(kind, state, feat, k, rp, &names, &ref_, &cats);
                     tags.extend(ann);
+                    add_semantic(&mut tags, kind, &cats);
                     feats.push(Feature::Way { pts, tags, closed: li == 0 });
                 }
             } else {
@@ -602,6 +883,7 @@ fn parse_block(
                 }
                 let mut tags = make_tags("poi", state, feat, k, rp, &names, &ref_, &cats);
                 tags.extend(ann);
+                add_semantic(&mut tags, "poi", &cats);
                 feats.push(Feature::Poi { lon: cx + (dlon << sh), lat: cy + (dlat << sh), tags });
             }
         }
@@ -637,7 +919,18 @@ fn to_osm(f: Feature) -> Option<OsmFeat> {
     }
 }
 
-fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io::Result<(usize, usize)> {
+// Keep a tile only when no bbox is set, or its extent overlaps the requested box.
+fn tile_in_bbox(region: &Region, level: usize, k: i64, bbox: &Option<BBox>) -> bool {
+    match bbox {
+        None => true,
+        Some(bb) => {
+            let (w, s, e, n) = region.tile_extent(level, k);
+            bb.intersects_pau(w as f64, s as f64, e as f64, n as f64)
+        }
+    }
+}
+
+fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize, bbox: &Option<BBox>) -> io::Result<(usize, usize)> {
     let mut maps: HashMap<String, Vec<u8>> = HashMap::new();
     // pass 1: assign node ids (dedup by coordinate) + remember POI tags
     let mut node_ids: HashMap<String, i64> = HashMap::new();
@@ -645,6 +938,9 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io:
     let mut poi_tags: HashMap<String, Vec<Tag>> = HashMap::new();
     let mut next_id: i64 = 1;
     for (k, ents, box_) in iter_tiles(region, level) {
+        if !tile_in_bbox(region, level, k, bbox) {
+            continue;
+        }
         for &(rp, ln, off) in &ents {
             let feats = match parse_block(region, level, rp, ln, off as usize, box_.0, box_.1, k, &mut maps) {
                 Ok(f) => f,
@@ -696,6 +992,9 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io:
     // pass 2: ways
     let mut ways = Vec::new();
     for (k, ents, box_) in iter_tiles(region, level) {
+        if !tile_in_bbox(region, level, k, bbox) {
+            continue;
+        }
         for &(rp, ln, off) in &ents {
             let feats = match parse_block(region, level, rp, ln, off as usize, box_.0, box_.1, k, &mut maps) {
                 Ok(f) => f,
@@ -759,13 +1058,14 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize) -> io:
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: map2osm_rs <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-o OUTDIR]");
+        eprintln!("usage: map2osm_rs <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-b W,S,E,N|none] [-o OUTDIR]");
         exit(1);
     }
     let src = &args[0];
     let mut levels = "123".to_string();
     let mut rfilter: Option<String> = None;
     let mut outdir: Option<String> = None;
+    let mut bbox_spec = "none".to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -781,9 +1081,21 @@ fn main() {
                 outdir = Some(args[i + 1].clone());
                 i += 2;
             }
+            "-b" => {
+                bbox_spec = args[i + 1].clone();
+                i += 2;
+            }
             _ => i += 1,
         }
     }
+    let bbox = match BBox::parse(&bbox_spec) {
+        Some(b) => Some(b),
+        None if bbox_spec.eq_ignore_ascii_case("none") => None,
+        None => {
+            eprintln!("error: invalid -b '{}', expected W,S,E,N (degrees) or 'none'", bbox_spec);
+            exit(1);
+        }
+    };
     let idx_files: Vec<PathBuf> = if Path::new(src).is_dir() {
         let mut v: Vec<PathBuf> = match fs::read_dir(src) {
             Ok(rd) => rd
@@ -831,14 +1143,14 @@ fn main() {
         for &level in &lvls {
             if let Some(od) = &outdir {
                 let p = format!("{}/{}_L{}.osm", od, r.name, level);
-                match fs::File::create(&p).and_then(|f| write_region_level(&mut BufWriter::new(f), &r, level)) {
+                match fs::File::create(&p).and_then(|f| write_region_level(&mut BufWriter::new(f), &r, level, &bbox)) {
                     Ok((nn, nw)) => eprintln!("{}: {} nodes, {} ways", p, nn, nw),
                     Err(e) => eprintln!("error: {}: {}", p, e),
                 }
             } else {
                 let stdout = io::stdout();
                 let mut w = BufWriter::new(stdout.lock());
-                if let Err(e) = write_region_level(&mut w, &r, level) {
+                if let Err(e) = write_region_level(&mut w, &r, level, &bbox) {
                     eprintln!("error: {}", e);
                 }
             }
