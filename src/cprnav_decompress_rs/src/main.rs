@@ -3,14 +3,14 @@
 // against the firmware reference (DAPIAPP.OUT cpr_tclDecompressAlgorithm).
 //
 // The original Python tool only handled per-block headers with 16-bit size fields
-// (block_size < 0x10000, e.g. MAP/IDX files where `unknown`=16 -> block_size=0x4000)
-// and failed on every LID file (`unknown`=64 -> block_size=0x10000). The firmware
+// (block_size < 0x10000, e.g. MAP/IDX files where block_size_kib=16 -> block_size=0x4000)
+// and failed on every LID file (block_size_kib=64 -> block_size=0x10000). The firmware
 // (cpr_tclDecompressAlgorithm::vInterpreteHeader) reads the per-block info/out sizes
 // as 32-bit DWORDs when block_size >= 0x10000 and as 16-bit WORDs otherwise. This
 // port implements both paths, so it decompresses MAP/IDX and LID alike.
 //
-// Verified byte-exact against the known-good unpacked N1E10AA.IDX (unknown=16) and
-// against the firmware algorithm on LID files (unknown=64).
+// Verified byte-exact against the known-good unpacked N1E10AA.IDX (block_size_kib=16)
+// and against the firmware algorithm on LID files (block_size_kib=64).
 //
 // Usage:
 //   cprnav_decompress_rs <file> [out]          decompress one file (out defaults to
@@ -232,6 +232,9 @@ fn unpack_block(block: &[u8], tables: &[CodeTable; 4], block_size: usize) -> Vec
 
     let out_size = block_size - raw_out as usize;
     let mut out = vec![0u8; out_size];
+    if std::env::var("CPR_DEBUG").is_ok() {
+        eprintln!("  [block] compr_len={:#x} info_size={:#x} raw_out={:#x} out_size={:#x}", block.len(), info_size, raw_out, out_size);
+    }
 
     let mut file_pointer = info_size as usize; // literal cursor into the block bytes
     let unknown_11: u32;
@@ -256,6 +259,9 @@ fn unpack_block(block: &[u8], tables: &[CodeTable; 4], block_size: usize) -> Vec
         let mut code_entry: &Entry;
         loop {
             if write_address == out_size {
+                if std::env::var("CPR_DEBUG").is_ok() {
+                    eprintln!("  [block] wrote={:#x} file_pointer_end={:#x} (pool used={:#x})", write_address, file_pointer, file_pointer - info_size as usize);
+                }
                 return out;
             }
             let entry_index = table.lookup[(info_bytes & table.mask) as usize];
@@ -334,9 +340,9 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
     if version != 5 {
         return Err(format!("invalid version (expected 5, got {})", version));
     }
-    let unknown = u16(data, 2) as usize;
-    if unknown > 64 {
-        return Err(format!("invalid unknown (<=64, got {})", unknown));
+    let block_size_kib = u16(data, 2) as usize;
+    if block_size_kib > 64 {
+        return Err(format!("invalid block_size_kib (<=64, got {})", block_size_kib));
     }
     if &data[4..12] != b"CPRNAV_2" {
         return Err(format!(
@@ -345,7 +351,7 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
         ));
     }
 
-    let block_size = unknown * 0x400;
+    let block_size = block_size_kib * 0x400; // bytes
     let unpacked_size = u32(data, 12) as usize;
     let compression_mode = u16(data, 16);
     if compression_mode != 3 {
@@ -380,7 +386,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; hdr.unpacked_size];
     let mut pos = 0usize;
 
-    for (start, end) in &hdr.blocks {
+    for (bi, (start, end)) in hdr.blocks.iter().enumerate() {
+        if std::env::var("CPR_DEBUG").is_ok() {
+            eprintln!("[block {}] range=[{:#x},{:#x}) compr_len={:#x}", bi, start, end, end - start);
+        }
         if *end > data.len() {
             return Err(format!("block [{:#x},{:#x}] exceeds file size {}", start, end, data.len()));
         }

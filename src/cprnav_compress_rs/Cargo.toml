@@ -1,0 +1,11 @@
+[package]
+name = "cprnav_compress"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "cprnav_compress_rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
