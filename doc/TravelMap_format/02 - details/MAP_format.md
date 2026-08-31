@@ -341,6 +341,29 @@ The high byte of `feature` = **display scale** (visibility threshold).
 | 0x26 | 0x1B |
 | 0x27 | 0x1C |
 
+**Verified POI category (low byte)** — cross-checked against object `name`s in a Kraków L3
+extract and against the official icon taxonomy in `POI_MAPPING.DAT` (see §7.1):
+
+| feature (low byte) | category | evidence (Kraków names / amenity) |
+|--------------------|----------|-----------------------------------|
+| 0x02 | parking | "P+R", amenity=parking |
+| 0x04 | fuel / petrol station | CIRCLE K, PETRONET, AUCHAN; amenity=fuel |
+| 0x05 | hotel | HOTEL LORENZO, PLATINUM, HOTEL PROKOCIM |
+| 0x06 | restaurant / food & drink | KAPITAN, PRZYSMAK (amenity=restaurant subset) |
+| 0x07 | car service / motor | CENTRUM MOTOCYKLOWE, SPEED CAR, auto |
+| 0x08 | company / office | "…SP. Z O.O." (few) |
+| 0x09 | car rental | SIXT, BLUE RENTAL, 99RENT |
+| 0x10 (16) | school / education | PRZEDSZKOLE, ZESPÓŁ SZKÓŁ, AWF |
+| 0x11 (17) | bar / pub / nightlife | LOKOPUB, MIESZCZANSKI |
+| 0x12 (18) | sport / fitness / recreation | KRYTA PŁYWALNIA, FITNESS |
+| 0x13 (19) | pharmacy / hospital | APTEKA, SZPITAL, BONA |
+| 0x14 (20) | shop / supermarket / retail | BIEDRONKA, SHELL, CROSBIKE |
+| 0x15 (21) | bank / ATM | CASHZONE, EURONET, BANK SPÓŁDZIELCZY |
+| 0x16 (22) | church / cemetery | MB RÓŻAŃCOWEJ, CMENTARZ |
+| 0x17 (23) | park / green space | PARK OSIEDLOWY, LASEK (+ some church) |
+| 0x22 (34) | railway station | KRAKÓW PROKOCIM, KRAKÓW BIEŻANÓW |
+| 0x23 (35) | highway junction / interchange | WĘZEŁ BIEŻANÓW |
+
 ### Polygons (list 0) — code → type
 
 | code (hex) | type |
@@ -367,6 +390,25 @@ The high byte of `feature` = **display scale** (visibility threshold).
 | 0x94 | 4 |
 | 0x9C | 0x23 |
 
+**Verified land-use class (polygon low byte)** — the low byte picks the terrain class, which is
+what the renderer colours. High byte = display scale only. From a Kraków L3 extract:
+
+| feature (low byte) | terrain | evidence (Kraków names / layer) | typical map colour |
+|--------------------|---------|----------------------------------|--------------------|
+| 0x48 | water | WISŁA, ZALEW BAGRY, STAW PŁASZOWSKI (`water_area`) | blue |
+| 0x39 | park / green space | PARK IM. JERZMANOWSKICH, LASEK, CMENTARZ (green subset) | green |
+| 0x3A | built-up / industrial | KRAKOWSKA FABRYKA KABLI, SZPITAL UNIW., BONARKA CITY CENTER | grey/brown |
+| 0x9C | urban blocks / developed (dominant in city centres) | 1506 unnamed `area` polygons | light grey |
+| 0x38, 0x2B | other developed / special areas | BONARKA etc. | grey variants |
+
+So the "grey = urban, green = park/forest, blue = water" scheme the user expects is driven by
+these low-byte classes; the exact RGB per class lives in the renderer's style config (see §7.2).
+
+**`tm:state` (cell byte 0–1)** — a constant per dataset/profile, **not** a category: every
+feature in an N6E2 L3 extract carried `state = 16876 (0x41EC)` regardless of kind or feature.
+It is emitted for completeness but carries no per-object discrimination at this level; treat it
+as a profile/variant marker.
+
 > The numeric `type` codes are the internal FastMap type. The human-readable layer name
 > in the converter is derived from **kind + annotation categories** (section 8), which is
 > what the data itself supports:
@@ -392,6 +434,63 @@ The high byte of `feature` = **display scale** (visibility threshold).
 `u8ConvertFeature2{Poly,Line}SubType` @0x008d5bb8/0x008d58a4 exist but map to further
 internal numbers; full semantic names like "forest"/"highway" live on the rendering
 side and are not in the MAP data.)
+
+### 7.1 POI icons — `POI_MAPPING.DAT` (SQLite)
+
+The fine-grained POI category → icon mapping is **not** in the `.MAP` file; it ships as a
+SQLite database at `CRYPTNAV/CFG/LID/POI_SRV/POI_MAPPING.DAT`. The MAP cell's small feature
+code (above) is the *coarse* class; the specific brand/type (and therefore the icon) comes from
+the POI's annotation and is resolved through this DB. Key tables:
+
+- **`neh_IDTable(name, Enum, ID)`** — 209 rows: icon file name → `FI_EN_*` category enum → numeric id.
+  This is the icon catalogue (129 distinct `.png`, 202 enums), e.g.:
+
+  | icon file | enum | id | meaning |
+  |-----------|------|----|---------|
+  | FUEL.png | FI_EN_GASSTATION | 221 | petrol station |
+  | PARKING.png | FI_EN_PARKING / _PARKINGGARAGE / _OPENPARKINGAREA / _PARKANDRIDEFACILITY | 30/902/286/905 | parking (variants) |
+  | COFFEE_SHOPS.png | FI_EN_CAFE / FI_EN_COFFESHOP | 209/371 | café / coffee shop |
+  | RESTAURANT.png | FI_EN_RESTAURANT / _RESTAURANTAREA | 243/285 | restaurant |
+  | FASTFOOD.png | FI_EN_FASTFOODRESTAURANT, _F_AMERICANFOOD, _BREAKFAST | 376/4174/907 | fast food |
+  | CHINESE/ITALIAN/JAPANESE/… .png | FI_EN_F_*FOOD | … | cuisine sub-types |
+  | AUTO.png / CAR_WASHES.png / SERVICE_MAINTENANCE.png | FI_EN_GROUPFUELAUTO / _CARWASHES / _GROUPSERVICEMAINTENANCE | 3001/901/3003 | automotive services |
+
+- **`POIMappingTab(..., MapGroup, MapSubGroup, FeatCode)`** — the full category tree; `MapGroup`
+  is an icon-group enum `E_MAP_IMAGE_POIICON_<TOPIC>_GROUP_<NAME>` (e.g.
+  `…_PETROL_STATION`, `…_HOTEL`, `…_RENT_A_CAR_FACILITIES`, `…_PHARMACY`, `…_HOSPITAL`,
+  `…_ATMCASH_DISPENSOR`, `…_CINEMA`, `…_GOLF_COURSE`). Top-level topics: ACCOMMODATION,
+  AUTOMOTIVE, CITY, ENTERTAINMENT_AND_RECREATION, MORE (bank/ATM/business), PUBLIC_FACILITIES
+  (school/hospital/pharmacy/post/police/cemetery…), RESTAURANTS, SHOPPING, TOURISM.
+- **`br_GMNextGen_POIs_brands(Brand, Icon, IconFile, ChainID, FIID, AnnotType, AnnotValue)`** —
+  brand chains (e.g. a specific gas chain) → concrete icon file + the `AnnotType`/`AnnotValue`
+  pair that appears in the MAP annotation. This is the bridge from MAP bytes to a named icon.
+
+Note: the referenced icon `.png` files are **not** present in the firmware tree examined (only
+other art, e.g. EV-charging `I00x_T*.png`, and 3D instruction pictures under `INSTRUCT/3D_PICT`);
+the POI icon package is loaded from elsewhere at runtime. The semantic mapping above is what
+matters for identifying a POI's meaning; the pixel art is looked up by these names.
+
+### 7.2 Rendering & colour — how `feature` becomes a drawn colour/icon
+
+`procmapengine.out` (Bosch `rbin_fastmap_3d_13.1 …/mapengine`, GLES + SVG) is the renderer. It
+does **not** hard-code per-feature colours; it resolves them through a style config:
+
+1. The MAP cell's feature is decoded by `map_tclFastMapToMapFeature::FastMapToPolyMapFeature`
+   (lines/areas) into a typed map feature.
+2. `map_tclMapEngineConfig::GetPolyConfigOffsetBasedOnType(config, feature)` maps that feature
+   type → a **style index**.
+3. The style index indexes a per-type config table in `map_tclMapEngineConfig` (an array of
+   pointers at `config+100`); each entry holds the fill/border attributes (colour, border on/off,
+   etc.). `map_tclMapElm_Landuse_Area::ReadFrom` reads this and builds the vertex/index buffers;
+   `Draw`/`PrepareVertices2D` submit them to GLES.
+
+So land-use colour is: **feature low byte → poly type → style index → config entry (RGB)**. The
+concrete RGB values are runtime `map_tclMapEngineConfig` globals (`CONF_*`, e.g.
+`CONF_BACKGROUND_COLOR_DAY/NIGHT`, `CONF_MAP_HLG_MAPELM_COLOR_GROUND_ID_DAY`, …) with defaults in
+the binary, overridable by the device's theme — which is why the same land-use class can be drawn
+grey (urban), green (park/forest) or blue (water) depending on the style entry, day/night mode.
+POI icons are resolved separately through `TextureManager` / `map_tclCacheElement_Icon` using the
+§7.1 catalogue.
 
 ---
 
