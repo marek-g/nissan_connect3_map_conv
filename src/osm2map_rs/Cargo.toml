@@ -1,0 +1,12 @@
+[package]
+name = "osm2map"
+version = "1.0.0"
+edition = "2021"
+
+# quick-xml streams the OSM XML (nodes/ways). serde not needed yet.
+[dependencies]
+quick-xml = { version = "0.42", default-features = false }
+
+[[bin]]
+name = "osm2map_rs"
+path = "src/main.rs"

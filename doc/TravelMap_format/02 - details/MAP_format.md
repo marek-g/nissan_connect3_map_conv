@@ -18,7 +18,7 @@ Source directory: `CRYPTNAV/DATA/DATA/MAP/` (411 regions, ~907 MB).
 |------|------|
 | `<REGION>AA.IDX` | One per region. Tile tables (4 levels) pointing to blocks inside the MAP files. |
 | `<REGION>1XX.MAP` | Eight per region (one per `regProf`). Contain the actual geometric data. |
-| `<REGION>1XX.TCI` | Tile Cluster Index per MAP file (not needed for geometry decoding). |
+| `<REGION>1XX.TCI` | Tile Cluster Index per MAP file — auxiliary "cluster" tile index. Not needed for the `.IDX`→`.MAP` geometry path; empty for profile 10I. See §11. |
 | `MAPWORLD.MAP` | Global world partition (region/tile grid); 4 rows of 8 B starting at offset 0x28. |
 
 The directory `CRYPTNAV/DATA/CONNECT/MAP/` also holds copies of the `.IDX` files plus
@@ -783,8 +783,53 @@ What a generator must produce, and what is still not fully pinned:
   default-file list. **Not used by the geometry path** — display/diagnostic only.
 - Binary blocks `[binOff .. fileSize)`: contiguous, 4-byte aligned. Each =
   `{u32 marker = 0xFFFF | (len<<16)}` + 3 × `{u16 start, u16 count}` + cells (12 B) + point pool
-  + annotation/text (§5/§8). `start[i+1] = start[i] + count[i]*3`; `len` (words) spans to the
-  next block.
+   + annotation/text (§5/§8). `start[i+1] = start[i] + count[i]*3`; `len` (words) spans to the
+   next block.
+
+### `.TCI` — Tile Cluster Index, fully known (writable)
+
+Per-MAP-file sub-index (`<REGION>1XX.TCI`, one per profile). Decoded from `DAPIAPP.OUT` classes
+`dap_map_tclTCIHeader` / `TCIPartition` and loaders `u16LoadPartitionTable` /
+`u16LoadClusterIndexTile` / `u16GetClusterId`, confirmed against stock N6E2 10I + 11A:
+
+```
+[0x00] header (20 B): u16 f0=0, u16 f1=92, u32 fileSize, u16 partOff=0x84, u16 partCnt=4,
+                      u16 f5=122, u16 f6=16, u16 f7=12, u16 f8=106      (format constants)
+[0x14] descriptive block (112 B): copyright / build stamp / "TILE_CLUSTER_INDEX" / "TPNAV2"
+[0x84] partition table: 4 × {u32 level, u32 tileCount, u32 sectionOffset}
+[0xb4] per-level tile records: tileCount × {u16 primCl, u16 cl, u32 clusterOffset}
+[EOF-] cluster pool (geometry — only for profiles that use clusters)
+```
+
+- `partOff` (header @0x08) = byte offset of the partition table; `partCnt` (@0x0a) = 4, one entry
+  per level — `u16LoadPartitionTable` errors (`0x218`) if it is not 4. N6E2 tileCounts =
+  1 / 25 / 2500 / 250000 (same grid as the IDX).
+- `sectionOffset[L]` = byte offset of level L's record array = `180 + Σ_{j<L} tileCount[j]·8`
+  (L0@180, L1@188, L2@388, L3@20388 for N6E2).
+- A tile record is all-zero (`primCl=cl=clusterOffset=0`) when the tile has no cluster data;
+  otherwise `clusterOffset` points into the trailing pool.
+
+**When it is / isn't needed.** `dap_map_tclIdController::u16GenerateTileIds` resolves a region's
+tiles two ways: positive-index tiles go through the `.IDX` → `.MAP` block path; negative-index
+("cluster") tiles go through the TCI via `u16GetClusterId`. If the TCI file is absent, that call
+returns error `0x307`, logs `"Could not read tci file"` and skips just those cluster tiles — it
+does **not** abort the whole region. Discovery is a wildcard `*.tci` directory scan
+(`u16InitTciFileList`), so no specific TCI file is mandated to exist.
+
+**Key fact:** for profile **10I** the stock TCI's cluster pool is 100 % empty (no geometry) — all
+of 10I's data flows through the `.IDX` path. Profile 11A, by contrast, carries a real ~1.7 MB pool
+(same structure, non-empty records). So which profiles actually use clusters varies per profile;
+the file format is identical either way.
+
+**Consequence for swapping:** to replace routes/objects you only swap `<REGION>AA.IDX` +
+`<REGION>1XX.MAP`. The TCI is **not required** — leave the stock `.TCI` in place (empty for 10I,
+contributes nothing) or omit it (worst case: harmless `0x307` logs). Do **not** copy a TCI from
+another profile/region: its `clusterOffset`s point at that file's own layout and would be wrong.
+
+`osm2map_rs::emit_tci` generates a structurally-valid, all-empty TCI (header + descriptive block +
+partition table + zeroed record arrays) byte-identical to the stock 10I prefix; it round-trips
+byte-exact through CPRNAV. Emit it only if you target a cluster-using profile or want the file
+present to avoid the `0x307` logs.
 
 ### Still not fully pinned (all avoidable for a minimal working file)
 
@@ -805,3 +850,7 @@ Get the IDX right (header + partition table + tile tables pointing at real block
 write the MAP binary blocks with correct markers / cells / points / annotations plus a
 self-consistent 32 B header (`binOff`, `fileSize`, bbox). The metadata info-string region and the
 premium / unknown-annotation payloads can be omitted or copied verbatim from a reference file.
+
+The `.TCI` is **not** part of the minimal pair — for profile 10I it is empty and the geometry is
+fully carried by `.IDX` + `.MAP`, so a swap only needs those two files (see the `.TCI` subsection
+above).
