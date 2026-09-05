@@ -383,8 +383,12 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let hdr = parse_header(data)?;
     let tables = code_tables();
+    // Output buffer is pre-zeroed. Each block k maps to the FIXED slot k*block_size and
+    // produces `out_size` bytes there (0..=block_size); any region a block does not cover
+    // stays zero. Bosch relies on this: all-zero regions are stored as empty blocks
+    // (raw_out = block_size, out_size = 0) that cost only a few file bytes. Placing blocks by
+    // running offset + pad is wrong whenever an empty/short block appears mid-stream.
     let mut out = vec![0u8; hdr.unpacked_size];
-    let mut pos = 0usize;
 
     for (bi, (start, end)) in hdr.blocks.iter().enumerate() {
         if std::env::var("CPR_DEBUG").is_ok() {
@@ -395,11 +399,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
         }
         let block = &data[*start..*end];
         let unpacked = unpack_block(block, &tables, hdr.block_size);
-        out[pos..pos + unpacked.len()].copy_from_slice(&unpacked);
-        pos += unpacked.len();
-        // Pad to the next block boundary (matching the reference's zero fill).
-        while pos % hdr.block_size != 0 && pos < hdr.unpacked_size {
-            pos += 1;
+        let base = bi * hdr.block_size;
+        if base < hdr.unpacked_size {
+            let n = unpacked.len().min(hdr.unpacked_size - base);
+            out[base..base + n].copy_from_slice(&unpacked[..n]);
         }
     }
 

@@ -252,19 +252,42 @@ fn write_sym(bw: &mut BitWriter, s: &Sym, table: &CodeTable, u11: u32) {
 
 // --- LZ77 symbol selection -------------------------------------------------
 
-const HASH_BITS: usize = 15;
+const HASH_BITS: usize = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
-const MAX_CHAIN: usize = 16; // candidates walked per position (speed vs ratio)
+const MAX_CHAIN: usize = 24; // candidates walked per position (speed vs ratio)
 
-fn h3(b: &[u8], j: usize) -> usize {
-    let v = (b[j] as u32) ^ ((b[j + 1] as u32) << 5) ^ ((b[j + 2] as u32) << 9);
-    (v & ((HASH_SIZE - 1) as u32)) as usize
+// Seed on TWO bytes. Indexing by a 3-byte prefix missed every length-2 repeat, so short
+// repeats were emitted as literals — Bosch instead spends ~60k tiny copies/file on dense MAP
+// data and lands at far fewer literal bytes. A 2-byte seed finds them.
+#[inline]
+fn h2(b: &[u8], j: usize) -> usize {
+    let v = (b[j] as u32) | ((b[j + 1] as u32) << 8);
+    ((v.wrapping_mul(0x9E37_79B1)) >> (32 - HASH_BITS)) as usize
+}
+
+// Parity-split hash chains. Two head tables (one per position parity) share a single prev[]
+// array: position j is linked only to earlier positions q with q % 2 == j % 2, so following the
+// chain from p always yields an EVEN distance (p - q). Every COPY_PREV distance in these code
+// tables is a multiple of 2 (off_base is even and the extra field is shifted by u11 >= 1), so an
+// odd-distance match can never be encoded — restricting candidates to same-parity positions here
+// keeps find_match/collect_matches from proposing dead matches instead of dropping them.
+#[inline]
+fn build_chains(chunk: &[u8]) -> Vec<usize> {
+    let n = chunk.len();
+    let mut head = vec![usize::MAX; 2 * HASH_SIZE];
+    let mut prev = vec![usize::MAX; n];
+    for j in 0..n.saturating_sub(1) {
+        let h = h2(chunk, j) + (j & 1) * HASH_SIZE;
+        prev[j] = head[h];
+        head[h] = j;
+    }
+    prev
 }
 
 // Best match using flat prev array with vectorized memcmp
 fn find_match(chunk: &[u8], prev: &[usize], p: usize, max_len: u32, max_dist: u32) -> Option<(u32, u32)> {
     let n = chunk.len();
-    if p < 1 || n - p < 3 {
+    if n - p < 2 {
         return None;
     }
     let max_len = (max_len as usize).min(n - p);
@@ -335,16 +358,9 @@ fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
         .max()
         .unwrap_or(0);
 
-    // Flat arrays instead of Vec<Vec> to prevent thousands of tiny allocations
+    // Parity-split chains (see build_chains) so all candidate distances are even.
     let n = chunk.len();
-    let mut head = vec![usize::MAX; HASH_SIZE];
-    let mut prev = vec![usize::MAX; n];
-    
-    for j in 0..n.saturating_sub(2) {
-        let h = h3(chunk, j);
-        prev[j] = head[h];
-        head[h] = j;
-    }
+    let prev = build_chains(chunk);
 
     let mut pool: Vec<u8> = Vec::new();
     let mut syms: Vec<Sym> = Vec::new();
@@ -416,7 +432,7 @@ const LITRUN_CANDIDATES: &[usize] =
 fn collect_matches(chunk: &[u8], prev: &[usize], p: usize, max_len: u32, max_dist: u32, chain_cap: usize) -> Vec<(u32, u32)> {
     let n = chunk.len();
     let mut out: Vec<(u32, u32)> = Vec::new();
-    if p < 1 || n - p < 3 {
+    if n - p < 2 {
         return out;
     }
     let max_len = (max_len as usize).min(n - p);
@@ -481,15 +497,9 @@ fn lz77_best(chunk: &[u8], table_idx: usize, chain_cap: usize) -> (Vec<Sym>, Vec
         .max()
         .unwrap_or(0);
 
+    // Parity-split chains (see build_chains) so all candidate distances are even.
     let n = chunk.len();
-    let mut head = vec![usize::MAX; HASH_SIZE];
-    let mut prev = vec![usize::MAX; n];
-    
-    for j in 0..n.saturating_sub(2) {
-        let h = h3(chunk, j);
-        prev[j] = head[h];
-        head[h] = j;
-    }
+    let prev = build_chains(chunk);
 
     // dp[p] = min (code_bits + 8*pool_bytes) to encode chunk[p..n].
     let mut dp = vec![u64::MAX; n + 1];
@@ -662,20 +672,42 @@ fn encode_block_best(chunk: &[u8], block_size: usize, table: Option<usize>, lite
         .unwrap()
 }
 
+// Encode an all-zero block as a zero-cost "empty" block: info_size = header bytes, raw_out =
+// block_size (=> out_size 0). size_bits is 16 for block_size < 0x10000 else 32, matching
+// vInterpreteHeader. For block_size=0x4000 this yields the exact Bosch pattern 04 00 00 40:
+// push(info_size=4,16) then push(raw_out=0x4000,16), LSB-first.
+fn empty_block_bytes(block_size: usize) -> Vec<u8> {
+    let size_bits = if block_size >= 0x10000 { 32u32 } else { 16u32 };
+    let info_size = (2 * size_bits / 8) as u32;
+    let mut bw = BitWriter::new();
+    bw.push(info_size, size_bits);
+    bw.push(block_size as u32, size_bits);
+    bw.finish()
+}
+
 fn compress(data: &[u8], block_size_kib: u16, table: Option<usize>, literal_only: bool, level: u32) -> Vec<u8> {
     let block_size = (block_size_kib as usize) * 0x400;
     let n = data.len();
     // Contiguous tiling: full blocks of block_size, one partial at the end.
     let nblocks = if n == 0 { 1 } else { (n + block_size - 1) / block_size };
 
-    // PARALLEL: compress all blocks concurrently, preserving order
+    // PARALLEL: compress all blocks concurrently, preserving order.
+    // All-zero regions are emitted as "empty" blocks (raw_out = block_size => out_size 0),
+    // costing only the size-field bytes; the runtime zero-fills that slot. This mirrors Bosch
+    // and is what makes sparse data (.TCI/.TTC tile-cluster indices, tables) tiny. Without it
+    // we spend ~1 KB/block copying zeros Bosch stores in ~4 bytes. Output placement is by block
+    // INDEX (slot k*block_size), so a zero-cost empty block stays byte-correct on round-trip.
     let blocks: Vec<Vec<u8>> = (0..nblocks)
         .into_par_iter()
         .map(|k| {
             let start = k * block_size;
             let end = (start + block_size).min(n);
             let chunk = &data[start..end];
-            encode_block_best(chunk, block_size, table, literal_only, level)
+            if chunk.is_empty() || chunk.iter().all(|&b| b == 0) {
+                empty_block_bytes(block_size)
+            } else {
+                encode_block_best(chunk, block_size, table, literal_only, level)
+            }
         })
         .collect();
 
@@ -725,7 +757,9 @@ fn main() {
              --level N      1-9. 1-4 fast greedy; 5-9 optimal-parsing (best) + bigger window\n\
              --no-lz        disable LZ77 back refs (literal only)\n\
              --block-kib K  block size in KiB: 16 -> 0x4000 bytes, 64 -> 0x10000 bytes\n\
-             --table T      force code table 0..3 (default: auto-pick best per block)\n\n\
+             --table T      force code table 0..3 (default: auto-pick best per block)
+             --force        compress even if the input already looks CPRNAV_2 (nested)\n\
+             --force        compress even if the input already looks CPRNAV_2 (nested)\n\n\
              PARALLEL: Uses rayon to compress blocks and select tables concurrently."
         );
         exit(if args.is_empty() { 1 } else { 0 });
@@ -735,6 +769,7 @@ fn main() {
     let mut block_size_kib: u16 = 16;
     let mut level: u32 = 9;
     let mut table: Option<usize> = None;
+    let mut force = false;
     let mut files: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -753,6 +788,7 @@ fn main() {
                 i += 1;
                 table = Some(args[i].parse().expect("bad --table"));
             }
+            "--force" => force = true,
             a => files.push(a.to_string()),
         }
         i += 1;
@@ -775,6 +811,20 @@ fn main() {
             exit(1);
         }
     };
+    // Guard against double-compression: these map files (notably *.TCI / *.IDX) are ALREADY
+    // CPRNAV_2 on the card, so feeding a packed file straight into the compressor silently
+    // produces a nested archive that decompresses to garbage and blanks the map. Refuse unless --force.
+    if data.len() >= 12 && u16::from_le_bytes([data[0], data[1]]) == 5 && &data[4..12] == b"CPRNAV_2" {
+        eprintln!(
+            "error: {} already looks like a CPRNAV_2 archive (version=5, magic at +4). \
+             Decompress it first (cprnav_decompress_rs) before compressing; the runtime cannot read nested files. \
+             Use --force to override.",
+            input.display()
+        );
+        if !force {
+            exit(2);
+        }
+    }
     let packed = compress(&data, block_size_kib, table, literal_only, level);
     if let Err(e) = fs::write(&out, &packed) {
         eprintln!("write {}: {}", out.display(), e);
