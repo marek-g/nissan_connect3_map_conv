@@ -3,6 +3,8 @@
 // cpr_tclDecompressAlgorithm / cpr_tclFileheader). Produces files that both the
 // Rust decompressor and the firmware expand to the exact input bytes.
 //
+// PARALLEL: uses rayon to compress blocks concurrently.
+//
 // File layout (little-endian):
 //   [0x00] u16 version = 5
 //   [0x02] u16 block_size_kib  (block_size = block_size_kib * 0x400 bytes; 16 -> 0x4000, 64 -> 0x10000)
@@ -17,7 +19,7 @@
 //
 // Per-block: a single LSB-first bit stream. Bit 0 = LSB of byte 0.
 //   [16b info_size][16b raw_out][2b table_idx] then the code stream.
-//   out_size = block_size - raw_out  (the number of output bytes this block yields)
+//   out_size = block_size - raw_out   (the number of output bytes this block yields)
 //   The literal pool begins at BYTE offset info_size in the block.
 //   info_size = ceil((34 + code_bits)/8).
 //
@@ -29,6 +31,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use rayon::prelude::*;
 
 const CMD_COPY_BYTE: u8 = 1;
 const CMD_COPY_BYTES: u8 = 2;
@@ -125,19 +128,33 @@ impl BitWriter {
     fn new() -> Self {
         BitWriter { bytes: Vec::new(), bitpos: 0 }
     }
-    // Append `nbits` low bits of `value`, LSB-first (bit 0 of stream = LSB of byte 0).
+    // Append `nbits` low bits of `value`, LSB-first. Highly optimized to write byte-wise.
     fn push(&mut self, value: u32, nbits: u32) {
-        for i in 0..nbits {
-            let bit = (value >> i) & 1;
-            if bit == 1 {
-                let b = (self.bitpos / 8) as usize;
-                if self.bytes.len() <= b {
-                    self.bytes.resize(b + 1, 0);
-                }
-                self.bytes[b] |= 1 << (self.bitpos % 8);
-            }
-            self.bitpos += 1;
+        if nbits == 0 { return; }
+        let mut val = value as u64;
+        let mut bits_left = nbits;
+        let mut pos = self.bitpos as usize;
+        
+        let needed_bytes = (pos + bits_left as usize + 7) / 8;
+        if self.bytes.len() < needed_bytes {
+            self.bytes.resize(needed_bytes, 0);
         }
+        
+        while bits_left > 0 {
+            let byte_idx = pos >> 3;
+            let bit_idx = pos & 7;
+            
+            let can_write = (8 - bit_idx).min(bits_left as usize);
+            let mask = (1u64 << can_write) - 1;
+            let chunk = (val & mask) as u8;
+            
+            self.bytes[byte_idx] |= chunk << bit_idx;
+            
+            val >>= can_write;
+            pos += can_write;
+            bits_left -= can_write as u32;
+        }
+        self.bitpos = pos as u32;
     }
     fn finish(mut self) -> Vec<u8> {
         let total = ((self.bitpos + 7) / 8) as usize;
@@ -244,43 +261,58 @@ fn h3(b: &[u8], j: usize) -> usize {
     (v & ((HASH_SIZE - 1) as u32)) as usize
 }
 
-// Best match of chunk[p..] against earlier positions, overlap-safe (the source
-// byte at an overlapped position is chunk[q+l], which equals the already-written
-// output). Returns (len, dist) with len>=2, or None.
-fn find_match(chunk: &[u8], chains: &[[usize; MAX_CHAIN]], chain_len: &[u16], p: usize, max_len: u32, max_dist: u32) -> Option<(u32, u32)> {
-    // h3 needs 3 bytes; also need at least a 2-byte match to be worthwhile.
-    if p < 1 || chunk.len() - p < 3 {
+// Best match using flat prev array with vectorized memcmp
+fn find_match(chunk: &[u8], prev: &[usize], p: usize, max_len: u32, max_dist: u32) -> Option<(u32, u32)> {
+    let n = chunk.len();
+    if p < 1 || n - p < 3 {
         return None;
     }
-    let max_len = (max_len as usize).min(chunk.len() - p);
+    let max_len = (max_len as usize).min(n - p);
     if max_len < 2 {
         return None;
     }
     let min_q = if (p as u32) > max_dist { p - max_dist as usize } else { 0 };
-    let h = h3(chunk, p);
-    let cl = chain_len[h] as usize;
-    let start = cl.saturating_sub(MAX_CHAIN);
-    let mut best: Option<(usize, usize)> = None; // (len, q)
-    for &q in &chains[h][start..cl] {
-        if q >= p || q < min_q {
-            continue;
-        }
-        // Non-overlapping only: the match source [q, q+l) must lie entirely in the
-        // already-produced prefix [0, p). The decompressor copies with snapshot
-        // semantics (not memmove), so overlapping refs would corrupt the output.
+    
+    let mut best_l = 1;
+    let mut best_q = 0;
+    let mut q = prev[p];
+    let mut depth = 0;
+    
+    while q != usize::MAX && q >= min_q && depth < MAX_CHAIN {
         let cap = max_len.min(p - q);
-        let mut l = 0usize;
+        let mut l = 0;
+        
+        // Fast vectorized 8-byte compare
+        while l + 8 <= cap {
+            let a = unsafe { chunk.as_ptr().add(p + l).cast::<u64>().read_unaligned() };
+            let b = unsafe { chunk.as_ptr().add(q + l).cast::<u64>().read_unaligned() };
+            if a != b {
+                l += (a ^ b).trailing_zeros() as usize / 8;
+                break;
+            }
+            l += 8;
+        }
         while l < cap && chunk[p + l] == chunk[q + l] {
             l += 1;
         }
-        if l >= 2 && best.map_or(true, |b| l > b.0) {
-            best = Some((l, q));
+        
+        if l >= 2 && l > best_l {
+            best_l = l;
+            best_q = q;
             if l == max_len {
                 break;
             }
         }
+        
+        q = prev[q];
+        depth += 1;
     }
-    best.map(|(l, q)| (l as u32, (p - q) as u32))
+    
+    if best_l >= 2 {
+        Some((best_l as u32, (p - best_q) as u32))
+    } else {
+        None
+    }
 }
 
 fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
@@ -303,17 +335,15 @@ fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
         .max()
         .unwrap_or(0);
 
-    // Build hash chains over all 3-byte prefixes of the chunk.
-    let mut chains: Vec<[usize; MAX_CHAIN]> = vec![[0; MAX_CHAIN]; HASH_SIZE];
-    let mut chain_len: Vec<u16> = vec![0; HASH_SIZE];
+    // Flat arrays instead of Vec<Vec> to prevent thousands of tiny allocations
     let n = chunk.len();
+    let mut head = vec![usize::MAX; HASH_SIZE];
+    let mut prev = vec![usize::MAX; n];
+    
     for j in 0..n.saturating_sub(2) {
         let h = h3(chunk, j);
-        let l = chain_len[h] as usize;
-        if l < MAX_CHAIN {
-            chains[h][l] = j;
-            chain_len[h] = (l + 1) as u16;
-        }
+        prev[j] = head[h];
+        head[h] = j;
     }
 
     let mut pool: Vec<u8> = Vec::new();
@@ -323,10 +353,7 @@ fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
 
     let mut p = 0usize;
     while p < n {
-        if let Some((len, dist)) = find_match(chunk, &chains, &chain_len, p, max_ref_len, max_dist) {
-            // Only take the reference if it actually saves bits vs literals.
-            // A back ref costs width+amt_bits+off_bits; a literal byte costs 2 bits
-            // (COPY_BYTE). Require len >= 2 and that the entry exists.
+        if let Some((len, dist)) = find_match(chunk, &prev, p, max_ref_len, max_dist) {
             if backref_entry(table, len, dist, u11).is_some() {
                 syms.push(Sym::BackRef { len, dist });
                 stat_back += len as u64;
@@ -337,7 +364,7 @@ fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
         // Literal: gather a run until the next worthwhile match or 265 bytes.
         let mut run = 1usize;
         while p + run < n && run < 265 {
-            let m = find_match(chunk, &chains, &chain_len, p + run, max_ref_len, max_dist);
+            let m = find_match(chunk, &prev, p + run, max_ref_len, max_dist);
             let worth = match m {
                 Some((l, d)) => backref_entry(table, l, d, u11).is_some() && l >= 2,
                 None => false,
@@ -381,47 +408,55 @@ fn lz77(chunk: &[u8], table_idx: usize) -> (Vec<Sym>, Vec<u8>) {
 }
 
 // --- Optimal-parsing LZ77 ("best" level) ----------------------------------
-//
-// Greedy picking is suboptimal: a slightly shorter match + literals can be
-// cheaper than the longest match, and literal runs should be batched to save
-// code bits. This does a shortest-path (DP) over positions where every candidate
-// move carries its exact bit cost from the fixed code table plus 8 bits per pool
-// byte. Minimizing code_bits + 8*pool_bytes minimizes the block size (up to <1
-// byte of ceil rounding). Lazy matching falls out for free: "emit a literal then
-// take a longer match" is just another path the DP may prefer.
 
 const LITRUN_CANDIDATES: &[usize] =
     &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128];
 
-// Encodable back-reference matches at position p, most-recent source first
-// (closer sources use cheaper offset codes). Returns up to 40 (len, dist).
-fn collect_matches(chunk: &[u8], chains: &Vec<Vec<usize>>, p: usize, max_len: u32, max_dist: u32) -> Vec<(u32, u32)> {
+// Collect matches ensuring Pareto-optimality (each subsequent match must be strictly longer).
+fn collect_matches(chunk: &[u8], prev: &[usize], p: usize, max_len: u32, max_dist: u32, chain_cap: usize) -> Vec<(u32, u32)> {
     let n = chunk.len();
+    let mut out: Vec<(u32, u32)> = Vec::new();
     if p < 1 || n - p < 3 {
-        return Vec::new();
+        return out;
     }
     let max_len = (max_len as usize).min(n - p);
     if max_len < 2 {
-        return Vec::new();
+        return out;
     }
     let min_q = if (p as u32) > max_dist { p - max_dist as usize } else { 0 };
-    let cl = &chains[h3(chunk, p)];
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    for &q in cl.iter().rev() {
-        if q >= p || q < min_q {
-            continue;
-        }
+    
+    let mut best_len = 1;
+    let mut q = prev[p];
+    let mut depth = 0;
+    
+    while q != usize::MAX && q >= min_q && depth < chain_cap {
         let cap = max_len.min(p - q); // overlap-safe (snapshot copy)
-        let mut l = 0usize;
+        let mut l = 0;
+        
+        // Vectorized 8-byte compare
+        while l + 8 <= cap {
+            let a = unsafe { chunk.as_ptr().add(p + l).cast::<u64>().read_unaligned() };
+            let b = unsafe { chunk.as_ptr().add(q + l).cast::<u64>().read_unaligned() };
+            if a != b {
+                l += (a ^ b).trailing_zeros() as usize / 8;
+                break;
+            }
+            l += 8;
+        }
         while l < cap && chunk[p + l] == chunk[q + l] {
             l += 1;
         }
-        if l >= 2 {
+        
+        if l > best_len {
+            best_len = l;
             out.push((l as u32, (p - q) as u32));
-            if out.len() >= 40 {
+            if l == max_len {
                 break;
             }
         }
+        
+        q = prev[q];
+        depth += 1;
     }
     out
 }
@@ -447,14 +482,13 @@ fn lz77_best(chunk: &[u8], table_idx: usize, chain_cap: usize) -> (Vec<Sym>, Vec
         .unwrap_or(0);
 
     let n = chunk.len();
-    // Hash chains over 3-byte prefixes, capped per bucket.
-    let mut chains: Vec<Vec<usize>> = vec![Vec::new(); HASH_SIZE];
+    let mut head = vec![usize::MAX; HASH_SIZE];
+    let mut prev = vec![usize::MAX; n];
+    
     for j in 0..n.saturating_sub(2) {
         let h = h3(chunk, j);
-        let bkt = &mut chains[h];
-        if bkt.len() < chain_cap {
-            bkt.push(j);
-        }
+        prev[j] = head[h];
+        head[h] = j;
     }
 
     // dp[p] = min (code_bits + 8*pool_bytes) to encode chunk[p..n].
@@ -488,7 +522,7 @@ fn lz77_best(chunk: &[u8], table_idx: usize, chain_cap: usize) -> (Vec<Sym>, Vec
             }
         }
         // Back-reference moves.
-        for (len, dist) in collect_matches(chunk, &chains, p, max_ref_len, max_dist) {
+        for (len, dist) in collect_matches(chunk, &prev, p, max_ref_len, max_dist, chain_cap) {
             let i = match backref_entry(table, len, dist, u11) {
                 Some(i) => i,
                 None => continue,
@@ -612,17 +646,20 @@ fn encode_block(chunk: &[u8], table_idx: usize, block_size: usize, literal_only:
 
 // Encode one block with the best of the 4 code tables (each block's 2-bit
 // table_idx is independent, so per-block selection is valid). If `table` is
-// Some(t), only that table is used.
+// Some(t), only that table is used. PARALLEL: tries all 4 tables concurrently.
 fn encode_block_best(chunk: &[u8], block_size: usize, table: Option<usize>, literal_only: bool, level: u32) -> Vec<u8> {
-    let tables = if let Some(t) = table { vec![t] } else { vec![0, 1, 2, 3] };
-    let mut best: Option<Vec<u8>> = None;
-    for t in tables {
-        let b = encode_block(chunk, t, block_size, literal_only, level);
-        if best.as_ref().map_or(true, |bb| b.len() < bb.len()) {
-            best = Some(b);
-        }
-    }
-    best.unwrap()
+    let tables: Vec<usize> = if let Some(t) = table { vec![t] } else { vec![0, 1, 2, 3] };
+    
+    // Parallel table selection (4 independent tasks)
+    let results: Vec<(usize, Vec<u8>)> = tables
+        .into_par_iter()
+        .map(|t| (t, encode_block(chunk, t, block_size, literal_only, level)))
+        .collect();
+    
+    results.into_iter()
+        .min_by_key(|(_, b)| b.len())
+        .map(|(_, b)| b)
+        .unwrap()
 }
 
 fn compress(data: &[u8], block_size_kib: u16, table: Option<usize>, literal_only: bool, level: u32) -> Vec<u8> {
@@ -631,13 +668,16 @@ fn compress(data: &[u8], block_size_kib: u16, table: Option<usize>, literal_only
     // Contiguous tiling: full blocks of block_size, one partial at the end.
     let nblocks = if n == 0 { 1 } else { (n + block_size - 1) / block_size };
 
-    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(nblocks);
-    for k in 0..nblocks {
-        let start = k * block_size;
-        let end = (start + block_size).min(n);
-        let chunk = &data[start..end];
-        blocks.push(encode_block_best(chunk, block_size, table, literal_only, level));
-    }
+    // PARALLEL: compress all blocks concurrently, preserving order
+    let blocks: Vec<Vec<u8>> = (0..nblocks)
+        .into_par_iter()
+        .map(|k| {
+            let start = k * block_size;
+            let end = (start + block_size).min(n);
+            let chunk = &data[start..end];
+            encode_block_best(chunk, block_size, table, literal_only, level)
+        })
+        .collect();
 
     let first = 0x18usize + 4 * nblocks;
     let mut out = Vec::new();
@@ -681,18 +721,19 @@ fn main() {
         eprintln!(
             "Usage:\n  cprnav_compress_rs <file> [out] [--level N] [--block-kib K] [--table T]\n\n\
              Compress a file into CPRNAV_2 (inverse of cprnav_decompress_rs).\n\
-             Defaults: level=1 (fast), block-kib=16 (0x4000-byte blocks), auto code-table.\n\
+             Defaults: level=9 (best), block-kib=16 (0x4000-byte blocks), auto code-table.\n\
              --level N      1-9. 1-4 fast greedy; 5-9 optimal-parsing (best) + bigger window\n\
              --no-lz        disable LZ77 back refs (literal only)\n\
              --block-kib K  block size in KiB: 16 -> 0x4000 bytes, 64 -> 0x10000 bytes\n\
-             --table T      force code table 0..3 (default: auto-pick best per block)"
+             --table T      force code table 0..3 (default: auto-pick best per block)\n\n\
+             PARALLEL: Uses rayon to compress blocks and select tables concurrently."
         );
         exit(if args.is_empty() { 1 } else { 0 });
     }
 
     let mut literal_only = false;
     let mut block_size_kib: u16 = 16;
-    let mut level: u32 = 1;
+    let mut level: u32 = 9;
     let mut table: Option<usize> = None;
     let mut files: Vec<String> = Vec::new();
     let mut i = 0;

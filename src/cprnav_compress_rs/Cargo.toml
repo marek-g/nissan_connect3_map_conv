@@ -3,6 +3,9 @@ name = "cprnav_compress"
 version = "1.0.0"
 edition = "2021"
 
+[dependencies]
+rayon = "1.10"
+
 [[bin]]
 name = "cprnav_compress_rs"
 path = "src/main.rs"
