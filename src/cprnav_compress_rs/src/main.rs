@@ -17,6 +17,10 @@
 //   [0x18 + 4*i] u32 end offset of block i   (i in 0..nblocks)
 //   [first .. ] block data
 //
+// Every block's stored length is a MULTIPLE OF 4 bytes (zero-padded, see pad4). Bosch does the same:
+// DAPIAPP.OUT bDecompressData guards `if (param_1 & 3)` on each block's file-offset address and reads
+// the stream via raw u32 loads, so an unaligned block start aborts decompression -> no map renders.
+//
 // Per-block: a single LSB-first bit stream. Bit 0 = LSB of byte 0.
 //   [16b info_size][16b raw_out][2b table_idx] then the code stream.
 //   out_size = block_size - raw_out   (the number of output bytes this block yields)
@@ -652,6 +656,28 @@ fn encode_block(chunk: &[u8], table_idx: usize, block_size: usize, literal_only:
     block
 }
 
+// Pad a compressed block up to the next multiple of 4 bytes.
+//
+// The firmware reader (DAPIAPP.OUT cpr_tclDecompressAlgorithm::bDecompressData) is fed each
+// block by address, taken straight from the file's block-offset table
+// (cpr_tclSectionDecompress::bDecompress → param_1 = fileBase + u32GetBlockBeginFileOffset(i)).
+// It GUARDS that address: `if ((param_1 & 3) != 0)` → trace "CPR read access to unaligned adress"
+// and bDecompressData returns failure. u32GetNextBits then reads the bit stream as a run of
+// raw little-endian DWORDs (*puVar4, ptr += 1), which on this ARM target faults/misreads if the
+// base is not 4-byte aligned. Since block i+1 begins exactly where block i ends (begin(i+1) =
+// end(i)+1 semantics collapse to [begin_i, begin_{i+1})), every block start is 4-aligned IFF every
+// compressed block length is a multiple of 4. Bosch does exactly this (all its blocks are mult-of-4;
+// the offset table and `first` are too). Without the pad our blocks land on odd offsets → the nav
+// rejects them and renders no map. Up to 3 zero bytes are appended inside the block's own region and
+// are never read by the decoder (it stops at out_size / literal-pool consumption).
+fn pad4(mut b: Vec<u8>) -> Vec<u8> {
+    let rem = b.len() & 3;
+    if rem != 0 {
+        b.resize(b.len() + (4 - rem), 0);
+    }
+    b
+}
+
 // --- File writer -----------------------------------------------------------
 
 // Encode one block with the best of the 4 code tables (each block's 2-bit
@@ -703,11 +729,14 @@ fn compress(data: &[u8], block_size_kib: u16, table: Option<usize>, literal_only
             let start = k * block_size;
             let end = (start + block_size).min(n);
             let chunk = &data[start..end];
-            if chunk.is_empty() || chunk.iter().all(|&b| b == 0) {
+            let blk = if chunk.is_empty() || chunk.iter().all(|&b| b == 0) {
                 empty_block_bytes(block_size)
             } else {
                 encode_block_best(chunk, block_size, table, literal_only, level)
-            }
+            };
+            // Every compressed block must be a multiple of 4 bytes so the next block's file
+            // offset (and thus bDecompressData's param_1) stays 4-byte aligned — see pad4.
+            pad4(blk)
         })
         .collect();
 
