@@ -59,7 +59,7 @@ reuse bytes from a reference file; **const** = a fixed value works.
 | header `spare` (0x02) | const | **const** `32` | always 32 in observed files |
 | header BBox `west/south/east/north` (0x04..0x13) | known | **write** — your region's corners, PAU | drives coordinate decoding |
 | header `partOff` (0x14) | known | **write** — partition-table offset in 4-byte units | reader uses it |
-| info-string region `[0x20 .. partOff*4)` | metadata | **avoid** (leave as zeros / minimal) or **copy** | not used by geometry; display only |
+| info region `[0x20 .. partOff*4)` | metadata | **copy verbatim** from a stock IDX of the same dataset | not read by the geometry path (see `MAP_format.md` §11), but copying is free and matches every shipped file — zero risk |
 | partition table (4 × 12 B) | known | **write** — see §3.1 | fully decoded |
 | tile-table slots | known | **write** — `{regProf, length, offset}` | the core pointer |
 | `multi` slot | known | **write** when a tile spans profiles — see §2 | decoded this pass, verified on data |
@@ -75,9 +75,9 @@ reuse bytes from a reference file; **const** = a fixed value works.
 | header BBox (0x08..0x17) | known | **write** — identical to the IDX | drives coordinate decoding |
 | header `@0x18` | unclear | **copy** from reference, or **const** `8` | stored by reader; 8 in every observed file |
 | header `@0x1a` | unclear | **copy** from reference, or **const** `4` | stored by reader; 4 in every observed file |
-| header `@0x1c` | unclear | **copy**, or `0x400 \| ((binOff − base) >> 1)` | stored by reader; correlates with first-block offset |
-| header `@0x1e` | ignored | **anything** (write `0x8400 \| prof` for tidiness) | reader's header object omits this field entirely |
-| info-string region `[0x20 .. infoTbl)` | metadata | **avoid** or **copy** | not used by geometry |
+| header `@0x1c` | const-able | **copy** — comes along with the template; do not fabricate (stock binOff=0x7bc → `04 04`) | stored by reader; correlates with first-block offset |
+| header `@0x1e` | ignored | **anything** (template carries `0x8400 \| prof`) | reader's header object omits this field entirely |
+| info region `[0x20 .. binOff)` | metadata | **copy verbatim** — keep `binOff` at its stock value (~0x7bc) | not read by the geometry path, but copying is free and matches every shipped file. The #02 reboot was NOT this region — it was self-inconsistent IDX↔block offsets / an unaligned container (OOB in `u16Convert`, `MAP_format.md` §11) |
 | data blocks `[binOff .. fileSize)` | known | **write** — see §3.2 | fully decoded |
 
 ---
@@ -114,7 +114,7 @@ Layout (all offsets are file-absolute; keep everything 4-byte aligned):
 
 ```
 0x00  ┌ header (32 B)
-0x20  ├ info-string region  (optional metadata; may be empty)
+ 0x20  ├ info region  (copy the stock IDX bytes verbatim — do not zero)
       │   ...
 partOff*4  ┌ partition table (4 × 12 B)
            ├ L0 tile table @ binOff
@@ -149,7 +149,7 @@ Layout:
 
 ```
 0x00  ┌ header (32 B)
-0x20  ├ info-string region (optional metadata; may be empty)
+ 0x20  ├ info region (copy the stock MAP bytes verbatim; keep binOff = its stock value, ~0x7bc)
       │   ...
 binOff  ┌ block 0  {marker, 3×(start,count), cells…, point pool…, annotations/text…}
         ├ block 1  (contiguous, 4-byte aligned)
@@ -158,9 +158,14 @@ binOff  ┌ block 0  {marker, 3×(start,count), cells…, point pool…, annotat
 
 Steps:
 
-1. **Write the header.** `binOff` (first block), `infoTbl=0x34`, `fileSize` (final total),
-   BBox identical to the IDX, and `@0x18/@0x1a/@0x1c/@0x1e` per the table in §1 (copy from a
-   reference file of the same profile is the zero-risk choice).
+1. **Write the header.** Best: clone the stock file's whole `[0 .. binOff)` prefix as a template
+   (`osm2map_rs` ships `templates/map_header.bin` = 0x7bc, `templates/idx_header.bin` = 0x1f8) and
+   patch only `fileSize`, BBox (and `@0x1e` profile). Keeping the stock prefix byte-identical is free
+   insurance even though the geometry path (`vConvertMapData`) does not read this region — see §11. The
+   invariants that **do** break rendering are: 4-byte container alignment, and every IDX slot landing on
+   a real block whose marker `len` matches the slot length (an OOB read in `u16Convert`, or the `&3`
+   unaligned guard, is what reboot-looped #02). Otherwise write `binOff`, `infoTbl=0x34`, `fileSize`,
+   BBox identical to the IDX, and copy `@0x18/@0x1a/@0x1c` from a reference file of the same dataset.
 2. **Write each block** the IDX points to, exactly at the offset/length the slot records:
    - `u32 marker = 0xFFFF | (len << 16)` where `len` = block size in words.
    - 3 × `{u16 start, u16 count}` for lists 0 (polygons), 1 (lines), 2 (POI), with
@@ -193,10 +198,10 @@ already been observed to accept.
 Concrete workflow to author a new `<REGION>1<prof>.MAP`:
 
 1. Open the existing `<REGION>1<prof>.MAP` as a template.
-2. Keep its 32-byte header as-is, changing only `binOff`/`fileSize` if your block layout shifts
-   (recompute `@0x1c = 0x400 | ((binOff − base) >> 1)` if you move the first block).
-3. Keep the info-string region as-is (or truncate it and fix `infoTbl`).
-4. Replace only the block data you intend to change; leave unchanged blocks byte-identical so you
+2. Keep its 32-byte header **and the entire info region `[0x20 .. binOff)`** verbatim; change only
+   `fileSize` (and BBox). Do not move `binOff` and do not truncate this region — keep geometry at the
+   stock `binOff` so the reader sees exactly the metadata layout it accepts.
+3. Replace only the block data you intend to change; leave unchanged blocks byte-identical so you
    can diff-verify them later.
 
 For a new `.IDX`, do the same: copy a real IDX of the same region, then rewrite the tile-table
@@ -215,7 +220,13 @@ slots to point at your new MAP blocks.
    their real coordinates.
 4. **Byte-diff unchanged features.** For any feature you copied rather than regenerated, the bytes
    must be identical to the reference — this catches accidental layout drift.
-5. **Runtime load (if available).** Load the file in the actual navigation runtime / a debug build
+5. **Strict structural gate — `diag/tmcheck.py`.** Run `python3 diag/tmcheck.py <dir_or_IDX>`: it
+   walks every block, checks the `0xFFFF|(len<<16)` marker equals the real length, that every slot /
+   sub-entry / annotation / text offset stays **inside its block**, and reports the nearest stock
+   file's verdict. It PASSES on shipped N6E2 (8054 blocks) — a PASS means our reader model matches what
+   the car renders, so an output that FAILS here will fault or reboot on the HU. Use it as a
+   pre-flash gate.
+6. **Runtime load (if available).** Load the file in the actual navigation runtime / a debug build
    and confirm no load errors and correct rendering. This is the ultimate acceptance test.
 
 ---
@@ -232,6 +243,9 @@ slots to point at your new MAP blocks.
 - [ ] Upper BBox border is `south + rel_n`, not `north + rel_n`.
 - [ ] BBox identical in IDX and MAP, in PAU (`deg * 2^31 / 180`).
 - [ ] `multi` slot: bit 14 set, `count` in the length slot, `ptr` in the offset slot.
+- [ ] Every IDX slot `(offset,length)` lands exactly on a real block whose marker `len` matches, and the
+      container is 4-byte aligned — these (not the info region) are what OOB-fault / unaligned-guard.
+- [ ] MAP/IDX prefix `[0 .. binOff)` copied verbatim from stock (free insurance; matches shipped files).
 - [ ] No checksum/CRC is written (none observed); do not invent one.
 
 ---

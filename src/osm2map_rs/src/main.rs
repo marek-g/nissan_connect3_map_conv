@@ -30,6 +30,14 @@ fn deg2pau(d: f64) -> i64 {
 const STATE: u16 = 0x25D4; // measured from reference N6E2 polygon cells
 const PROF: u16 = 0x12; // base32 "0I" -> file N6E210I.MAP
 
+// Stock header/info/metadata templates (verbatim Bosch bytes, static across every region — see
+// doc). The MAP info/partition/metadata block [0x20..binOff) and the IDX descriptive block are
+// byte-identical for all shipped regions; only W/S/E/N + profile differ, which we patch at runtime.
+// Emitting these verbatim (instead of a fabricated 0x40 header with zeros) is what keeps the head
+// unit's strict parser from walking garbage pointers in [0x20..binOff) and rebooting.
+const MAP_HEADER: &[u8] = include_bytes!("../templates/map_header.bin"); // [0x00..0x7bc), binOff=0x7bc
+const IDX_HEADER: &[u8] = include_bytes!("../templates/idx_header.bin"); // [0x00..partOff*4), partOff=0x7e
+
 fn put_u16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
 }
@@ -797,21 +805,30 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
 }
 
 // ---- .MAP / .IDX emitters --------------------------------------------------
-fn emit_map(path: &Path, data: &[u8], binoff: u16) {
-    let filesize = binoff as usize + data.len();
-    let mut d = vec![0u8; filesize];
-    d[0..2].copy_from_slice(&binoff.to_le_bytes());
-    d[2..4].copy_from_slice(&0x34u16.to_le_bytes()); // infoTbl
+// MAP header + info/partition/metadata region [0x00..binOff) is copied verbatim from the stock
+// template (Bosch-static across regions); only W/S/E/N, profile word and total file size are
+// patched. Geometry blocks begin at binOff = MAP_HEADER.len() (0x7bc).
+fn emit_map(path: &Path, data: &[u8]) {
+    let binoff = MAP_HEADER.len(); // 0x7bc
+    let filesize = binoff + data.len();
+    let mut d = MAP_HEADER.to_vec();
+    d.resize(filesize, 0);
     d[4..8].copy_from_slice(&(filesize as u32).to_le_bytes()); // fileSize
     d[8..12].copy_from_slice(&(W as u32).to_le_bytes());
     d[12..16].copy_from_slice(&(S as u32).to_le_bytes());
     d[16..20].copy_from_slice(&(E as u32).to_le_bytes());
     d[20..24].copy_from_slice(&(N as u32).to_le_bytes());
-    d[24..26].copy_from_slice(&8u16.to_le_bytes()); // @0x18
-    d[26..28].copy_from_slice(&4u16.to_le_bytes()); // @0x1a
-    d[30..32].copy_from_slice(&(0x8400u16 | PROF).to_le_bytes()); // @0x1e
-    d[binoff as usize..].copy_from_slice(data);
+    d[0x1e..0x20].copy_from_slice(&(0x8400u16 | PROF).to_le_bytes()); // profile word @0x1e
+    d[binoff..].copy_from_slice(data);
     fs::write(path, &d).expect("write MAP");
+}
+
+// Map-region bbox into a header buffer at `base` (W,S,E,N as u32 LE, 4 consecutive words).
+fn patch_bbox(d: &mut [u8], base: usize) {
+    d[base..base + 4].copy_from_slice(&(W as u32).to_le_bytes());
+    d[base + 4..base + 8].copy_from_slice(&(S as u32).to_le_bytes());
+    d[base + 8..base + 12].copy_from_slice(&(E as u32).to_le_bytes());
+    d[base + 12..base + 16].copy_from_slice(&(N as u32).to_le_bytes());
 }
 
 // ---- sub-block packing -----------------------------------------------------
@@ -893,16 +910,25 @@ fn pack_and_build_blocks(
 }
 
 // ---- .IDX emitter (single + multi-entry slots) ------------------------------
+// Header + descriptive/metadata block [0x00..partOff*4) copied verbatim from the stock template;
+// only the region bbox is patched. The partition table sits at partOff*4 and the per-level tile
+// tables follow immediately after it (binOff = first tile table). Multi-entry slots keep their
+// sub-entry arrays appended after all four tile tables, exactly like stock dense tiles do.
 fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
-    let partOff: u16 = 16; // partition table @ 0x40
-    let mut off = 0x70u32; // first tile table after the partition table
+    let mut d = IDX_HEADER.to_vec();
+    let part_off_word = u16::from_le_bytes([d[0x14], d[0x15]]); // stock value (0x7e), kept as-is
+    let pt = (part_off_word as usize) * 4; // partition table byte offset
+    if d.len() < pt {
+        d.resize(pt, 0);
+    }
+    let bin_off = (pt + 4 * 12) as u32; // first tile table, right after the 4 partition entries
     let mut tbl_offs = [0u32; 4];
+    let mut off = bin_off;
     for i in 0..4 {
         tbl_offs[i] = off;
         off += (TILECNT[i] as u32) * 8;
     }
     let fixed_end = off; // end of the four tile tables
-    let binOff: u16 = tbl_offs[0] as u16;
 
     // Assign byte offsets for each multi-tile's sub-entry table (appended after the tables).
     let mut sub_off = fixed_end;
@@ -918,17 +944,14 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
         }
     }
     let total = sub_off as usize;
-    let mut d = vec![0u8; total];
-    d[0..2].copy_from_slice(&binOff.to_le_bytes());
-    d[2..4].copy_from_slice(&32u16.to_le_bytes()); // spare
-    d[4..8].copy_from_slice(&(W as u32).to_le_bytes());
-    d[8..12].copy_from_slice(&(S as u32).to_le_bytes());
-    d[12..16].copy_from_slice(&(E as u32).to_le_bytes());
-    d[16..20].copy_from_slice(&(N as u32).to_le_bytes());
-    d[0x14..0x16].copy_from_slice(&partOff.to_le_bytes());
+    d.resize(total, 0);
 
+    d[0..2].copy_from_slice(&(bin_off as u16).to_le_bytes()); // binOff @0x00
+    patch_bbox(&mut d, 4); // W/S/E/N at 0x04 (partOff@0x14 kept from template)
+
+    // partition table: id, lat bytes, then {tileCnt<<8|shift} and {tblOff<<8}
     for i in 0..4usize {
-        let o = 0x40 + i * 12;
+        let o = pt + i * 12;
         d[o] = i as u8;
         d[o + 1] = LATPART[i];
         d[o + 2] = LATPART[i];
@@ -1057,7 +1080,7 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    let map_binoff: u32 = 0x40;
+    let map_binoff: u32 = MAP_HEADER.len() as u32; // geometry begins at binOff (0x7bc), after the header/info template
     let mut map_data: Vec<u8> = Vec::new();
     // slots[L][k] = None (empty tile) or Some(list of (lenWords, mapOffset) sub-blocks).
     let mut slots: [Vec<Option<Vec<(u16, u32)>>>; 4] = [
@@ -1152,7 +1175,7 @@ fn main() {
     let map_path = format!("{}/N6E210I.MAP", outdir);
     let idx_path = format!("{}/N6E2AA.IDX", outdir);
     let tci_path = format!("{}/N6E210I.TCI", outdir);
-    emit_map(Path::new(&map_path), &map_data, 0x40);
+    emit_map(Path::new(&map_path), &map_data);
     emit_idx(Path::new(&idx_path), &slots);
     emit_tci(Path::new(&tci_path), &TILECNT);
 

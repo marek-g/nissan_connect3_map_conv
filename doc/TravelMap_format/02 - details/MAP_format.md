@@ -755,8 +755,11 @@ What a generator must produce, and what is still not fully pinned:
 
 ### `.IDX` — fully known (writable)
 
-- 32 B header: `binOff`, `spare`(=32), `west/south/east/north` (PAU), `partOff`(×4).
-- Info-string region `[0x20 .. partOff*4)`: u16 offset list + packed ASCII (metadata, §below).
+- 32 B header: `binOff`, `spare`(=32), `west/south/east/north` (PAU), `partOff`(×4). Stock N6E2:
+  `partOff`=**0x7e** (partition table at pt=`partOff*4`=0x1f8), `binOff`=**0x234**.
+- Descriptive block `[0x20 .. partOff*4)`: u16 offset list + packed ASCII metadata — like the MAP
+  info region, **byte-identical across every region/profile** (only date digits vary). ⇒ copy a stock
+  prefix verbatim as a template and patch only `west/south/east/north` (+ optionally `binOff`).
 - Partition table: 4 × 12 B at `partOff*4`.
 - Tile tables: L0 @ `binOff`, L1/L2/L3 @ `u32b>>8`; slot = `{u16 regProf, u16 length(words),
   u32 offset}`.
@@ -767,20 +770,20 @@ What a generator must produce, and what is still not fully pinned:
 - `regProf` field = `0x400 | prof` (bit 10 is a flag; the file name comes from the two base32
   digits of `prof`); bit 14 = multi, bit 15 = empty.
 
-### `.MAP` header — mostly known
+### `.MAP` header — resolved: copy it verbatim (write-side)
 
 - 32 B header: `binOff`(first block), `infoTbl`(=0x34), `fileSize`, `west/south/east/north`,
-  then 4 × u16:
-  - `@0x18` = **8**, `@0x1a` = **4** — constant across all observed files.
-  - `@0x1c` = `0x400 | ((binOff − 0x7b4) >> 1)` — derived from the first-block offset
-    (0x7b4→0, 0x7bc→4, 0x7c4→8, 0x7cc→c; 0x7b4 is the smallest observed `binOff`).
-  - `@0x1e` = `0x8400 | regProf` (the profile number). **The runtime does not read this field:**
-    its in-memory `dap_map_tclMapFileHeader` (ctor @0x008d8e1c) stores only file offsets
-    0x00–0x1C and omits @0x1E — the profile is taken from the IDX slot instead.
-- Info-string region `[0x20 .. infoTbl)`: same metadata format as the IDX — a short u16 offset
-  list (`{0x44, 0x74, 0x84, 0xbc, …}`) + packed NUL-terminated ASCII: copyright, build
-  date/time, config author, product ("TpMap2 (Map-Data) for TravelMap"), project name, and a
-  default-file list. **Not used by the geometry path** — display/diagnostic only.
+  then 4 × u16 (`@0x18`=**8**, `@0x1a`=**4**, `@0x1c/0x1d`=**04 04**, `@0x1e`=`0x8400|regProf`).
+  `binOff` is **0x7bc in ~94 % of shipped MAP files** (rest are the ±8 B neighbours) — a generator
+  must NOT shrink it to `0x40`.
+- Info-string / metadata region `[0x20 .. binOff)` (~1.9 KB): an info-table at `infoTbl`=0x34 plus
+  packed ASCII (copyright, build date/time, product "TpMap2 (Map-Data) for TravelMap", project).
+  **Verified byte-identical across every shipped region/profile** (diff of 40 canonical files: only
+  six date digits at 0x7f/0x81/0x82/0x44f/0x451/0x452 vary). ⇒ it is static Bosch build metadata and
+  must be **copied verbatim from a stock file**, never regenerated as zeros.
+- `@0x1e` (profile) is not read by the runtime header ctor (`dap_map_tclMapFileHeader` @0x008d8e1c,
+  stores only 0x00–0x1C); profile comes from the IDX slot — but we still patch it for consistency.
+
 - Binary blocks `[binOff .. fileSize)`: contiguous, 4-byte aligned. Each =
   `{u32 marker = 0xFFFF | (len<<16)}` + 3 × `{u16 start, u16 count}` + cells (12 B) + point pool
    + annotation/text (§5/§8). `start[i+1] = start[i] + count[i]*3`; `len` (words) spans to the
@@ -833,9 +836,31 @@ present to avoid the `0x307` logs.
 
 ### Still not fully pinned (all avoidable for a minimal working file)
 
-- **Purpose of header @0x18 / @0x1a / @0x1c:** stored by the runtime but their consumption is not
-  traced; empirically 8/4 are constant and @0x1c tracks `binOff`. Safe writer strategy: copy them
-  from an existing file of the same profile, or emit `8 / 4 / 0x400|((binOff−base)>>1)`.
+- **REBOOT ROOT CAUSE (corrected).** The geometry path — `dap_map_tclWorker::vConvertMapData`
+  @0x00847604 → `dap_map_tclMap2FastMapConverter::u16Convert` @0x008d8248 → `u16ConvertCells`
+  @0x008d7660 — is driven **only** by the IDX-provided `MemBlockDesc` (block ptr/len) plus the tile
+  BBox / shift pulled from the partition table via `DataContext`. It does **not** read `binOff`,
+  `infoTbl`, or the `[0x20 .. binOff)` metadata region, and the in-memory header ctor (@0x008d8e1c)
+  holds no pointer into that region either. So a zeroed info region cannot by itself fault. The early
+  `osm2map` reboot (`binOff=0x40`, `[0x20..)` zeros) is therefore attributable to a **self-inconsistent
+  file**: the IDX slot `(offset,length)` not landing exactly on real blocks / marker `len` mismatch →
+  out-of-bounds read inside `u16Convert`, and/or an unaligned CPRNAV container tripping the `&3`
+  guard. Fix that made it render: (1) pad4'd container (see `compression_CPRNAV2.md`), (2) IDX slots
+  pointing at real, correctly-sized blocks, and — as belt-and-braces — (3) emitting the MAP/IDX prefix
+  **verbatim from stock templates** (`src/osm2map_rs/templates/{map,idx}_header.bin`) so every header
+  byte matches a shipped file. Verbatim-copy stays the zero-risk recommendation because it can only
+  ever match what the reader has accepted; but the *rendering* invariants are alignment + IDX↔block
+  consistency, **not** the info region. See `diag/tmcheck.py` (§10) which enforces exactly those.
+- **Header @0x18 / @0x1a / @0x1c — RESOLVED for writing:** constants (8, 4, and binOff-derived); the
+  safe strategy is to inherit them from the copied template. Consumption by the runtime still not
+  individually traced, but copying them verbatim matches every shipped file.
+- **Profile = display layer taxonomy (open).** The renderer composites one MAP file per profile, and
+  Bosch **splits categories across profiles**, e.g. N6E2: `10I` ≈ hydrography/water + named polygons
+  (+ a few lines, **zero POI cells**), `109` ≈ roads (annot 0x11 roadinfo / 0x14 roadnum) + place-name
+  POIs (`feature`=0x21 city). `osm2map` currently writes *everything* into `10I` — structurally valid
+  and self-contained (tmcheck PASS, round-trips), but the per-layer styling/colour is wrong because it
+  ignores this partition. Fixing visual fidelity needs the **feature → draw/style table** decompiled
+  from `procmapengine.out` (renderer), keyed by `(profile, feature)` — pending Ghidra.
 - **Premium POI payload** (list 2, `feature & 0xF000 == 0xF000`): the 8-byte payload is skipped by
   `bSkipPremiumPOI` @0x008d5f00; its content is unknown. Avoid by not emitting premium POIs.
 - **Annotation payloads 0x23 / 0x30 / 0x34 / 0x35 / 0x51 / 0x52:** size/payload undecoded (the
