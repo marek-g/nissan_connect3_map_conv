@@ -836,21 +836,26 @@ present to avoid the `0x307` logs.
 
 ### Still not fully pinned (all avoidable for a minimal working file)
 
-- **REBOOT ROOT CAUSE (corrected).** The geometry path — `dap_map_tclWorker::vConvertMapData`
-  @0x00847604 → `dap_map_tclMap2FastMapConverter::u16Convert` @0x008d8248 → `u16ConvertCells`
-  @0x008d7660 — is driven **only** by the IDX-provided `MemBlockDesc` (block ptr/len) plus the tile
-  BBox / shift pulled from the partition table via `DataContext`. It does **not** read `binOff`,
-  `infoTbl`, or the `[0x20 .. binOff)` metadata region, and the in-memory header ctor (@0x008d8e1c)
-  holds no pointer into that region either. So a zeroed info region cannot by itself fault. The early
-  `osm2map` reboot (`binOff=0x40`, `[0x20..)` zeros) is therefore attributable to a **self-inconsistent
-  file**: the IDX slot `(offset,length)` not landing exactly on real blocks / marker `len` mismatch →
-  out-of-bounds read inside `u16Convert`, and/or an unaligned CPRNAV container tripping the `&3`
-  guard. Fix that made it render: (1) pad4'd container (see `compression_CPRNAV2.md`), (2) IDX slots
-  pointing at real, correctly-sized blocks, and — as belt-and-braces — (3) emitting the MAP/IDX prefix
-  **verbatim from stock templates** (`src/osm2map_rs/templates/{map,idx}_header.bin`) so every header
-  byte matches a shipped file. Verbatim-copy stays the zero-risk recommendation because it can only
-  ever match what the reader has accepted; but the *rendering* invariants are alignment + IDX↔block
-  consistency, **not** the info region. See `diag/tmcheck.py` (§10) which enforces exactly those.
+- **REBOOT ROOT CAUSE (confirmed empirically = EMPTY-tile slot encoding).** Trial #04 rebooted the
+  head unit even with byte-correct headers, a pad4 container and a self-consistent IDX — so the fault
+  was in the tile-table slot *encoding*, found by diffing stock `N6E2AA.IDX` against osm2map's. The
+  rule: an **empty** tile MUST be written as `regProf = 0x8000` exactly, with `len=0`, `off=0` (raw
+  bytes `00 80 00 00 00 00 00 00`). Bosch does this for all 67k+ empty L3 tiles — it deliberately
+  leaves the profile bits **cleared**, so even if a slot is ever followed, bit15 selects a
+  *non-existent* file (`base32(0)`→`N6E210…`) that simply fails to open. osm2map had been OR-ing the
+  profile into the marker (`0x8000|0x412 = 0x8412`), which points an empty tile at the **real**
+  `N6E210I.MAP` with `off=0`; the reader then treats the MAP *header* as a block and walks its bytes as
+  cells → OOB read inside `u16ConvertCells` @0x008d7660 → reboot. **Fix:** emit empty = bare `0x8000`,
+  and a `multi` header = bare `0x4000` (profile bits cleared, as stock). Same class of "don't leave
+  stray profile bits in a marker slot".
+- **Why the info region / fabricated header are NOT the cause.** The geometry path —
+  `vConvertMapData` @0x00847604 → `u16Convert` @0x008d8248 → `u16ConvertCells` — is driven **only** by
+  the IDX-provided `MemBlockDesc` (block ptr/len) plus tile BBox/shift from the partition table; it does
+  not read `binOff`, `infoTbl` or `[0x20 .. binOff)` (header ctor @0x008d8e1c stores no pointer there).
+  So copying the stock prefix verbatim is good hygiene but never rendered/never faulted — and a region
+  whose **IDX is left untouched** (trial #03) was always safe, which is exactly why #03 worked while
+  every osm2map IDX swap (#02, #04) rebooted. `diag/tmcheck.py` (§10) now enforces the empty/multi
+  bit-patterns + block bounds for every slot; it FAILs on the old #04 IDX and PASSes on all of stock.
 - **Header @0x18 / @0x1a / @0x1c — RESOLVED for writing:** constants (8, 4, and binOff-derived); the
   safe strategy is to inherit them from the copied template. Consumption by the runtime still not
   individually traced, but copying them verbatim matches every shipped file.

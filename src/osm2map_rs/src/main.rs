@@ -967,8 +967,11 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
             let so = tbl + k * 8;
             match &slots[L][k] {
                 None => {
-                    d[so..so + 2]
-                        .copy_from_slice(&((0x8000u16 | regprof as u16).to_le_bytes())); // empty
+                    // Empty tile MUST be exactly 0x8000 (bit15 set, profile bits CLEARED), len=0,
+                    // off=0 — matching stock. OR-ing the profile in makes the reader resolve an empty
+                    // slot to a real <REGION>1XX.MAP at offset 0 and parse the MAP header as cells →
+                    // OOB read → head-unit reboot. (The bytes so+2..so+8 are already zero from resize.)
+                    d[so..so + 2].copy_from_slice(&0x8000u16.to_le_bytes());
                 }
                 Some(e) if e.len() == 1 => {
                     let (len, offb) = e[0];
@@ -978,7 +981,8 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
                 }
                 Some(e) => {
                     let sbo = sub_table[&(L, k)];
-                    let a: u32 = ((e.len() as u32) << 16) | (0x4000u16 | PROF) as u32; // bit14 = multi
+                    // multi header regProf = exactly 0x4000 (bit14 only, profile bits cleared) like stock
+                    let a: u32 = ((e.len() as u32) << 16) | 0x4000u32;
                     d[so..so + 4].copy_from_slice(&a.to_le_bytes());
                     d[so + 4..so + 8].copy_from_slice(&sbo.to_le_bytes());
                     for (j, &(len, offb)) in e.iter().enumerate() {

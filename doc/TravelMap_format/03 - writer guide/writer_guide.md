@@ -63,7 +63,7 @@ reuse bytes from a reference file; **const** = a fixed value works.
 | partition table (4 × 12 B) | known | **write** — see §3.1 | fully decoded |
 | tile-table slots | known | **write** — `{regProf, length, offset}` | the core pointer |
 | `multi` slot | known | **write** when a tile spans profiles — see §2 | decoded this pass, verified on data |
-| empty tiles | known | **write** slot with bit 15 set (`empty`) | reader skips it |
+| empty tiles | known | **write** `{regProf=0x8000, len=0, off=0}` — profile bits MUST be cleared | bit15 alone isn't enough: leaving the profile bits set points an "empty" tile at a real MAP file (off=0 → parses the header as cells → reboot). Stock always uses exactly `00 80 00 00 00 00 00 00`. |
 
 ### `.MAP`
 
@@ -242,7 +242,11 @@ slots to point at your new MAP blocks.
 - [ ] Coordinate = tile center + `(delta << shift)`; use the per-level `shift`.
 - [ ] Upper BBox border is `south + rel_n`, not `north + rel_n`.
 - [ ] BBox identical in IDX and MAP, in PAU (`deg * 2^31 / 180`).
-- [ ] `multi` slot: bit 14 set, `count` in the length slot, `ptr` in the offset slot.
+- [ ] `multi` slot: bit 14 set, `count` in the length slot, `ptr` in the offset slot; header regProf is
+      exactly `0x4000` (no profile bits). Sub-entries carry the real `{regProf,len,off}`.
+- [ ] **Empty tile = `{0x8000, 0, 0}` with profile bits cleared** — never `0x8000|prof`. Leaving the
+      profile set redirects the "empty" slot to a real MAP file at off=0 → header parsed as cells → OOB
+      reboot (this is what broke trials #02/#04 while stock and untouched-IDX edits were fine).
 - [ ] Every IDX slot `(offset,length)` lands exactly on a real block whose marker `len` matches, and the
       container is 4-byte aligned — these (not the info region) are what OOB-fault / unaligned-guard.
 - [ ] MAP/IDX prefix `[0 .. binOff)` copied verbatim from stock (free insurance; matches shipped files).
