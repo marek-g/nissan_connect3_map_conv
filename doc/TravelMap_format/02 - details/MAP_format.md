@@ -318,7 +318,10 @@ Dispatch: **`u8ConvertFeature2Type` @ `0x008d5b8c`** — takes `feature & 0xFF`
 | 1 | lines | `u8ConvertFeature2LineType` | `0x008d582c` |
 | 2 | POI | `u8ConvertFeature2POIType` | `0x008d5a10` |
 
-The high byte of `feature` = **display scale** (visibility threshold).
+**Feature high byte is NOT a display-scale field.** Measured across 6 full regions, the high
+byte of `feature` is `0x00` for *every* road cell at every level and profile. Visibility comes
+from which tile **level** a cell sits on and which **profile** references it — not from a per-cell
+bitfield in `feature`. (Earlier "high byte = display scale" reading was wrong; see §11.)
 
 ### Lines (list 1) — code → type
 
@@ -391,7 +394,7 @@ extract and against the official icon taxonomy in `POI_MAPPING.DAT` (see §7.1):
 | 0x9C | 0x23 |
 
  **Verified land-use class (polygon low byte)** — the low byte picks the terrain class, which is
- what the renderer colours. High byte = display scale only. From a Kraków-area L3 extract
+ what the renderer colours (high byte measured `0x00` throughout — see §7 note above). From a Kraków-area L3 extract
  (city + suburbs + rural south), with the OSM tag now emitted by the converter:
 
  | feature (low byte) | terrain | evidence (names / size / location) | OSM tag | map colour |
@@ -859,20 +862,101 @@ present to avoid the `0x307` logs.
 - **Header @0x18 / @0x1a / @0x1c — RESOLVED for writing:** constants (8, 4, and binOff-derived); the
   safe strategy is to inherit them from the copied template. Consumption by the runtime still not
   individually traced, but copying them verbatim matches every shipped file.
-- **Profile = display layer taxonomy (open).** The renderer composites one MAP file per profile, and
-  Bosch **splits categories across profiles**, e.g. N6E2: `10I` ≈ hydrography/water + named polygons
-  (+ a few lines, **zero POI cells**), `109` ≈ roads (annot 0x11 roadinfo / 0x14 roadnum) + place-name
-  POIs (`feature`=0x21 city). `osm2map` currently writes *everything* into `10I` — structurally valid
-  and self-contained (tmcheck PASS, round-trips), but the per-layer styling/colour is wrong because it
-  ignores this partition. Fixing visual fidelity needs the **feature → draw/style table** decompiled
-  from `procmapengine.out` (renderer), keyed by `(profile, feature)` — pending Ghidra.
+- **Profile model — CORRECTED (empirical, 411 regions + Ghidra).** A profile is **not** a category /
+  display layer. Two findings from the full map set:
+  1. **`0I` is universal and special.** It exists in *every* region (387/411 ship *only* `0I`) and
+     holds **hydrography only** — coastline/water lines + water-area polygons, **zero POI cells and
+     zero settlement/landuse polygons**. Ocean regions need nothing else.
+  2. **Non-`0I` profiles are geographic shards, not categories.** In the ~6 dense countries (N4E2/3,
+     N5E1/2, N6E1/2) a region splits into several shard profiles; at L2 most tiles resolve to exactly
+     one shard and every shard carries the **same content mix** (roads + POI + landuse), differing only
+     by *volume* (e.g. N6E2 L2: `1A`=1112 tiles, `02`=365, `0H`=142, `0E`=100). A pure-water tile →
+     `0I` alone; a land tile with water → `<shard>` + `0I`; the L0 root aggregates all profiles.
+  So Bosch partitions a region's tiles across named data buckets (size/volume-driven), with `0I` held
+  out as the hydro overlay. There is **no** global "category → profile id" map and **no** profile
+  literally named `109` — earlier examples to that effect were wrong.
+- **Profile ids are internal to the region — there is NO on-disk map-profile registry (task C).** The only
+  region/profile metadata files are `DATA/DATASET.CFG` (`DATASET_ID{1758962541}`, `USED_COMPRESSION{5}`,
+  `DATABASE_CONFIG{'MAP'|'/MAP/''|'10.23'}`, and a small country-level `REGION_CONFIG`) + `MEDIUM.CFG`, and
+  `DATA/DATA/MISC/tp_meta.dat`. The `resinf` “RegionMetaInfo/ProfileMetaInfo” path
+  (`vProcessEvalRegionMetaInfos` @0x008b43c0 reads `…/data/data/misc/tp_meta.dat` via
+  `u16CreateFullAvailMetaFileAccessPath` @0x008ae808, parsed by `dap_tclMetaDataCtrl::u16EvalAnnotations`)
+  lists **Traffic-Provider profiles** named `INV,CCP,MRP,IRP,ALPS,TGP,ALP` (matching INFO.TXT “TMC (CCP/IRP…)”)
+  — NOT the MAP display suffixes (`0I/02/…`). So it neither whitelists per-profile annotations nor constrains
+  our map profile ids, and a `.MAP`/`.IDX` swap does **not** touch `DATASET.CFG`/`tp_meta.dat`.
+  ⇒ the fatal-`0x204` dataset/metadata-eval path is ruled out for our edit. Map display profiles live only in
+  each region's `AA.IDX` regProf words (+ the per-file `@0x1e` word), with the descriptive info-block copied
+  verbatim from stock — nothing external to keep in sync besides emitting only ids that exist as files.
+- **Renderer is profile-agnostic (procmapengine.out deep-dive).** `opt/bosch/processes/procmapengine.out`
+  contains **no `Profile` symbol at all**; drawing works on FastMap `map_tclMapObject`s selected purely by
+  **feature type + display/detail scale** (`bGetFeatureStatus(ren_tenMapFeature,…)`, `LayoutScene(...,
+  map_tenScaleID)`, `CreateMapObject(map_trMapObjectData)`, `DetermineMapObjects`). The MAP *profile* only
+  decides which file the geometry was read from; after `u16Convert` it is discarded. Consequence: authoring
+  land in `0I` vs a shard is **invisible to the renderer** — it cannot change styling or fault rendering. So
+  the two-profile split (#07) improves *file-layout fidelity* but, on its own, is unlikely to be the reboot
+  fix; the reboot must originate upstream of the FastMap output (see remaining leads below).
+
+- **Faithful file layout (`#07`).** Bosch keeps `0I` hydrography-only and puts land into separate shard
+  profiles; no shipped region ships a lone `0I` carrying roads/POI. osm2map previously did exactly that, so
+  `#07` now emits `10I` (hydro only) + `02` (land), each L2 tile → its shard (+ `0I` when it has water). This
+  matches Bosch's layout and cluster/overlay conventions; since the renderer is profile-agnostic it is a
+  *fidelity* change, **not** a proven reboot fix. Confirm on-car with #07 first, then isolate (#06: inject one
+  osm2map block into a stock map tile at its empty slot's off/len).
+
+- **Geometry is NOT the fault vector (offline reader-model verification).** Decompiling the actual
+  path `vConvertMapData` @0x00847604 → `u16Convert` @0x008d8248 → `u16ConvertCells` @0x008d7660 shows
+  every read goes through a **bounded data accessor** sized from the IDX `MemBlockDesc{ptr,len}`; a
+  short/over-long read returns an error code (`0x321`/`0x218`) and the tile is skipped — it does **not**
+  SIGSEGV. The block header it expects (after skipping the 4-byte marker) is exactly our `3×{u16 start,
+  u16 count}` for lists 0/1/2, then point pool + texts — confirming our writer's layout field-for-field.
+  Consequence: any output that (a) encodes slots to stock bit-patterns, (b) keeps every block inside its
+  MAP file (`off+len*4 ≤ filesize`), and (c) uses valid feature/annotation codes cannot fault here. `#05`
+  satisfied all three (tmcheck PASS) yet still rebooted ⇒ the cause is **outside** geometry.
+- **Feature/annotation codes are all safe + legal.** The dispatchers `u8ConvertFeature2{Poly,Line,POI}Type`
+  @0x008d56a0/0x008d582c/0x008d5a10 return a FastMap **type** via switch/if-ranges (default → `0`), never
+  index a table by the raw feature ⇒ no OOB from feature codes. Our `#07` scan: poly low ∈
+  {0x38,0x39,0x3A,0x2B,0x48,0x9C}, line low = {0x30}, POI low ⊂ valid `{1-9,0x10-0x17,0x21,0x22}`, feature
+  high byte = 0 everywhere; annotations only {0x10,0x11,0x7A}. So `feature`/annot cannot crash the renderer
+  and none of our POIs fall to an unmapped type. Combined with tasks A–C (bounded reader; no map-profile
+  registry / fatal-`0x204`; profile-agnostic renderer), **every data-path component we can model offline is
+  clean**; the tile-id / partition loader upstream of `u16Convert` is likewise fully bounded (see remaining
+  leads), leaving only the unlikely CPRNAV_2 decompress→hand-off boundary unverified.
+- **`diag/tmcheck.py` is now a calibrated strict model.** Added: marker hi==`0xFFFF`, in-block marker len ==
+  slot length (accessor window), multi sub-entry count ≤ 15. Calibrated to **PASS 17/17 diverse stock
+  regions** (1–9 profiles, oceanic→dense; e.g. N4E2/N5E1/N5E2/N6E1) with zero false positives, still FAILs
+  the old #04 empty-slot bug (`0x8412`), and PASSes `#07`.
+
 - **Premium POI payload** (list 2, `feature & 0xF000 == 0xF000`): the 8-byte payload is skipped by
   `bSkipPremiumPOI` @0x008d5f00; its content is unknown. Avoid by not emitting premium POIs.
 - **Annotation payloads 0x23 / 0x30 / 0x34 / 0x35 / 0x51 / 0x52:** size/payload undecoded (the
   converter treats them as category flags). Avoid by not emitting those types, or copy raw bytes
   from a reference file.
-- **Checksum/CRC:** none observed in any header or block; unverified whether an external tool
-  validates one.
+- **Tile-id enumeration / partition loader — now EXONERATED (fully traced + bounded).** Chain
+  `dap_map_tclIdController::u16GenerateTileIds @0x8cd8e0` → `dap_map_tclTileLoader::u16ValidateTileId
+  @0x8e3f00` → `u16LoadTileOffsetFromIdxFile @0x8e3cd8` → `u16ReadMultiIdxListDesc @0x8e3968`. Every loop is
+  a size-bounded STL/container walk; the only raw file read is clamped like the geometry accessor. Concrete
+  invariants the reader enforces (and that `tmcheck` now mirrors):
+  - Slot word flags `(word & 0xC000)`: `0x0000` = single entry (`regProf = field>>2`, length = high half-word,
+    offset from the companion u32); `0x4000` = multi → sub-list via `u16ReadMultiIdxListDesc`; **any other flag
+    (incl. the `0x8000` empty marker) is silently skipped** ⇒ an empty slot never faults.
+  - Multi sub-entry count `= *(u16)(desc+2)` guarded by `if (count > 0xF) → err 0xd`; it reads exactly
+    `count × 8` bytes at `offset = *(u32)(desc+4)` through `u16LoadDataBlockConnectGlobal` inside a fixed
+    0x4000 preload window (bounded accessor). No nested multi ⇒ no recursion blow-up.
+  - Single/multi entries with `offset==0 || length==0` are dropped (`RegionList::u16Add`, not pushed as data) —
+    this is the code path that made old `#04`'s bogus non-empty-looking empty slot (`0x8412`) invalid, and why
+    `tmcheck` rejects it.
+  Conclusion: with a `tmcheck`-clean output these loaders cannot OOB, so #04/#05 could not have rebooted here
+  *if* they had satisfied these invariants (the empty-slot rule #04 did not).
+- **Remaining reboot lead — container/decompression stage (CPRNAV_2), only and unlikely.** `#05` used a
+  stock-valid container that decompresses byte-exact, but the decompress→hand-off boundary has not been
+  independently confirmed. Everything else modelable offline (partition/tile-id loader, per-block reader,
+  feature/annot codes, dataset/profile metadata, renderer) is now bounded/clean for a `tmcheck`-passing output.
+  **Offline RE is exhausted — decisive progress needs the head unit: flash #07, then run the #06 isolation
+  ladder.**
+
+- **Checksum/CRC:** none observed in any header or block; unverified whether an external tool validates one.
+
+
 
 ### Minimal viable `.MAP`/`.IDX` pair (readable for geometry)
 

@@ -137,11 +137,22 @@ Steps:
    - `+7..+10` = `u32b = (tableOffset << 8)`  ← where this level's tile table lives
    - Fixed for the EUR dataset: `latPart = (1,5,10,10)`, `shift = (13,10,7,4)`,
      `tileCnt = (1,25,2500,250000)`.
-4. **Write each tile table.** For every tile `K` at level `i`, one 8-byte slot:
-   - data present in one profile → `{0x400 | prof, length(words), offset-in-MAP}`
-   - data present in several profiles → a `multi` slot (§2)
-   - no data → `{0x8000 | (0x400|prof), 0, 0}` (bit 15 = empty)
-   - `length` is the block size **in 4-byte words** and must equal the marker length in the MAP.
+ 4. **Write each tile table.** For every tile `K` at level `i`, one 8-byte slot:
+    - data present in one profile → `{0x400 | prof, length(words), offset-in-MAP}`
+    - data present in several profiles → a `multi` slot (§2) (header = bare `0x4000`, no profile bits)
+    - no data → **exactly `{0x8000, 0, 0}`** — the profile bits MUST be cleared. Leaving them set
+      (`0x8000 | prof`) points an "empty" tile at a real MAP file (off 0 parses its header as cells),
+      which is the #04 reboot. Never OR the profile into an empty marker.
+    - `length` is the block size **in 4-byte words** and must equal the marker length in the MAP.
+
+    > **Which profile?** Profile ids are fixed per region by a product metadata catalog (`resinf`) —
+    > only reuse ids already declared for the target region; do not invent new ones (a mismatch drives
+    > a fatal error at region init). Empirically: `0I` = hydrography overlay (coast/water lines +
+    > water areas, **no POI / no settlement polygons**) and is present in every region; land content
+    > goes into one or more separate shard profiles. A tile references its land shard (+ `0I` when it
+    > also has water). Do **not** put roads/POI/urban into `0I`. See MAP_format.md §11 for the measured
+    > evidence and the still-open #04/#05 reboot link.
+
 
 ### 3.2 Generate the `.MAP`
 

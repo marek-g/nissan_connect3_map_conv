@@ -28,7 +28,31 @@ fn deg2pau(d: f64) -> i64 {
 }
 
 const STATE: u16 = 0x25D4; // measured from reference N6E2 polygon cells
-const PROF: u16 = 0x12; // base32 "0I" -> file N6E210I.MAP
+
+// Two-profile output (see doc/TravelMap_format §11): Bosch's `0I` profile is a hydrography-only
+// overlay present in EVERY region (coastline/water lines + water-area polygons, zero POI/settlement),
+// while land content lives in separate shard profiles. No shipped region puts roads/POI into `0I`.
+// osm2map previously dumped everything into a lone `0I`, which no stock map does (leading suspect for
+// the #04/#05 reboot). We now split: hydro -> `0I` (0x12), land -> shard profile `02` (0x02), both of
+// which are already declared for region N6E2 in the resinf metadata catalog. base32(low) -> file name
+// via `<REGION>1<B32[low/32]><B32[low%32]>`.
+const HYDRO_PROF: u16 = 0x12; // "0I" -> N6E210I.MAP : waterways + water areas, no POI
+const LAND_PROF: u16 = 0x02; // "02" -> N6E2102.MAP : roads + POI + land-use polygons
+const PROF: u16 = HYDRO_PROF; // kept for reference / single-profile callers
+
+// water-area polygon feature low byte (area_feat returns this for natural/landuse water)
+fn is_water_area_feat(feat: u16) -> bool {
+    feat & 0xFF == 0x48
+}
+
+const REGION: &str = "N6E2"; // whole region replaced; ids must be declared in its resinf catalog
+// profile id -> MAP/TCI file base name: <REGION> + "1" + base32(low byte as 2 chars).
+fn prof_file(prof: u16) -> String {
+    const B32: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let v = (prof & 0xFF) as usize;
+    let s: String = [B32[v / 32], B32[v % 32]].iter().map(|&c| c as char).collect();
+    format!("{}1{}", REGION, s)
+}
 
 // Stock header/info/metadata templates (verbatim Bosch bytes, static across every region — see
 // doc). The MAP info/partition/metadata block [0x20..binOff) and the IDX descriptive block are
@@ -808,7 +832,7 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
 // MAP header + info/partition/metadata region [0x00..binOff) is copied verbatim from the stock
 // template (Bosch-static across regions); only W/S/E/N, profile word and total file size are
 // patched. Geometry blocks begin at binOff = MAP_HEADER.len() (0x7bc).
-fn emit_map(path: &Path, data: &[u8]) {
+fn emit_map(path: &Path, data: &[u8], prof: u16) {
     let binoff = MAP_HEADER.len(); // 0x7bc
     let filesize = binoff + data.len();
     let mut d = MAP_HEADER.to_vec();
@@ -818,7 +842,7 @@ fn emit_map(path: &Path, data: &[u8]) {
     d[12..16].copy_from_slice(&(S as u32).to_le_bytes());
     d[16..20].copy_from_slice(&(E as u32).to_le_bytes());
     d[20..24].copy_from_slice(&(N as u32).to_le_bytes());
-    d[0x1e..0x20].copy_from_slice(&(0x8400u16 | PROF).to_le_bytes()); // profile word @0x1e
+    d[0x1e..0x20].copy_from_slice(&(0x8400u16 | prof).to_le_bytes()); // profile word @0x1e
     d[binoff..].copy_from_slice(data);
     fs::write(path, &d).expect("write MAP");
 }
@@ -914,7 +938,7 @@ fn pack_and_build_blocks(
 // only the region bbox is patched. The partition table sits at partOff*4 and the per-level tile
 // tables follow immediately after it (binOff = first tile table). Multi-entry slots keep their
 // sub-entry arrays appended after all four tile tables, exactly like stock dense tiles do.
-fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
+fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u16, u32)>>>; 4]) {
     let mut d = IDX_HEADER.to_vec();
     let part_off_word = u16::from_le_bytes([d[0x14], d[0x15]]); // stock value (0x7e), kept as-is
     let pt = (part_off_word as usize) * 4; // partition table byte offset
@@ -960,7 +984,6 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
         d[o + 7..o + 11].copy_from_slice(&(tbl_offs[i] << 8).to_le_bytes());
     }
 
-    let regprof = (0x400u16 | PROF) as u32; // single/sub-entry profile word (bits 14-15 clear)
     for L in 0..4usize {
         let tbl = tbl_offs[L] as usize;
         for k in 0..TILECNT[L] {
@@ -974,8 +997,8 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
                     d[so..so + 2].copy_from_slice(&0x8000u16.to_le_bytes());
                 }
                 Some(e) if e.len() == 1 => {
-                    let (len, offb) = e[0];
-                    d[so..so + 2].copy_from_slice(&(regprof as u16).to_le_bytes());
+                    let (rp, len, offb) = e[0]; // rp = 0x400|profile, bits 14-15 clear
+                    d[so..so + 2].copy_from_slice(&rp.to_le_bytes());
                     d[so + 2..so + 4].copy_from_slice(&len.to_le_bytes());
                     d[so + 4..so + 8].copy_from_slice(&offb.to_le_bytes());
                 }
@@ -985,9 +1008,10 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u32)>>>; 4]) {
                     let a: u32 = ((e.len() as u32) << 16) | 0x4000u32;
                     d[so..so + 4].copy_from_slice(&a.to_le_bytes());
                     d[so + 4..so + 8].copy_from_slice(&sbo.to_le_bytes());
-                    for (j, &(len, offb)) in e.iter().enumerate() {
+                    // each sub-entry carries its OWN profile word (land shard and/or hydro 0I overlay)
+                    for (j, &(rp, len, offb)) in e.iter().enumerate() {
                         let q = (sbo as usize) + j * 8;
-                        let aa: u32 = ((len as u32) << 16) | regprof;
+                        let aa: u32 = ((len as u32) << 16) | (rp as u32);
                         d[q..q + 4].copy_from_slice(&aa.to_le_bytes());
                         d[q + 4..q + 8].copy_from_slice(&offb.to_le_bytes());
                     }
@@ -1085,9 +1109,12 @@ fn main() {
     );
 
     let map_binoff: u32 = MAP_HEADER.len() as u32; // geometry begins at binOff (0x7bc), after the header/info template
-    let mut map_data: Vec<u8> = Vec::new();
-    // slots[L][k] = None (empty tile) or Some(list of (lenWords, mapOffset) sub-blocks).
-    let mut slots: [Vec<Option<Vec<(u16, u32)>>>; 4] = [
+    // Two independent MAP files, each with its own geometry starting at map_binoff: land shard and hydro.
+    let mut map_land: Vec<u8> = Vec::new();
+    let mut map_hydro: Vec<u8> = Vec::new();
+    // slots[L][k] = None (empty tile) or Some(list of (regProfWord, lenWords, mapOffset) sub-blocks).
+    // regProfWord = 0x400 | profile id (bits 14-15 clear); a tile may mix the land shard and 0I overlay.
+    let mut slots: [Vec<Option<Vec<(u16, u16, u32)>>>; 4] = [
         vec![None; TILECNT[0]],
         vec![None; TILECNT[1]],
         vec![None; TILECNT[2]],
@@ -1147,14 +1174,20 @@ fn main() {
             let ts = dist.remove(&K).unwrap();
             let (cx, cy) = tile_center(L, K);
 
-            // Combine roads (0x11 roadinfo) and waterways (0x10 water) into the line section.
-            let mut lines: Vec<LineCell> =
-                Vec::with_capacity(ts.roads.len() + ts.waterways.len());
+            // Split this tile's content into LAND (shard profile `02`) vs HYDRO (`0I` overlay).
+            // Bosch's `0I` carries ONLY water: waterway lines + water-area polygons, never roads/POI.
+            let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
             for (geom, w) in &ts.roads {
-                lines.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x11, *w, 0)) });
+                lines_land.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x11, *w, 0)) });
             }
+            let mut lines_hydro: Vec<LineCell> = Vec::with_capacity(ts.waterways.len());
             for (geom, wc) in &ts.waterways {
-                lines.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x10, *wc, 0)) });
+                lines_hydro.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x10, *wc, 0)) });
+            }
+            let mut land_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
+            let mut hydro_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
+            for a in ts.areas.iter().cloned() {
+                if is_water_area_feat(a.1) { hydro_polys.push(a); } else { land_polys.push(a); }
             }
             let tpois_named: Vec<(i64, i64, u16, Option<&str>)> = ts
                 .pois
@@ -1162,33 +1195,48 @@ fn main() {
                 .map(|(a, b, c, d)| (*a, *b, *c, Some(d.as_str())))
                 .collect();
 
-            // Pack the tile's features into sub-blocks (each <= MAX_BLOCK_WORDS) and append them.
-            let subblocks = pack_and_build_blocks(shift, cx, cy, &ts.areas, &lines, &tpois_named);
-            nsub += subblocks.len();
-            let mut entries: Vec<(u16, u32)> = Vec::with_capacity(subblocks.len());
-            for blk in &subblocks {
-                let offb = map_binoff + map_data.len() as u32;
-                map_data.extend_from_slice(blk);
-                entries.push(((blk.len() / 4) as u16, offb));
+            // Append a profile's sub-blocks to its own MAP buffer, tagging each slot entry with that
+            // profile's regProf word. Land first, then the 0I hydro overlay (matches stock co-refs).
+            let mut entries: Vec<(u16, u16, u32)> = Vec::new();
+            for blk in pack_and_build_blocks(shift, cx, cy, &land_polys, &lines_land, &tpois_named) {
+                let offb = map_binoff + map_land.len() as u32;
+                let lw = (blk.len() / 4) as u16;
+                map_land.extend_from_slice(&blk);
+                entries.push((0x400 | LAND_PROF, lw, offb));
             }
-            slots[L][K as usize] = Some(entries);
+            for blk in pack_and_build_blocks(shift, cx, cy, &hydro_polys, &lines_hydro, &[]) {
+                let offb = map_binoff + map_hydro.len() as u32;
+                let lw = (blk.len() / 4) as u16;
+                map_hydro.extend_from_slice(&blk);
+                entries.push((0x400 | HYDRO_PROF, lw, offb));
+            }
+            nsub += entries.len();
+            if entries.len() > 15 {
+                eprintln!("WARN L{} tile {}: {} sub-entries (> 15 multi-slot cap)", L, K, entries.len());
+            }
+            if !entries.is_empty() {
+                slots[L][K as usize] = Some(entries);
+            }
         }
         eprintln!("L{}: {} non-empty tiles -> {} sub-blocks", L, ntiles, nsub);
     }
 
-    let map_path = format!("{}/N6E210I.MAP", outdir);
-    let idx_path = format!("{}/N6E2AA.IDX", outdir);
-    let tci_path = format!("{}/N6E210I.TCI", outdir);
-    emit_map(Path::new(&map_path), &map_data);
+    let idx_path = format!("{}/{}AA.IDX", outdir, REGION);
+    let land_file = prof_file(LAND_PROF); // N6E2102
+    let hydro_file = prof_file(HYDRO_PROF); // N6E210I
+    emit_map(Path::new(&format!("{}/{}.MAP", outdir, land_file)), &map_land, LAND_PROF);
+    emit_map(Path::new(&format!("{}/{}.MAP", outdir, hydro_file)), &map_hydro, HYDRO_PROF);
     emit_idx(Path::new(&idx_path), &slots);
-    emit_tci(Path::new(&tci_path), &TILECNT);
+    emit_tci(Path::new(&format!("{}/{}.TCI", outdir, land_file)), &TILECNT);
+    emit_tci(Path::new(&format!("{}/{}.TCI", outdir, hydro_file)), &TILECNT);
 
     eprintln!(
-        "wrote {}, {} and {}; map data {} B, {}s total",
+        "wrote {} + land {}.MAP/.TCI ({} B) + hydro {}.MAP/.TCI ({} B), {}s total",
         idx_path,
-        map_path,
-        tci_path,
-        map_data.len(),
+        land_file,
+        map_land.len(),
+        hydro_file,
+        map_hydro.len(),
         t0.elapsed().as_secs_f64()
     );
 }
