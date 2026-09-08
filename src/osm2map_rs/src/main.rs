@@ -45,6 +45,29 @@ fn is_water_area_feat(feat: u16) -> bool {
     feat & 0xFF == 0x48
 }
 
+// ---- polygon (list-0) feature full code -----------------------------------
+// Bosch LINE cells (list1) always carry a HIGH byte of 0x00 in `feature` (confirmed: every stock line
+// low code 0x10/0x20/0x21/0x30/0x31/0x32/0x33 has high==0), which is why our roads render fine. Stock
+// POLYGON cells (list0) span high 0x20..0x95 (values < 0x20 never occur) and encode fill style/detail.
+// NOTE: an earlier note here blamed the polygon reboot on a zero high byte (#06c); that is DISPROVEN.
+// The high byte only feeds PolygonConfigMatrix::u16GetDisplayScale (a clamped display-scale bucket),
+// and the true #06c cause was the MISSING per-polygon annotation (see build_block). poly_full_feat is
+// kept anyway because it yields stock-valid, in-band full codes; observed stock mode per category. The
+// feature LOW code is not the crash source: 0x9c is the single most common stock polygon code (2.78M).
+fn poly_full_feat(low_only: u16) -> u16 {
+    let low = (low_only & 0xFF) as u8;
+    let hi: u8 = match low {
+        0x9c => 0x20, // residential / building land-use   -> 0x209c (dominant stock value)
+        0x38 => 0x60, // grass / meadow / vegetation        -> 0x6038
+        0x2b => 0x60, // forest / woodland                  -> 0x602b
+        0x48 => 0x50, // water area                         -> 0x5048
+        0x39 => 0x40, // cemetery                           -> 0x4039
+        0x3a => 0x50, // commercial                         -> 0x503a
+        _ => 0x40,    // safe in-band default
+    };
+    ((hi as u16) << 8) | (low_only & 0xFF)
+}
+
 const REGION: &str = "N6E2"; // whole region replaced; ids must be declared in its resinf catalog
 // profile id -> MAP/TCI file base name: <REGION> + "1" + base32(low byte as 2 chars).
 fn prof_file(prof: u16) -> String {
@@ -94,6 +117,39 @@ fn ann_words(typ: u8) -> u32 {
     }
 }
 
+// Which annotation a land-use polygon must carry, chosen by CATEGORY (measured on stock N6E2):
+//   * feat low 0x9c (OSM landuse=residential / settlement area) ALWAYS carries 0x04 (DCM = 3D city
+//     model) — 2.77M cells, ~100% of that category, and it is the ONLY category that ever does.
+//   * grass 0x38 / forest 0x2b / cemetery 0x39 ... carry no annotation ~79-96% of the time (a name
+//     0x7A otherwise). Water-area 0x48 always carries 0x10 (not 0x04) — added separately for hydro.
+// Emitting 0x04 on our 0x9c polygons is what stops the reboot (the renderer dereferences a
+// style/config entry the DCM record supplies; see build_block). OSM2MAP_POLY_ANN:
+//   "cat" (default) = faithful: 0x04 only on 0x9c      "all" = 0x04 on every polygon (ladder 6c3)
+//   "0"/"none"      = no polygon annotation (ladder baselines 6c/6c2)
+// Returns the annotation type byte to emit, or 0 for none.
+fn poly_annot_type(feat_low: u8) -> u8 {
+    match env::var("OSM2MAP_POLY_ANN").unwrap_or_else(|_| "cat".into()).as_str() {
+        "0" | "n" | "none" | "false" => 0,
+        "all" | "1" | "y" | "true" => 0x04,
+        _ => {
+            if feat_low == 0x9c {
+                0x04
+            } else {
+                0
+            }
+        }
+    }
+}
+
+// Words the polygon's annotation occupies (0x04 DCM = 8 B = 2 words; 0 when none).
+fn poly_annot_words(feat_low: u8) -> u32 {
+    if poly_annot_type(feat_low) != 0 {
+        2
+    } else {
+        0
+    }
+}
+
 // ---- decompressed MAP block (inverted from map2osm parse_block) ------------
 fn build_block(
     shift: i32,
@@ -132,10 +188,26 @@ fn build_block(
     }
     let pool_end = cur;
 
-    // annotation region (after point pool): one variable-size entry per line that has an
-    // ann, then one 0x7A text entry per named POI, then the POI text records.
-    let mut line_ann = vec![None::<u32>; nl];
+    // Land-use polygon annotations are CATEGORY-driven (see poly_annot_type). The reboot root cause
+    // (confirmed on the car, ladder #06c/#06c2 -> #06c3) is that a residential/settlement polygon
+    // (feat low 0x9c) MUST carry its 0x04 DCM annotation: the renderer (map_tclMapElm_Landuse_Area::
+    // ReadFrom@0x003ebc64) dereferences a style/config entry that the DCM record supplies, and with
+    // annDesc=(0,0) the entry is absent -> hard fault. Stock NEVER puts 0x04 on grass/forest/water,
+    // and those boot fine unannotated — so we emit 0x04 only where stock does (0x9c by default).
+    // Dispatch: dap_map_tclAnnotationConverter::u16WriteAttrib@0x920744 / bReadWithOutBase@0x8d9784.
+
+    // annotation region (after point pool): per-polygon 0x04 DCM (residential only by default), then
+    // one variable-size entry per line that has an ann, then one 0x7A text entry per named POI,
+    // then the POI text records.
     let mut w = pool_end;
+    let mut poly_ann = vec![0u32; np]; // 0 = none; else start word of the 0x04 record
+    for i in 0..np {
+        if poly_annot_type((polys[i].1 & 0xff) as u8) != 0 {
+            poly_ann[i] = w;
+            w += 2; // 0x04 record = 8 bytes = 2 words
+        }
+    }
+    let mut line_ann = vec![None::<u32>; nl];
     for i in 0..nl {
         if let Some((typ, _, _)) = lines[i].ann {
             line_ann[i] = Some(w);
@@ -172,7 +244,8 @@ fn build_block(
 
     let mut cw = start0;
     for (i, (rpts, feat)) in polys.iter().enumerate() {
-        write_cell(&mut b, cw, *feat, poly_idx[i] as u16, rpts.len() as u16, 0, 0);
+        let (t0, t1) = if poly_ann[i] != 0 { (poly_ann[i] as u16, 1u16) } else { (0, 0) };
+        write_cell(&mut b, cw, poly_full_feat(*feat), poly_idx[i] as u16, rpts.len() as u16, t0, t1);
         cw += 3;
     }
     for (i, lc) in lines.iter().enumerate() {
@@ -215,6 +288,19 @@ fn build_block(
                     put_u16(&mut b, bo + 2, wval);
                 }
             }
+        }
+    }
+
+    // polygon 0x04 DCM annotations (8 bytes): {size=8, type=0x04, u16=0x0020, 0x11,0,0,0}
+    // payload copied verbatim from a stock land-use polygon annotation. Emitted only where
+    // poly_annot_type chose it (residential 0x9c by default). u16=0x0020 is the DCM class selector
+    // (u8ConvertDCMClass(0x20)=2); 0x11 and 0x00 are two x10-scaled params; last 2 bytes unused.
+    for i in 0..np {
+        if poly_ann[i] != 0 {
+            let bo = (poly_ann[i] as usize) * 4;
+            b[bo] = 8;
+            b[bo + 1] = 0x04;
+            b[bo + 2..bo + 8].copy_from_slice(&[0x20, 0x00, 0x11, 0x00, 0x00, 0x00]);
         }
     }
 
@@ -454,6 +540,102 @@ fn clip_polygon(poly: &[(i64, i64)], rect: (i64, i64, i64, i64)) -> Vec<(i64, i6
     p
 }
 
+// Max vertices a polygon ring may have. The head-unit renderer triangulates every polygon in
+// map_tclTriangulate::u16TessellatePolygon (procmapengine 0x003b8df0), whose ear-clip keeps the
+// ring's vertex indices in a single BYTE and fills its index list with `do { idx[i]=..; i=(i+1)&0xff }
+// while (i < n)`. For n >= 256 that loop wraps and can never reach n -> INFINITE LOOP -> watchdog
+// reboot (roads, never tessellated, are unaffected). This cap is PREVENTIVE hardening: per-tile
+// clipping already bounds our rings to <=198 points, so it is inactive for current data, and it was
+// NOT the #06c reboot cause (that was the missing per-polygon annotation — see build_block). Keep
+// well under the 256/signed-byte cliff for margin against the `(char)` arithmetic there too.
+const MAX_RING_PTS: usize = 250;
+
+// Perpendicular (squared) distance from p to the infinite line through a-b, in coordinate units.
+fn perp_dist2(a: (i64, i64), b: (i64, i64), p: (i64, i64)) -> f64 {
+    let (ax, ay) = (a.0 as f64, a.1 as f64);
+    let (bx, by) = (b.0 as f64, b.1 as f64);
+    let (px, py) = (p.0 as f64, p.1 as f64);
+    let (dx, dy) = (bx - ax, by - ay);
+    let l2 = dx * dx + dy * dy;
+    if l2 == 0.0 {
+        let (ex, ey) = (px - ax, py - ay);
+        return ex * ex + ey * ey;
+    }
+    let num = (dy * px - dx * py + bx * ay - by * ax).abs();
+    (num * num) / l2
+}
+
+// Open Douglas-Peucker (keeps endpoints) as a stack loop; `eps2` is squared tolerance.
+fn rdp(pts: &[(i64, i64)], eps2: f64) -> Vec<(i64, i64)> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((s, e)) = stack.pop() {
+        if e <= s + 1 {
+            continue;
+        }
+        let (mut dmax, mut idx) = (0.0f64, s);
+        for i in (s + 1)..e {
+            let d = perp_dist2(pts[s], pts[e], pts[i]);
+            if d > dmax {
+                dmax = d;
+                idx = i;
+            }
+        }
+        if dmax > eps2 {
+            keep[idx] = true;
+            stack.push((s, idx));
+            stack.push((idx, e));
+        }
+    }
+    pts.iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, &p)| p).collect()
+}
+
+// Reduce a closed ring (open loop, no duplicated first point) to <= MAX_RING_PTS vertices using
+// closed Douglas-Peucker at growing tolerance, with a uniform-stride hard fallback so the bound is
+// guaranteed regardless of shape complexity.
+fn decimate_ring(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let n = ring.len();
+    if n <= MAX_RING_PTS {
+        return ring.to_vec();
+    }
+    // Split the closed ring into two open chains at the vertex farthest from ring[0], simplify both,
+    // and stitch so shared endpoints are not duplicated.
+    let mut ek = 1usize;
+    let mut dk = -1.0f64;
+    for i in 1..n {
+        let dx = (ring[i].0 - ring[0].0) as f64;
+        let dy = (ring[i].1 - ring[0].1) as f64;
+        let d = dx * dx + dy * dy;
+        if d > dk {
+            dk = d;
+            ek = i;
+        }
+    }
+    let mut eps2 = 1.0f64;
+    loop {
+        let a = rdp(&ring[..=ek], eps2);
+        let b = rdp(&ring[ek..], eps2);
+        let mut out = a;
+        out.extend_from_slice(&b[1..b.len().saturating_sub(1)]);
+        if out.len() <= MAX_RING_PTS {
+            return out;
+        }
+        if eps2 > 1e15 {
+            break;
+        }
+        eps2 *= 4.0;
+    }
+    // Guaranteed fallback: keep evenly spaced vertices.
+    let stride = (n + MAX_RING_PTS - 1) / MAX_RING_PTS;
+    ring.iter().step_by(stride).cloned().collect()
+}
+
 // Per-tile geometry after clipping.
 #[derive(Default)]
 struct TileShapes {
@@ -521,10 +703,14 @@ fn distribute(
                 let rect = cell_rect(level, c, r);
                 let slice = clip_polygon(geom, rect);
                 if slice.len() >= 3 {
-                    map.entry(cell_to_k(level, c, r))
-                        .or_default()
-                        .areas
-                        .push((slice, *feat));
+                    // Tessellator-safe: cap every emitted polygon ring below 256 vertices.
+                    let ring = decimate_ring(&slice);
+                    if ring.len() >= 3 {
+                        map.entry(cell_to_k(level, c, r))
+                            .or_default()
+                            .areas
+                            .push((ring, *feat));
+                    }
                 }
             }
         }
@@ -886,8 +1072,8 @@ fn pack_and_build_blocks(
     }
     // word cost per feature (3 cell words + point-pool words + annotation words)
     let mut cost: Vec<u32> = Vec::with_capacity(n);
-    for (pts, _) in polys {
-        cost.push(3 + pts.len() as u32);
+    for (pts, feat) in polys {
+        cost.push(3 + pts.len() as u32 + poly_annot_words((*feat & 0xff) as u8));
     }
     for lc in lines {
         let aw = match lc.ann {
@@ -1098,7 +1284,61 @@ fn main() {
     };
 
     let t0 = std::time::Instant::now();
-    let osm = parse_osm(&osm_in, bw, bs, be, bn);
+    let mut osm = parse_osm(&osm_in, bw, bs, be, bn);
+
+    // ---- #06 isolation ladder: content-reduction modes (env OSM2MAP_MODE) ----
+    // Each mode is a CUMULATIVE superset of the previous, so the first rung that reboots pins the
+    // single mechanism it introduced. full == the #07 build (known to reboot => positive control).
+    //   empty      : no features; all slots 0x8000. Tests generated headers/IDX/TCI/container only.
+    //   roads      : + road polylines into land `02` (line cells + feat 0x30 + annot 0x11). Single profile.
+    //   land       : + land-use polygons (polygon cells + area feats; water polygons stripped). Still `02` only.
+    //   poi_noname : + POI point cells + POI feats, names STRIPPED (no text annotation).
+    //   poi_name   : + POI name annotations (the 0x7A TEXT record) — isolates the name/text encoder.
+    //   full       : + waterway lines (annot 0x10) and water-area polygons -> hydro `0I` overlay + multi
+    //                [02,0I] tiles == #07 behaviour.
+    let mode = env::var("OSM2MAP_MODE").unwrap_or_else(|_| "full".into());
+    match mode.as_str() {
+        "empty" => {
+            osm.roads.clear();
+            osm.waterways.clear();
+            osm.areas.clear();
+            osm.pois.clear();
+        }
+        "roads" => {
+            osm.waterways.clear();
+            osm.areas.clear();
+            osm.pois.clear();
+        }
+        "land" | "poly_min" | "poi_noname" | "poi_name" => {
+            // No water at all in these rungs (neither lines nor water polygons): keep it single-profile.
+            osm.waterways.clear();
+            osm.areas.retain(|(_, f)| f & 0xFF != 0x48);
+            if mode == "land" || mode == "poly_min" {
+                osm.pois.clear();
+            }
+        }
+        _ => {} // "full": everything (== #07)
+    }
+    // poly_min: keep only the N area features nearest the boot-view target, so a SMALL but
+    // in-view polygon set is rendered. Decides the "#06c reboots because there are too many
+    // polygons" hypothesis: if ~N polygons still reboot exactly like full #06c, it is NOT quantity.
+    if mode == "poly_min" {
+        let max_areas: usize =
+            env::var("OSM2MAP_MAX_AREAS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+        let tx = deg2pau(19.656422f64); // target lon (Krzeszowice)
+        let ty = deg2pau(50.139191f64); // target lat
+        osm.areas.sort_by_key(|(ring, _)| {
+            let cx: i64 = ring.iter().map(|p| p.0).sum::<i64>() / ring.len() as i64;
+            let cy: i64 = ring.iter().map(|p| p.1).sum::<i64>() / ring.len() as i64;
+            let dx = cx - tx;
+            let dy = cy - ty;
+            dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+        });
+        osm.areas.truncate(max_areas);
+    }
+    let emit_names = matches!(mode.as_str(), "full" | "poi_name");
+    eprintln!("OSM2MAP_MODE={}  (emit_names={})", mode, emit_names);
+
     eprintln!(
         "parsed {} pois, {} roads, {} waterways, {} areas in bbox ({}s)",
         osm.pois.len(),
@@ -1192,7 +1432,7 @@ fn main() {
             let tpois_named: Vec<(i64, i64, u16, Option<&str>)> = ts
                 .pois
                 .iter()
-                .map(|(a, b, c, d)| (*a, *b, *c, Some(d.as_str())))
+                .map(|(a, b, c, d)| (*a, *b, *c, if emit_names { Some(d.as_str()) } else { None }))
                 .collect();
 
             // Append a profile's sub-blocks to its own MAP buffer, tagging each slot entry with that

@@ -318,10 +318,43 @@ Dispatch: **`u8ConvertFeature2Type` @ `0x008d5b8c`** — takes `feature & 0xFF`
 | 1 | lines | `u8ConvertFeature2LineType` | `0x008d582c` |
 | 2 | POI | `u8ConvertFeature2POIType` | `0x008d5a10` |
 
-**Feature high byte is NOT a display-scale field.** Measured across 6 full regions, the high
-byte of `feature` is `0x00` for *every* road cell at every level and profile. Visibility comes
-from which tile **level** a cell sits on and which **profile** references it — not from a per-cell
-bitfield in `feature`. (Earlier "high byte = display scale" reading was wrong; see §11.)
+**Feature high byte = POLYGON display-scale selector ONLY (this is NOT the #06c reboot cause).**
+Ghidra-verified data path: `u16ConvertCells@0x8d7660` reads `[state:u16][feature:u16]`, masks
+`feature &= 0xff` for the type converters, and passes **`feature>>8` (the high byte)** down through
+`u16WriteData@0x8d760c` → `u16WritePolyLineData@0x8d73c8` → `u16Convert2TypeDisplayScale@0x8d68d8`, which
+branches by convTypeTag: **tag 0 (polygon) → `u16Convert2PolyDisplayScale(high)` →
+`PolygonConfigMatrix::u16GetDisplayScale@0x8d9b08`**, which scans 14 runtime thresholds and returns
+`s_au16DisplayScale[0..0xd]` — **clamped, so high `0x00` is NOT an OOB; it only selects a wrong (top) scale
+bucket**. **tag 1/2 (line/POI) → `u16Convert2LinePOIDisplayScale(this)` which IGNORES the feature entirely**
+— that is why our roads and POIs render fine no matter what high byte we emit. Measured over 178k stock
+polygon cells: **polygon high byte spans `0x20..0x95`, line/POI high byte is always `0x00`.**
+
+Consequence: the whole DAPIAPP converter is defensive (`bCheck` before every read, clamped table indices →
+malformed data returns error codes `0xd`/`0x218`/`0x321`, never faults), so **neither the high byte nor a
+bad coord-list count can reboot the unit inside DAPIAPP.** The #06c reboot (roads rendered, adding our
+polygons rebooted) is therefore **still UNCONFIRMED.** `osm2map` still maps each area low code to a
+stock-canonical FULL code (`0x9c→0x209c`, `0x38→0x6038`, `0x2b→0x602b`, `0x48→0x5048`, `0x39→0x4039`,
+`0x3a→0x503a`; unknown low → high `0x40`) so polygons land in the normal display-scale range (fidelity
+only — not a proven #06c fix).
+
+**Renderer (procmapengine) polygon path reviewed — every branch is bounded/guarded for OUR data:**
+- `LandUseAreaAddToDrawLayers@0x3ef7d0` indexes a style array by `this+0x58` but ONLY skips when it is the
+  `0xffff` sentinel; `GetPolyConfigOffsetBasedOnType@0x46cd08` maps (type,subtype[,sub2]) → offset `0..0x35`
+  (bounded, `0xffff` for unknown types) → `param_3+100 + off*4`. Landuse types we emit resolve to valid
+  offsets.
+- `map_tclTriangulate::u16TessellatePolygon@0x3b8df0` (ear-clip) stores ring vertex indices in **one BYTE**
+  and fills its list with `do{ idx[i]=..; i=(i+1)&0xff } while(i<n)` ⇒ **for `n ≥ 256` that loop never
+  reaches `n` → INFINITE LOOP → watchdog reboot**. This is a genuine Bosch bug, BUT it is **inactive for our
+  data**: per-tile `clip_polygon` already bounds every emitted ring (measured max **198** vertices, pre- AND
+  post-fix; 0 rings ≥256), so it is NOT what rebooted #06c. osm2map adds `decimate_ring` (closed
+  Douglas-Peucker, cap 250, `MAX_RING_PTS`) as a **preventive** guard so this never bites if grid/OSM change.
+- Tessellation *failure* (bad/self-intersecting ring, `n<256`) is handled → `ReadFrom` frees buffers, returns
+  1 gracefully; no fault.
+
+⇒ The offline model is exhausted again: loader, DAPIAPP converter, and the renderer landuse/tessellation path
+all tolerate our (valid, ≤198-vertex) polygons. **Decisive next step is on-device**: capture the #06c crash
+trace (`diag/navdiag_logger.sh`) to get the faulting module/PC instead of guessing across ~13k renderer
+functions.
 
 ### Lines (list 1) — code → type
 
@@ -515,6 +548,42 @@ Annotations live at `startUnit * 4` inside the block (after the point pool) and 
 packed sequence, each `{u8 size, u8 type, payload[size-2]}` (`size` counts itself + type).
 `count == 0` → no annotations.
 
+> ### ⚠ Residential/settlement polygons (feat low `0x9c`) REQUIRE a `0x04` DCM annotation — or the head unit reboots
+>
+> **Empirically confirmed on the car (ladder #06c3, see `trials/06 - isolation ladder`):** our
+> generated land-use polygons carried `annotDesc = (0,0)`. Rendering them — even 50 in the boot view —
+> **hard-faulted and rebooted the head unit**; adding `0x04` made them render. Root cause of the
+> #04/#05/#06c/#06c2/#07 reboot loop.
+>
+> **It is category-specific, NOT a generic "every polygon needs an annotation" rule.** Cross-tab of
+> `feature` low byte × first-annotation type (all N6E2 `list0`, marker-validated) shows `0x04` lives on
+> **exactly one category** and is *required* there:
+>
+> | `feature` low | OSM meaning | cells | with `count=0` | first annotation |
+> |---|---|---|---|---|
+> | **`0x9c`** | **`landuse=residential` (settlement area)** | 2 779 023 | **0 %** | **`0x04` DCM (2 770 696)** |
+> | `0x38` | grass / meadow | 347 118 | 79 % | (rest) `0x7A` name |
+> | `0x2b` | forest / wood | 194 904 | 96 % | `0x7A` |
+> | `0x48` | water (area) | 124 449 | 0 % | `0x7A` + `0x10` (never `0x04`) |
+> | `0x39` | cemetery | 59 015 | 81 % | `0x7A` |
+>
+> So `0x04` (DCM = Digital/3D City Model) is the **settlement-area** record — "this urban block has a 3D
+> city model, class N" — which is exactly why stock puts it on `residential` and never on grass/forest/water.
+> Grass/forest/cemetery are legitimately *unannotated* 79–96 % of the time and boot fine. The `0x04` record is
+> 8 bytes; the validated stock value we emit verbatim is `08 04 | 20 00 | 11 00 | 00 00`
+> (`{size=8, type=4, u16=0x0020, u8=0x11, u8=0x00, u8=0x00, u8=0x00}`); per `u16ConvertDCMInfo` the `u16=0x0020`
+> low byte is the DCM-class selector (`u8ConvertDCMClass(0x20)=2`), `0x11`/`0x00` are two ×10-scaled params
+> (model height/extent, rendering-side), last 2 bytes unused. **`osm2map` emits `0x04` only on `0x9c`**
+> (`OSM2MAP_POLY_ANN=cat`, the default; `all` = on every polygon, `0` = none). Water-area `0x48` should carry
+> `0x10` (hydro builds) — see TODO.
+>
+> Mechanism: `map_tclMapElm_Landuse_Area::ReadFrom @ 0x003ebc64` resolves a style via
+> `GetPolyConfigOffsetBasedOnType` and dereferences `configTable[off]` (→ `*(float*)(pmVar13+0x38)`); the
+> residential style needs the DCM record, so with `annotDesc=(0,0)` the entry is absent and the deref faults.
+> Line/POI cells never take this path (they carry their own annotations). We have not isolated whether *any*
+> annotation on `0x9c` suffices vs this specific `0x04` (no serial log); the exact tested bytes are kept.
+
+
 ### Annotation types
 
 Dispatch: `dap_map_tclAnnotationConverter::u16WriteAttrib` @ `0x00920744`.
@@ -526,7 +595,7 @@ payload = `size - 2` bytes):
 |------|------|---------|---------------------|
 | 0x01 | 4 | `u16` | road surface cover → `enConvertSurface` @0x0091cd84 (table below) |
 | 0x03 | 3 | `s8` | relative elevation, signed byte pass-through (`u16ConvertElevation` @0x0091fd40) |
-| 0x04 | 8 | `{u16, u8, u8, u8, u8}` | DCM (3D/city model) info — `dap_map_tclDCMAnnotation::bReadWithOutBase` @0x008d9784; first two values are written ×10, 3rd byte = class → `u8ConvertDCMClass` @0x0091cf8c (`0x00`→1, `0x20..0x32`→2..20), last 2 bytes unused by the converter |
+| 0x04 | 8 | `{u16, u8, u8, u8, u8}` | DCM (Digital City Model / 3D city-model) info. `bReadWithOutBase`@0x008d9784 reads `u16@+2, u8@+4, u8@+5, u8@+6, u8@+7`. `u16ConvertDCMInfo`@0x00920688 then emits to FastMap: `(u8@+4)×10`, `(u8@+5)×10`, `class = u8ConvertDCMClass(low byte of u16@+2)` @0x0091cf8c (`0x00`→1, `0x20..0x32`→2..20, else 0), then a `0` byte. `u8@+6`/`u8@+7` are read but unused by the converter. So the **u16 field selects the DCM class**, and payload bytes 2–3 are two ×10-scaled params (rendering-side: model type/height/extent) |
 | 0x10 | 4 | `u16` | water: low nibble = class code, high nibble = type code (`u8ConvertWaterClass`/`Type` @0x0091cefc/d110; tables below) |
 | 0x11 | 8 | `{u16, u32}` | road info — bit layout below (`u16ReadRoadInfo` @0x009200e8 does `bCheck(6)` + readU16 + readU32) |
 | 0x14 | 8 | `{u16 textRef, u16 mid, u16 status}` | road number: `textRef*4` = **text record** offset (bare digits); `status` bits 4–5 mode / bit 6 → `u8RoadStatus2Status` @0x0091d3d8; `mid` + `status&0xF` feed the name-prefix interning (`u32SkipPrefixOffset`) — shared name prefixes are stored once |
@@ -867,14 +936,20 @@ present to avoid the `0x307` logs.
   1. **`0I` is universal and special.** It exists in *every* region (387/411 ship *only* `0I`) and
      holds **hydrography only** — coastline/water lines + water-area polygons, **zero POI cells and
      zero settlement/landuse polygons**. Ocean regions need nothing else.
-  2. **Non-`0I` profiles are geographic shards, not categories.** In the ~6 dense countries (N4E2/3,
-     N5E1/2, N6E1/2) a region splits into several shard profiles; at L2 most tiles resolve to exactly
-     one shard and every shard carries the **same content mix** (roads + POI + landuse), differing only
-     by *volume* (e.g. N6E2 L2: `1A`=1112 tiles, `02`=365, `0H`=142, `0E`=100). A pure-water tile →
-     `0I` alone; a land tile with water → `<shard>` + `0I`; the L0 root aggregates all profiles.
-  So Bosch partitions a region's tiles across named data buckets (size/volume-driven), with `0I` held
-  out as the hydro overlay. There is **no** global "category → profile id" map and **no** profile
-  literally named `109` — earlier examples to that effect were wrong.
+   2. **Non-`0I` profiles are geographic shards, not categories.** In the ~6 dense countries (N4E2/3,
+      N5E1/2, N6E1/2) a region splits into several shard profiles; at L2 most tiles resolve to exactly
+      one shard and every shard carries the **same *kind* of content** (roads + POI + landuse), but the
+      per-shard **mix skews with the area's character**, not just volume. Empirical N6E2 full-region
+      fingerprint (`diag` scan over all slots, cell/feature split geo vs point): `1A`=160 MB (dominated by
+      area/building polys `..9c`, the dense core), `02`=35 MB (POI-heavy urban), `0H`=23 MB
+      (geometry/area + boundary-annot heavy, few POI → rural), `0E`=18 MB (balanced). A pure-water tile →
+      `0I` alone; a land tile with water → `<shard>` + `0I`; the L0 root aggregates all profiles.
+   So Bosch partitions a region's tiles across several named data buckets (volume/geography-driven), with
+   `0I` held out as the hydro overlay. **osm2map `#07` still lumps ALL land into a single shard (`02`) +
+   `0I`** — better than the old one-file-everything, but not yet a multi-shard layout (N6E2 ships 4 land
+   shards). There is **no** global "category → profile id" map and **no** profile literally named `109` —
+   earlier examples to that effect were wrong.
+
 - **Profile ids are internal to the region — there is NO on-disk map-profile registry (task C).** The only
   region/profile metadata files are `DATA/DATASET.CFG` (`DATASET_ID{1758962541}`, `USED_COMPRESSION{5}`,
   `DATABASE_CONFIG{'MAP'|'/MAP/''|'10.23'}`, and a small country-level `REGION_CONFIG`) + `MEDIUM.CFG`, and
@@ -916,11 +991,24 @@ present to avoid the `0x307` logs.
   @0x008d56a0/0x008d582c/0x008d5a10 return a FastMap **type** via switch/if-ranges (default → `0`), never
   index a table by the raw feature ⇒ no OOB from feature codes. Our `#07` scan: poly low ∈
   {0x38,0x39,0x3A,0x2B,0x48,0x9C}, line low = {0x30}, POI low ⊂ valid `{1-9,0x10-0x17,0x21,0x22}`, feature
-  high byte = 0 everywhere; annotations only {0x10,0x11,0x7A}. So `feature`/annot cannot crash the renderer
-  and none of our POIs fall to an unmapped type. Combined with tasks A–C (bounded reader; no map-profile
-  registry / fatal-`0x204`; profile-agnostic renderer), **every data-path component we can model offline is
-  clean**; the tile-id / partition loader upstream of `u16Convert` is likewise fully bounded (see remaining
-  leads), leaving only the unlikely CPRNAV_2 decompress→hand-off boundary unverified.
+   high byte = 0 everywhere; annotations only {0x10,0x11,0x7A}. So `feature`/annot cannot crash the renderer
+   and none of our POIs fall to an unmapped type. NOTE (corrected §7): the polygon high byte only feeds the
+   **clamped** `PolygonConfigMatrix::u16GetDisplayScale@0x8d9b08` (no OOB), so even a high byte of 0 is not a
+   fault source in DAPIAPP — reinforcing that the reboot is downstream. Combined with tasks A–C (bounded
+    reader; no map-profile registry / fatal-`0x204`; profile-agnostic renderer), **every DAPIAPP data-path
+    component we can model offline is clean (all reads bCheck-guarded, all table indices clamped → error codes,
+    never faults)**; the tile-id / partition loader upstream of `u16Convert` is likewise fully bounded (see
+    remaining leads), leaving only the unlikely CPRNAV_2 decompress→hand-off boundary and the
+    **procmapengine renderer** (consumes the converted FastMap polygons) as unverified suspects.
+- **RESOLVED (car test #06c3): the reboot was a MISSING `0x04` DCM annotation on residential (`0x9c`) polygons, faulting the renderer.** The
+  one suspect above is confirmed: `map_tclMapElm_Landuse_Area::ReadFrom@0x003ebc64` dereferences a
+  style/config entry (`configTable[off]` → `*(float*)(pmVar13+0x38)`) that only the polygon's annotation
+  supplies; with `annotDesc=(0,0)` the entry is absent → hard fault → reboot (panic_on_oops). This is
+  a polygon-only path (line/POI cells carry their own annotations and render). It is NOT a feature-code,
+  display-scale, sub-type, geometry, or quantity issue — all of those were excluded and #05/#06c passed tmcheck
+  yet rebooted. **It is category-specific** (see §8 cross-tab): `0x04` (DCM) belongs only to `residential`
+  (`0x9c`), which stock annotates ~100 %; grass/forest/cemetery are legitimately unannotated. **Fix: emit the
+  `0x04` DCM (`08 04 20 00 11 00 00 00`) on `0x9c` polygons** — `osm2map build_block` default `OSM2MAP_POLY_ANN=cat`.
 - **`diag/tmcheck.py` is now a calibrated strict model.** Added: marker hi==`0xFFFF`, in-block marker len ==
   slot length (accessor window), multi sub-entry count ≤ 15. Calibrated to **PASS 17/17 diverse stock
   regions** (1–9 profiles, oceanic→dense; e.g. N4E2/N5E1/N5E2/N6E1) with zero false positives, still FAILs
