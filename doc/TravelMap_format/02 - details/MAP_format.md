@@ -382,6 +382,7 @@ extract and against the official icon taxonomy in `POI_MAPPING.DAT` (see §7.1):
 
 | feature (low byte) | category | evidence (Kraków names / amenity) |
 |--------------------|----------|-----------------------------------|
+| 0x01 | settlement / city (place) | 1890 stock city POIs all `feat=0x01` + a `0x21` annotation (§8) |
 | 0x02 | parking | "P+R", amenity=parking |
 | 0x04 | fuel / petrol station | CIRCLE K, PETRONET, AUCHAN; amenity=fuel |
 | 0x05 | hotel | HOTEL LORENZO, PLATINUM, HOTEL PROKOCIM |
@@ -482,6 +483,13 @@ The fine-grained POI category → icon mapping is **not** in the `.MAP` file; it
 SQLite database at `CRYPTNAV/CFG/LID/POI_SRV/POI_MAPPING.DAT`. The MAP cell's small feature
 code (above) is the *coarse* class; the specific brand/type (and therefore the icon) comes from
 the POI's annotation and is resolved through this DB. Key tables:
+
+> **Code-space note.** `POIMappingTab.FeatCode` is **not** the MAP cell feature byte. It is a
+> POI-**service/search** category id in the `7310..9996` (`0x1C8E..0x270C`) range (e.g. `PETROLSTATION`
+> = `0x1C8F`, `CARRENTAL` = `0x1C90`, `HOTELMOTEL` = `0x1C92`), used by the search/POI-server index — a
+> different taxonomy from the render low byte (`0x04` fuel, `0x05` hotel, …). This DB supplies the
+> human **category tree** (`IndexCat`/`MapGroup`/`MapSubGroup`) and **brand→icon** mapping, not a direct
+> render-byte lookup.
 
 - **`neh_IDTable(name, Enum, ID)`** — 209 rows: icon file name → `FI_EN_*` category enum → numeric id.
   This is the icon catalogue (129 distinct `.png`, 202 enums), e.g.:
@@ -676,8 +684,31 @@ type = `(u16 >> 4) & 0xF`: `0,1,2,3,4,6` → internal 1..6 (in that order), else
 `0x11`→1, `0x10`→0xF, `0x20`→0xB, `0x21`→0xC, `0x22`→0xD, `0x30`→0x17, `0x31`→0x15,
 `0x32`→0x16, `0x33`→0x18, `0x40`→0x20, `0x41`→0x1F, `0x42`→0x21, `0x43`→0x22,
 `0x50`→0x2A, `0x51`→0x29, `0x52`→0x2B, `0x53`→0x2C, `0x54`→0x2D, `0x60`→0xE,
-`0x61`→0x33, `0x62`→0x34, `0x63`→0x35, `0x64`→0x36; else 0.
-Observed raw values in N6E1 L2: 82–100 (0x52–0x64) dominate.
+ `0x61`→0x33, `0x62`→0x34, `0x63`→0x35, `0x64`→0x36; else 0.
+ Observed raw values in N6E1 L2: 82–100 (0x52–0x64) dominate.
+
+> **Writer status.**
+> - **`0x14` road-number: EMITTED** by `osm2map`. A road carrying OSM `ref` gets a `0x14`
+>   annotation right after its `0x11` (`annotDesc.count = 2`), with `mid=0`/`status=0` (the neutral
+>   codes the decoder reads back as `tm:roadnum_mid/status=0`) and `textRef` pointing at a
+>   name-format text record — the same `u16AddText` record shape Bosch's own converter uses for road
+>   numbers (see `u16ConvertRoadNumber@0x0091fa48`) and that POI names already render on the head
+>   unit with. Validated end-to-end: `krzeszowice` `ref=79` (DK79, netclass 2) → 61 road cells →
+>   decoded back to `ref=79`; selective (61/6541 line cells, not global).
+> - **`0x21` city (settlement label sizing): EMITTED** by `osm2map` for `place=*` nodes, which are
+>   written as **feature low `0x01`** (the settlement marker) + a `0x21` annotation (`count` up by 1).
+>   Bits (decoded from stock N6E2 city POIs): **display** bits 0-3 = label min-zoom (smaller = shown
+>   earlier), **size** bits 4-7 = importance (1 biggest … 15 hamlet), **admin** bits 8-10 = `1` for a
+>   voivodeship capital (KRAKÓW/KATOWICE) else `7` (all ordinary municipalities), **bit 15** = name
+>   overlap. Observed stock size↔importance: cities ~5-6 (display 4-6), towns 9-11, villages 12-15
+>   (display capped 12). Writer maps `city`→disp5/size6, `town`→9/9, `village`→12/13, `hamlet`→12/15,
+>   `suburb`→11/11, `admin=7`. Validated end-to-end: `krzeszowice` `place=town` (Krzeszowice) →
+>   decoded `disp=9 size=9 admin=7 feat=1`; 25 place nodes → 25 city POIs. tmcheck PASS.
+> - **`0x01` surface: NOT emitted.** `enConvertSurface` only gives raw-code → internal-render-enum;
+>   there is **no confirmed raw-code → OSM-surface-material** mapping, so choosing a code for
+>   `surface=asphalt`/`paved`/… would be fabrication. The per-code meaning is also unobserved
+>   (values 0x52–0x64 dominate with no label). Additionally the annotation distribution shows `0x01`
+>   on **polygons** (428), not road lines — so road-surface is not even a stock line annotation here.
 
 Key facts (all verified on data):
 

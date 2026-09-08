@@ -7,7 +7,7 @@
 // through map2osm_rs. Semantics (feature codes / names) are minimal here; M3 refines.
 
 use quick_xml::events::Event;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -107,6 +107,16 @@ struct LineCell {
     pts: Vec<(i64, i64)>,
     feat: u16,
     ann: Option<(u8, u16, u32)>,
+    rn: Option<String>, // road number (OSM `ref`) -> 0x14 annotation + text record
+}
+
+// Words a road-number (0x14) feature contributes beyond its 0x11: the 8-byte annotation record
+// (2 words) plus its text-pool record ({u8 n,u8 0,u8 len,bytes,NUL} word-aligned). 0 if no ref.
+fn rn_words(s: Option<&str>) -> u32 {
+    match s {
+        Some(r) if !r.is_empty() && r.len() <= 254 => 2 + ((r.len() + 4 + 3) / 4) as u32,
+        _ => 0,
+    }
 }
 
 // Annotation entry size in words (0x11 roadinfo = 8 bytes; everything else = 4).
@@ -157,7 +167,7 @@ fn build_block(
     cy: i64,
     polys: &[(Vec<(i64, i64)>, u16)], // (open ring, landuse feat)
     lines: &[LineCell],
-    pois: &[(i64, i64, u16, Option<&str>)],
+    pois: &[(i64, i64, u16, Option<&str>, u16)],
 ) -> Vec<u8> {
     let (np, nl, nq) = (polys.len(), lines.len(), pois.len());
     let start0: u32 = 4;
@@ -207,18 +217,44 @@ fn build_block(
             w += 2; // 0x04 record = 8 bytes = 2 words
         }
     }
-    let mut line_ann = vec![None::<u32>; nl];
+    // Line annotations live in the `w` region; a road may carry 0x11 (roadinfo) AND 0x14 (road
+    // number) back-to-back (count in annotDesc = number of records laid here, per map2osm's
+    // annotation walk). The 0x14 payload points at a text record in the POI text pool (same
+    // multi-string format), so the road-number text words are reserved after the POI names.
+    let mut line_ann = vec![None::<u32>; nl]; // 0x11/0x10 record word (if present)
+    let mut line_rn = vec![None::<u32>; nl]; // 0x14 record word (if present)
+    let mut line_nrec = vec![0u16; nl]; // annotDesc count for the cell
     for i in 0..nl {
         if let Some((typ, _, _)) = lines[i].ann {
             line_ann[i] = Some(w);
             w += ann_words(typ);
+            line_nrec[i] += 1;
+        }
+        if rn_words(lines[i].rn.as_deref()) != 0 {
+            line_rn[i] = Some(w);
+            w += 2; // 0x14 = 8 bytes
+            line_nrec[i] += 1;
         }
     }
+    // POI annotations: 0x7A name (1 word) + optional 0x21 city (1 word), laid contiguously; annotDesc
+    // count = how many a cell carries. ann_word = first record, city_word = the 0x21 record.
     let mut ann_word = vec![0u32; nq];
+    let mut city_word = vec![0u32; nq];
+    let mut poi_nrec = vec![0u16; nq];
     for i in 0..nq {
-        if pois[i].3.map_or(false, |s| !s.is_empty()) {
+        let has_name = pois[i].3.map_or(false, |s| !s.is_empty());
+        let has_city = pois[i].4 != 0;
+        if has_name {
             ann_word[i] = w;
-            w += 1; // one word per POI annotation entry
+            w += 1;
+            poi_nrec[i] += 1;
+        } else if has_city {
+            ann_word[i] = w; // city annotation is the first (and only) record
+        }
+        if has_city {
+            city_word[i] = w;
+            w += 1;
+            poi_nrec[i] += 1;
         }
     }
     let mut tw = w;
@@ -228,6 +264,15 @@ fn build_block(
             if !s.is_empty() {
                 text_word[i] = tw;
                 tw += ((s.len() + 4 + 3) / 4) as u32; // record = L+4 bytes, word-aligned
+            }
+        }
+    }
+    let mut rn_text = vec![0u32; nl];
+    for i in 0..nl {
+        if let Some(s) = lines[i].rn.as_deref() {
+            if !s.is_empty() && s.len() <= 254 {
+                rn_text[i] = tw;
+                tw += ((s.len() + 4 + 3) / 4) as u32;
             }
         }
     }
@@ -249,21 +294,20 @@ fn build_block(
         cw += 3;
     }
     for (i, lc) in lines.iter().enumerate() {
-        let (t0, t1) = match line_ann[i] {
-            Some(aw) => (aw as u16, 1u16),
-            None => (0, 0),
+        // annotDesc start = first record laid (0x11 then 0x14); count = line_nrec[i].
+        let (t0, t1) = match (line_ann[i], line_rn[i]) {
+            (Some(aw), _) => (aw as u16, line_nrec[i]),
+            (None, Some(rw)) => (rw as u16, line_nrec[i]),
+            (None, None) => (0, 0),
         };
         write_cell(&mut b, cw, lc.feat, line_idx[i] as u16, lc.pts.len() as u16, t0, t1);
         cw += 3;
     }
     for i in 0..nq {
-        let (lo, la, feat, name) = (pois[i].0, pois[i].1, pois[i].2, pois[i].3);
+        let (lo, la, feat) = (pois[i].0, pois[i].1, pois[i].2);
         let dlon = ((lo - cx) >> shift) as i16 as u16;
         let dlat = ((la - cy) >> shift) as i16 as u16;
-        let (t0, t1) = match name {
-            Some(s) if !s.is_empty() => (ann_word[i] as u16, 1u16),
-            _ => (0, 0),
-        };
+        let (t0, t1) = if poi_nrec[i] != 0 { (ann_word[i] as u16, poi_nrec[i]) } else { (0, 0) };
         write_cell(&mut b, cw, feat, dlon, dlat, t0, t1);
         cw += 3;
     }
@@ -291,6 +335,22 @@ fn build_block(
         }
     }
 
+    // road-number 0x14 annotations (8 bytes): {size=8, type=0x14, u16 textRef, u16 mid, u16 status}.
+    // textRef -> the road's text record (written below, same format as names). mid=0 / status=0 are
+    // the neutral codes the decoder reads back as tm:roadnum_mid/status=0 (unclassified shield).
+    for i in 0..nl {
+        if let (Some(rw), Some(s)) = (line_rn[i], lines[i].rn.as_deref()) {
+            if !s.is_empty() && s.len() <= 254 {
+                let bo = (rw as usize) * 4;
+                b[bo] = 8;
+                b[bo + 1] = 0x14;
+                put_u16(&mut b, bo + 2, rn_text[i] as u16);
+                put_u16(&mut b, bo + 4, 0); // mid
+                put_u16(&mut b, bo + 6, 0); // status
+            }
+        }
+    }
+
     // polygon 0x04 DCM annotations (8 bytes): {size=8, type=0x04, u16=0x0020, 0x11,0,0,0}
     // payload copied verbatim from a stock land-use polygon annotation. Emitted only where
     // poly_annot_type chose it (residential 0x9c by default). u16=0x0020 is the DCM class selector
@@ -304,6 +364,17 @@ fn build_block(
         }
     }
 
+    // POI city 0x21 annotations (4 bytes): {size=4, type=0x21, u16 city_bits}. Emitted for settlement
+    // (place=*) POIs; city_bits from city_bits() (display|size<<4|admin<<8). Laid after the name record.
+    for i in 0..nq {
+        if pois[i].4 != 0 {
+            let bo = (city_word[i] as usize) * 4;
+            b[bo] = 4;
+            b[bo + 1] = 0x21;
+            put_u16(&mut b, bo + 2, pois[i].4);
+        }
+    }
+
     for i in 0..nq {
         if let Some(s) = pois[i].3 {
             if !s.is_empty() {
@@ -312,6 +383,20 @@ fn build_block(
                 b[aw + 1] = 0x7A; // type = TEXT
                 put_u16(&mut b, aw + 2, text_word[i] as u16);
                 let tp = (text_word[i] as usize) * 4;
+                let bytes = s.as_bytes();
+                b[tp] = 1; // n strings
+                b[tp + 1] = 0;
+                b[tp + 2] = bytes.len() as u8;
+                b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
+                b[tp + 3 + bytes.len()] = 0; // terminator
+            }
+        }
+    }
+    // road-number text records (same multi-string format as names, single string).
+    for i in 0..nl {
+        if let Some(s) = lines[i].rn.as_deref() {
+            if !s.is_empty() && s.len() <= 254 {
+                let tp = (rn_text[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
                 b[tp + 1] = 0;
@@ -622,7 +707,9 @@ fn decimate_ring(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
         let a = rdp(&ring[..=ek], eps2);
         let b = rdp(&ring[ek..], eps2);
         let mut out = a;
-        out.extend_from_slice(&b[1..b.len().saturating_sub(1)]);
+        if b.len() >= 2 {
+            out.extend_from_slice(&b[1..b.len() - 1]);
+        }
         if out.len() <= MAX_RING_PTS {
             return out;
         }
@@ -636,45 +723,97 @@ fn decimate_ring(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
     ring.iter().step_by(stride).cloned().collect()
 }
 
+// Closed-ring Douglas-Peucker at a fixed tolerance (squared `eps2`), independent of the vertex cap.
+// Splits at the vertex farthest from ring[0], simplifies both open chains, stitches without
+// duplicating the shared seam. Used for the per-level LOD pass before the <=MAX_RING_PTS cap.
+fn simplify_ring(ring: &[(i64, i64)], eps2: f64) -> Vec<(i64, i64)> {
+    let n = ring.len();
+    if n < 4 {
+        return ring.to_vec();
+    }
+    let mut ek = 1usize;
+    let mut dk = -1.0f64;
+    for i in 1..n {
+        let dx = (ring[i].0 - ring[0].0) as f64;
+        let dy = (ring[i].1 - ring[0].1) as f64;
+        let d = dx * dx + dy * dy;
+        if d > dk {
+            dk = d;
+            ek = i;
+        }
+    }
+    let a = rdp(&ring[..=ek], eps2);
+    let b = rdp(&ring[ek..], eps2);
+    let mut out = a;
+    if b.len() >= 2 {
+        out.extend_from_slice(&b[1..b.len() - 1]);
+    }
+    out
+}
+
+// Squared bounding-box diagonal of a shape - used to drop sub-visible (smaller than one level
+// tolerance) slices at coarse zoom.
+fn bbox_diag2(pts: &[(i64, i64)]) -> f64 {
+    if pts.is_empty() {
+        return 0.0;
+    }
+    let (mut minx, mut maxx) = (pts[0].0, pts[0].0);
+    let (mut miny, mut maxy) = (pts[0].1, pts[0].1);
+    for &(x, y) in pts {
+        if x < minx { minx = x; } if x > maxx { maxx = x; }
+        if y < miny { miny = y; } if y > maxy { maxy = y; }
+    }
+    let dx = (maxx - minx) as f64;
+    let dy = (maxy - miny) as f64;
+    dx * dx + dy * dy
+}
+
 // Per-tile geometry after clipping.
 #[derive(Default)]
 struct TileShapes {
-    roads: Vec<(Vec<(i64, i64)>, u16)>,     // (slice, roadinfo_w)
+    roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)>, // (slice, roadinfo_w, ref)
     waterways: Vec<(Vec<(i64, i64)>, u16)>, // (slice, watercode)
     areas: Vec<(Vec<(i64, i64)>, u16)>,     // (clipped ring, landuse feat)
-    pois: Vec<(i64, i64, u16, String)>,     // (lon, lat, feat, name)
+    pois: Vec<(i64, i64, u16, String, u16)>, // (lon, lat, feat, name, city_bits)
 }
 
 // Split every shape across the level's tile grid. POIs go to their point's cell; lines and
 // polygons are clipped so each cell holds only the slice inside its extent.
 fn distribute(
     level: usize,
-    roads: &[(Vec<(i64, i64)>, u16)],
+    roads: &[(Vec<(i64, i64)>, u16, Option<String>)],
     waterways: &[(Vec<(i64, i64)>, u16)],
     areas: &[(Vec<(i64, i64)>, u16)],
-    pois: &[(i64, i64, u16, String)],
+    pois: &[(i64, i64, u16, String, u16)],
 ) -> HashMap<i64, TileShapes> {
     let mut map: HashMap<i64, TileShapes> = HashMap::new();
+    // Per-level level-of-detail: simplify geometry to sub-pixel tolerance and drop shapes smaller
+    // than one tolerance unit. Coarser levels (small `level`) carry far less detail.
+    let eps = SIM_EPS[level] as f64;
+    let eps2 = eps * eps;
 
-    for (lo, la, feat, name) in pois {
+    for (lo, la, feat, name, city) in pois {
         let (c, r) = point_col_row(level, *lo, *la);
         map.entry(cell_to_k(level, c, r))
             .or_default()
             .pois
-            .push((*lo, *la, *feat, name.clone()));
+            .push((*lo, *la, *feat, name.clone(), *city));
     }
 
-    for (geom, w) in roads {
+    for (geom, w, rn) in roads {
         let (c0, c1, r0, r1) = cell_span(level, geom);
         for c in c0..=c1 {
             for r in r0..=r1 {
                 let rect = cell_rect(level, c, r);
-                let slice = clip_polyline(geom, rect);
-                if slice.len() >= 2 {
+                let mut slice = clip_polyline(geom, rect);
+                if slice.len() >= 3 {
+                    slice = rdp(&slice, eps2);
+                }
+                if slice.len() >= 2 && bbox_diag2(&slice) >= eps2 {
                     map.entry(cell_to_k(level, c, r))
                         .or_default()
                         .roads
-                        .push((slice, *w));
+                        .push((slice, *w, rn.clone()));
                 }
             }
         }
@@ -685,8 +824,11 @@ fn distribute(
         for c in c0..=c1 {
             for r in r0..=r1 {
                 let rect = cell_rect(level, c, r);
-                let slice = clip_polyline(geom, rect);
-                if slice.len() >= 2 {
+                let mut slice = clip_polyline(geom, rect);
+                if slice.len() >= 3 {
+                    slice = rdp(&slice, eps2);
+                }
+                if slice.len() >= 2 && bbox_diag2(&slice) >= eps2 {
                     map.entry(cell_to_k(level, c, r))
                         .or_default()
                         .waterways
@@ -703,9 +845,10 @@ fn distribute(
                 let rect = cell_rect(level, c, r);
                 let slice = clip_polygon(geom, rect);
                 if slice.len() >= 3 {
-                    // Tessellator-safe: cap every emitted polygon ring below 256 vertices.
-                    let ring = decimate_ring(&slice);
-                    if ring.len() >= 3 {
+                    // Per-level LOD first, then tessellator-safe cap below 256 vertices.
+                    let sim = simplify_ring(&slice, eps2);
+                    let ring = decimate_ring(&sim);
+                    if ring.len() >= 3 && bbox_diag2(&ring) >= eps2 {
                         map.entry(cell_to_k(level, c, r))
                             .or_default()
                             .areas
@@ -787,9 +930,27 @@ fn poi_feat(tags: &HashMap<String, String>) -> u16 {
         return 0x08;
     }
     if tags.contains_key("place") {
-        return 0x21; // settlement (refined in M4)
+        return 0x01; // settlement marker (stock city POIs use feature low 0x01 + a 0x21 annotation)
     }
     0x01
+}
+
+// Settlement `place=*` -> TravelMap `0x21` city-annotation payload (u16), decoded from stock N6E2:
+//   bits 0-3 display level (label min-zoom; smaller=shown earlier), bits 4-7 size class
+//   (importance, 1=biggest..15=hamlet), bits 8-10 admin level (1=voivodeship capital, 7=ordinary),
+//   bit 15 name-overlap. Stock correlation: cities size~6 disp~4-6, towns 9-11, villages 12-15,
+//   admin=7 for all non-capitals. Display is clamped at 12 for the smallest settlements.
+fn city_bits(tags: &HashMap<String, String>) -> u16 {
+    let (disp, size) = match tags.get("place").map(|s| s.as_str()) {
+        Some("city") => (5u16, 6u16),
+        Some("town") => (9, 9),
+        Some("suburb") | Some("municipality") => (11, 11),
+        Some("village") => (12, 13),
+        Some("hamlet") | Some("locality") => (12, 15),
+        Some(_) => (12, 13), // other place values -> village-sized
+        None => return 0,    // not a settlement -> no city annotation
+    };
+    disp | (size << 4) | (7u16 << 8) // admin=7 (ordinary), overlap bit=0
 }
 
 // OSM highway -> TravelMap roadinfo `w` payload (the 0x11 annotation). Bit layout is
@@ -868,30 +1029,86 @@ fn poi_rank(tags: &HashMap<String, String>) -> u8 {
             "city" => 0,
             "town" => 1,
             "village" | "suburb" => 2,
-            _ => 3, // hamlet, isolated_dwelling, ...
+            _ => 4, // hamlet, isolated_dwelling: finest zoom only
         };
     }
-    // major services worth showing at regional zoom
+    // Services (major or minor) are an L3 surface-detail concern: shown only at the finest level.
     if g("amenity").map(|a| matches!(a, "fuel" | "hospital")).unwrap_or(false)
         || g("tourism")
             .map(|t| matches!(t, "hotel" | "attraction" | "museum"))
             .unwrap_or(false)
         || g("shop").map(|s| s == "supermarket").unwrap_or(false)
     {
-        return 2;
+        return 3;
     }
     3
 }
 
-// Max netclass shown at each populated level (higher threshold = more detail).
-const MAX_ROAD_NC: [u8; 4] = [2, 4, 7, 7]; // L0 motorway..primary, L1 +sec/tert, L2/L3 all
-const MAX_POI_RANK: [u8; 4] = [1, 2, 3, 3]; // L0 cities/towns .. L2/L3 everything
+// Max netclass shown at each populated level (higher threshold = more detail). Measured from stock
+// N6E2AA: max road netclass present per level is L0=0(motorway), L1=1, L2=3, L3=7(everything).
+const MAX_ROAD_NC: [u8; 4] = [0, 1, 3, 7];
+// Max POI rank shown at each level (lower rank = more important). Settlements scale with size
+// (city->town->village); amenities and hamlets (rank>=3) are L3-only, matching stock.
+const MAX_POI_RANK: [u8; 4] = [1, 2, 2, 4];
+
+// Per-level level-of-detail simplification tolerance in PAU: ~ tile_width/1024 (sub-pixel), where
+// tile_width = regionW/grid_size[L] and regionW = 0x0CCCCCCC..0x19999998 span = 214_748_364 PAU.
+// Coarser levels simplify much harder (L0 ~1.95 km, L3 ~3.9 m). Also used as the min-shape size so
+// sub-visible stubs/slivers are dropped entirely at coarse zoom.
+const SIM_EPS: [i64; 4] = [209715, 41943, 4194, 419];
 
 struct OsmData {
-    pois: Vec<(i64, i64, u16, String, u8)>,  // (lon_pau, lat_pau, feat, name, rank)
-    roads: Vec<(Vec<(i64, i64)>, u16)>,      // (geometry, roadinfo_w)
+    pois: Vec<(i64, i64, u16, String, u8, u16)>, // (lon_pau, lat_pau, feat, name, rank, city_bits)
+    roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)>, // (geometry, roadinfo_w, ref)
     waterways: Vec<(Vec<(i64, i64)>, u16)>,  // (geometry, watercode)
     areas: Vec<(Vec<(i64, i64)>, u16)>,      // (open ring, landuse feat)
+}
+
+// Join OSM way node-chains (each an open sequence of node ids) into closed rings.
+// Two chains connect when an endpoint of one equals an endpoint of the other; they are
+// merged (reversing either side as needed). Chains that close on themselves (>=4 nodes,
+// first==last) become rings, returned WITHOUT the repeated closing vertex (open loop, the
+// convention the area pipeline expects). Open stubs are dropped. Used to assemble
+// multipolygon/boundary relations whose member ways are individual boundary arcs.
+fn stitch_ways(chains: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let mut rest: VecDeque<Vec<i64>> =
+        chains.iter().filter(|c| c.len() >= 2).cloned().collect();
+    let mut rings: Vec<Vec<i64>> = Vec::new();
+    while let Some(mut cur) = rest.pop_front() {
+        let mut joined = true;
+        while joined {
+            joined = false;
+            let head = cur[0];
+            let tail = *cur.last().unwrap();
+            if let Some(i) = (0..rest.len()).find(|&i| {
+                let c = &rest[i];
+                c.first() == Some(&tail) || c.last() == Some(&tail)
+            }) {
+                let mut c = rest.remove(i).unwrap();
+                if c.first() != Some(&tail) {
+                    c.reverse();
+                }
+                cur.extend(c[1..].iter());
+                joined = true;
+                continue;
+            }
+            if let Some(i) =
+                (0..rest.len()).find(|&i| rest[i].last() == Some(&head))
+            {
+                let mut c = rest.remove(i).unwrap();
+                c.pop(); // drop the shared `head` node
+                c.extend(cur);
+                cur = c;
+                joined = true;
+                continue;
+            }
+        }
+        if cur.len() >= 4 && cur[0] == *cur.last().unwrap() {
+            cur.pop();
+            rings.push(cur);
+        }
+    }
+    rings
 }
 
 fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
@@ -900,15 +1117,30 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
     let file = fs::File::open(path).expect("open osm");
     let mut reader = quick_xml::Reader::from_reader(BufReader::new(file));
     let mut nodes: HashMap<i64, (i64, i64)> = HashMap::new();
-    let mut pois: Vec<(i64, i64, u16, String, u8)> = Vec::new();
-    let mut roads: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
+    let mut pois: Vec<(i64, i64, u16, String, u8, u16)> = Vec::new();
+    let mut roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)> = Vec::new();
     let mut waterways: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
     let mut areas: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
 
+    // Multipolygon/boundary relation support: OSM area relations carry their tags on the
+    // <relation>, not the member ways, and members are usually open boundary arcs (never
+    // closed on their own -> the closed-way path below misses them entirely). We keep every
+    // way's node-id list, then after parsing assemble relation outer rings. Standalone closed
+    // area ways are deferred so a way also used as a relation member is emitted once (relation
+    // wins). Interior rings (role="inner") are dropped: the single-ring area pipeline fills
+    // donuts (the TravelMap cell has no interior-ring / hole representation).
+    let mut way_nodes: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut rel_member: HashSet<i64> = HashSet::new();
+    let mut standalone_areas: Vec<(i64, Vec<(i64, i64)>, u16)> = Vec::new();
+
     let mut cur_node: Option<i64> = None;
     let mut cur_tags: HashMap<String, String> = HashMap::new();
+    let mut cur_way_id: Option<i64> = None;
     let mut cur_way_ids: Option<Vec<i64>> = None;
     let mut cur_way_tags: HashMap<String, String> = HashMap::new();
+    let mut in_relation = false;
+    let mut cur_rel_tags: HashMap<String, String> = HashMap::new();
+    let mut cur_rel_members: Vec<(String, i64)> = Vec::new(); // (role, way_ref)
 
     let mut buf = Vec::with_capacity(1024);
     loop {
@@ -922,8 +1154,14 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                     }
                 }
                 "way" => {
+                    cur_way_id = attr(&e, "id").and_then(|s| s.parse::<i64>().ok());
                     cur_way_ids = Some(Vec::new());
                     cur_way_tags.clear();
+                }
+                "relation" => {
+                    in_relation = true;
+                    cur_rel_tags.clear();
+                    cur_rel_members.clear();
                 }
                 _ => {}
             },
@@ -942,12 +1180,22 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                         }
                     }
                 }
+                "member" => {
+                    if in_relation && attr(&e, "type") == Some("way") {
+                        if let Some(r) = attr(&e, "ref").and_then(|s| s.parse::<i64>().ok()) {
+                            let role = attr(&e, "role").unwrap_or("").to_string();
+                            cur_rel_members.push((role, r));
+                        }
+                    }
+                }
                 "tag" => {
                     if let (Some(k), Some(v)) = (attr(&e, "k"), attr(&e, "v")) {
                         if cur_node.is_some() {
                             cur_tags.insert(k.to_string(), v.to_string());
                         } else if cur_way_ids.is_some() {
                             cur_way_tags.insert(k.to_string(), v.to_string());
+                        } else if in_relation {
+                            cur_rel_tags.insert(k.to_string(), v.to_string());
                         }
                     }
                 }
@@ -960,10 +1208,11 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                             matches!(k.as_str(), "amenity" | "tourism" | "shop" | "place")
                         });
                         if is_poi {
-                            if let Some((lo, la)) = nodes.get(&nid) {
+                                if let Some((lo, la)) = nodes.get(&nid) {
                                 if *lo >= bw && *lo <= be && *la >= bs && *la <= bn {
                                     let name = cur_tags.get("name").cloned().unwrap_or_default();
-                                    pois.push((*lo, *la, poi_feat(&cur_tags), name, poi_rank(&cur_tags)));
+                                    let cb = city_bits(&cur_tags);
+                                    pois.push((*lo, *la, poi_feat(&cur_tags), name, poi_rank(&cur_tags), cb));
                                 }
                             }
                         }
@@ -972,6 +1221,10 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                 }
                 "way" => {
                     if let Some(ids) = cur_way_ids.take() {
+                        let wid = cur_way_id.take();
+                        if let Some(w) = wid {
+                            way_nodes.insert(w, ids.clone());
+                        }
                         let tags = std::mem::take(&mut cur_way_tags);
                         let g = |k: &str| tags.get(k).map(|s| s.as_str());
                         let pts: Vec<(i64, i64)> =
@@ -986,7 +1239,8 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                             if let Some(hw) = g("highway") {
                                 if pts.len() >= 2 {
                                     let toll = matches!(g("toll"), Some("yes") | Some("1"));
-                                    roads.push((pts, roadinfo_w(hw, g("junction"), toll)));
+                                    let refn = g("ref").map(|s| s.to_string());
+                                    roads.push((pts, roadinfo_w(hw, g("junction"), toll), refn));
                                 }
                             } else if let Some(ww) = g("waterway") {
                                 if pts.len() >= 2 {
@@ -997,8 +1251,42 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                                     let mut ring = pts;
                                     ring.pop(); // drop the closing vertex -> open loop (Bosch convention)
                                     if ring.len() >= 3 {
-                                        areas.push((ring, feat));
+                                        standalone_areas.push((wid.unwrap_or(-1), ring, feat));
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+                "relation" => {
+                    in_relation = false;
+                    let tags = std::mem::take(&mut cur_rel_tags);
+                    let members = std::mem::take(&mut cur_rel_members);
+                    let rtype = tags.get("type").map(|s| s.as_str());
+                    if matches!(rtype, Some("multipolygon") | Some("boundary")) && !members.is_empty()
+                    {
+                        // Only relations whose own tags map to a land-use area both emit a
+                        // polygon and claim their member ways (suppressing those ways' standalone
+                        // emission). A relation with no area mapping (e.g. administrative
+                        // boundary) claims nothing, so a member way's own area tags still count.
+                        if let Some(feat) = area_feat(&tags) {
+                            for (_, w) in &members {
+                                rel_member.insert(*w);
+                            }
+                            let chains: Vec<Vec<i64>> = members
+                                .iter()
+                                .filter(|(role, _)| role != "inner") // holes unsupported -> filled
+                                .filter_map(|(_, w)| way_nodes.get(w).cloned())
+                                .collect();
+                            for ring_ids in stitch_ways(&chains) {
+                                let ring: Vec<(i64, i64)> =
+                                    ring_ids.iter().filter_map(|id| nodes.get(id).copied()).collect();
+                                if ring.len() >= 3
+                                    && ring
+                                        .iter()
+                                        .any(|&(lo, la)| lo >= bw && lo <= be && la >= bs && la <= bn)
+                                {
+                                    areas.push((ring, feat));
                                 }
                             }
                         }
@@ -1010,6 +1298,12 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
             _ => {}
         }
         buf.clear();
+    }
+    // Emit deferred standalone closed-area ways, skipping any that a relation already owns.
+    for (wid, ring, feat) in standalone_areas {
+        if !rel_member.contains(&wid) {
+            areas.push((ring, feat));
+        }
     }
     OsmData { pois, roads, waterways, areas }
 }
@@ -1062,7 +1356,7 @@ fn pack_and_build_blocks(
     cy: i64,
     polys: &[(Vec<(i64, i64)>, u16)],
     lines: &[LineCell],
-    pois: &[(i64, i64, u16, Option<&str>)],
+    pois: &[(i64, i64, u16, Option<&str>, u16)],
 ) -> Vec<Vec<u8>> {
     let np = polys.len();
     let nl = lines.len();
@@ -1080,10 +1374,10 @@ fn pack_and_build_blocks(
             Some((t, _, _)) => ann_words(t),
             None => 0,
         };
-        cost.push(3 + lc.pts.len() as u32 + aw);
+        cost.push(3 + lc.pts.len() as u32 + aw + rn_words(lc.rn.as_deref()));
     }
     for p in pois {
-        cost.push(poi_cost(p.3.unwrap_or("")));
+        cost.push(poi_cost(p.3.unwrap_or("")) + if p.4 != 0 { 1 } else { 0 });
     }
     // greedy first-fit into blocks (each starts with the 4-word header)
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -1368,17 +1662,17 @@ fn main() {
 
         // Per-level selection: roads by netclass (w & 7), POIs by rank. Waterways and landuse
         // areas are local detail, so they're only emitted at L1/L2 (not the whole-country L0).
-        let roads: Vec<(Vec<(i64, i64)>, u16)> = osm
+        let roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)> = osm
             .roads
             .iter()
-            .filter(|(_, w)| (*w & 7) <= mnc as u16)
+            .filter(|(_, w, _)| (*w & 7) <= mnc as u16)
             .cloned()
             .collect();
-        let pois: Vec<(i64, i64, u16, String)> = osm
+        let pois: Vec<(i64, i64, u16, String, u16)> = osm
             .pois
             .iter()
             .filter(|p| p.4 <= mpr)
-            .map(|(a, b, c, d, _)| (*a, *b, *c, d.clone()))
+            .map(|(a, b, c, d, _, ct)| (*a, *b, *c, d.clone(), *ct))
             .collect();
         let show_detail = L >= 1;
         let waterways: Vec<(Vec<(i64, i64)>, u16)> = if show_detail {
@@ -1417,22 +1711,29 @@ fn main() {
             // Split this tile's content into LAND (shard profile `02`) vs HYDRO (`0I` overlay).
             // Bosch's `0I` carries ONLY water: waterway lines + water-area polygons, never roads/POI.
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
-            for (geom, w) in &ts.roads {
-                lines_land.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x11, *w, 0)) });
+            for (geom, w, rn) in &ts.roads {
+                lines_land.push(LineCell {
+                    pts: geom.clone(),
+                    feat: 0x30,
+                    ann: Some((0x11, *w, 0)),
+                    rn: rn.clone(),
+                });
             }
             let mut lines_hydro: Vec<LineCell> = Vec::with_capacity(ts.waterways.len());
             for (geom, wc) in &ts.waterways {
-                lines_hydro.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x10, *wc, 0)) });
+                lines_hydro.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x10, *wc, 0)), rn: None });
             }
             let mut land_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
             let mut hydro_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
             for a in ts.areas.iter().cloned() {
                 if is_water_area_feat(a.1) { hydro_polys.push(a); } else { land_polys.push(a); }
             }
-            let tpois_named: Vec<(i64, i64, u16, Option<&str>)> = ts
+            let tpois_named: Vec<(i64, i64, u16, Option<&str>, u16)> = ts
                 .pois
                 .iter()
-                .map(|(a, b, c, d)| (*a, *b, *c, if emit_names { Some(d.as_str()) } else { None }))
+                .map(|(a, b, c, d, ct)| {
+                    (*a, *b, *c, if emit_names { Some(d.as_str()) } else { None }, *ct)
+                })
                 .collect();
 
             // Append a profile's sub-blocks to its own MAP buffer, tagging each slot entry with that

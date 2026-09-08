@@ -184,7 +184,7 @@ mappings already implemented and verified in `map2osm_rs` (`poi_osm`, `landuse_o
 | `amenity=place_of_worship` | `0x16` | |
 | `tourism=attraction`/`museum`/`viewpoint`/`zoo`/`theme_park` | `0x17` | mixed leisure class |
 | `railway=station` / `halt` | `0x22` | |
-| `place=city/town/village/hamlet` (named) | city POI + `0x21` city ann | size class from population/admin (§5) |
+| `place=city/town/village/hamlet/suburb` | `0x01` | city POI + `0x21` city ann (`count=2` with name); bits disp/size/admin from `place` class (§8, stock-decoded): city 5/6, town 9/9, village 12/13, hamlet 12/15, suburb 11/11, `admin=7` |
 
 Unmapped amenities are still emitted as a POI with their name; the exact code stays best-effort and is
 refined during M3.
@@ -208,6 +208,12 @@ Sub-attributes (same roadinfo word): `junction=roundabout` → road_type 2; `hig
 (interconnect) or 1 (long ramp); `toll=yes` → toll bits; `route=ferry` → ferry bits (emitted as a line, not
 a road class). The full roadinfo payload is written as annotation type `0x11` `{u16 w, u32 d}`.
 
+Road number: `ref=*` → a `0x14` annotation laid right after the `0x11` (`annotDesc.count = 2`), payload
+`{u16 textRef, u16 mid=0, u16 status=0}`; `textRef` points at a name-format text record holding the ref
+string (same `u16AddText` shape Bosch's converter and POI names use). Selective — only `ref`-bearing
+highways get it. E.g. `krzeszowice` `ref=79` (primary) → `0x14` on its road cells. `surface` (`0x01`) is
+**not** emitted (no confirmed OSM→code semantics; see MAP_format §8).
+
 Water lines: `waterway=*` → list-1 with water annotation type `0x10` (class/type nibbles) — `river`,
 `canal`, `stream`, `ditch`.
 
@@ -215,15 +221,28 @@ Water lines: `waterway=*` → list-1 with water annotation type `0x10` (class/ty
 
 | OSM tag | feature low byte |
 |---|---|
-| `landuse=forest` / `natural=wood` | `0x2B` |
+| `landuse=forest`/`wood` or `natural=wood`/`forest` | `0x2B` |
 | `landuse=grass` / `meadow` | `0x38` |
 | `landuse=cemetery` | `0x39` |
-| `landuse=commercial` / `industrial` | `0x3A` |
-| `natural=water` / `water=lake` / closed water area | `0x48` |
+| `landuse=commercial` | `0x3A` |
+| `natural=water` / `landuse=water`/`basin`/`reservoir` | `0x48` |
 | `landuse=residential` | `0x9C` |
+
+> Only codes the decoder confirms by evidence are mapped (`area_feat` inverts `map2osm landuse_osm`).
+> `landuse=industrial`/`farmland`/`orchard`, `natural=grassland`/`scrub`, `leisure=pitch`/`garden`, and
+> `building=*` have **no confirmed Bosch land-use code** in this dataset and are intentionally **not**
+> emitted — mapping them to a neighbouring code (e.g. industrial→`0x3A`) would mislabel them.
 
 **Ring storage:** OSM repeats the first node at the end; Bosch stores each vertex **once** (open loop).
 Drop the closing node before computing `count` and emitting the point pool (writer_guide §8).
+
+**Relations (`type=multipolygon`|`boundary`):** `parse_osm` assembles area relations. A relation is emitted
+only when **its own** tags map to a land-use area via `area_feat` (an administrative `boundary` does not, so it
+is skipped and its member ways keep their own area status). Its member ways (`role != "inner"`) are joined into
+closed outer rings by `stitch_ways`; a member closed way is then not double-emitted standalone (`rel_member` set).
+**Holes / islands are filled**: the list-0 cell is a single ring with no interior-ring representation, so
+`role="inner"` members are dropped by design. True donut support needs a multi-ring list-0 encoding (format
+support unconfirmed) plus hole-aware tile clipping. Net on `krzeszowice` full: land coverage 18 → 22 tiles, tmcheck PASS.
 
 ### 4.4 Names & text records
 
