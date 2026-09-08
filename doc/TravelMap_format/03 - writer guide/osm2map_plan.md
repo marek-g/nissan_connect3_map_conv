@@ -139,14 +139,18 @@ binOff  blocks, contiguous & 4-byte aligned:
   `coord = center + (delta << SHIFTS[i])`, `SHIFTS = [13,10,7,4]`. Deltas are `i16`, so each object's
   coordinates must fall within `±2^15 << shift` of its tile center (clamp/split if not — see §10).
 
-### 3.4 Profiles & slots (v1 simplification)
+### 3.4 Profiles & slots — RESOLVED (single `02`, car-validated)
 
-- A tile normally references one profile → **single slot**. v1 emits **one profile** per region and uses
-  single-entry slots only (no `multi`), which sidesteps the multi-slot complexity. All OSM objects for a
-  tile go into that one profile's block.
-- The original N6E2 uses five profiles (`102,10E,10H,10I,11A` = prof values `0x02,0x0E,0x11,0x12,0x2A`).
-  Replacing the region with a single-profile set is fine for a render test; whether the runtime *requires*
-  the original profile set is an M0 check (§10).
+- A tile normally references one profile → **single slot**; v1 uses single-entry slots only (no `multi`).
+- **Open question #1 (§10) is answered: a single profile is fine on the head unit.** Default emits **one
+  profile `02`** for the region and puts *everything* (roads, POI, land-use areas, **and inland water**) in
+  it. Validated on car (#09p full-map boot + render); the renderer is profile-agnostic (MAP_format §11), and
+  stock N6E2 Kraków likewise keeps inland water in `02` (`0I` absent there).
+- The `0I` hydro-overlay split (`OSM2MAP_HYDRO=overlay`, water → `10I` + `multi` sub-slots) is retained only
+  for coastal/maritime regions and is **untested on car** — earlier `0I` reboots were the water-*line*
+  `0x30` bug, not the multi-slot mechanism. Do not add extra shards (`0E/0H/1A`): Bosch's shard mix is
+  volume/geography-driven, not a category map, and adds no rendering value.
+
 
 ### 3.5 `.TCI`
 
@@ -208,14 +212,26 @@ Sub-attributes (same roadinfo word): `junction=roundabout` → road_type 2; `hig
 (interconnect) or 1 (long ramp); `toll=yes` → toll bits; `route=ferry` → ferry bits (emitted as a line, not
 a road class). The full roadinfo payload is written as annotation type `0x11` `{u16 w, u32 d}`.
 
+**Line feature LOW byte = the class tier that the renderer styles by (writer-critical).** The netclass in
+`0x11` does **not** set the drawn pen (stock road lines carry no `0x11` yet render with full hierarchy); the
+pen comes from the line's feature low code, which is a class tier. `road_feat_low(nc)` derives it from the
+netclass: `nc 0→0x30` motorway · `1–2→0x31` trunk/primary · `3→0x32` secondary · `4–6→0x33`
+tertiary/unclassified/residential · `7→0x21` minor local (service/track/path/footway/pedestrian). Road tiers
+keep the `0x11`; the `0x21` minor tier is emitted **annotation-free** (stock does, and `0x21`+`0x11` is
+unproven on the reader) and shown at **L3 only** (`max_road_nc` cap `[…,6,7]`). Using one code for all roads
+(the old constant `0x30`) is what made every road/footpath look identical — see MAP_format §7, `trials/10`.
+
 Road number: `ref=*` → a `0x14` annotation laid right after the `0x11` (`annotDesc.count = 2`), payload
 `{u16 textRef, u16 mid=0, u16 status=0}`; `textRef` points at a name-format text record holding the ref
 string (same `u16AddText` shape Bosch's converter and POI names use). Selective — only `ref`-bearing
 highways get it. E.g. `krzeszowice` `ref=79` (primary) → `0x14` on its road cells. `surface` (`0x01`) is
 **not** emitted (no confirmed OSM→code semantics; see MAP_format §8).
 
-Water lines: `waterway=*` → list-1 with water annotation type `0x10` (class/type nibbles) — `river`,
-`canal`, `stream`, `ditch`.
+Water lines: `waterway=*` (`river`, `canal`, `stream`, `ditch`) → list-1 cell with feature **low byte
+`0x20`** (type 3 = hydrography) + water annotation type `0x10`. **Never use `0x30`** for water: `0x30..0x37`
+classify as *road* lines (type 4), whose reader wants a `0x11` roadinfo — pairing `0x30` with a `0x10`
+annotation mis-sizes the record and **reboots the head unit** (car-confirmed, trials #09l vs #09n). Stock N6E2
+water lines are `0x20`; default `OSM2MAP_WATERLINE_FEAT=20`.
 
 ### 4.3 Areas / polygons (closed OSM `<way>` or `relation[type=multipolygon]`) → list-0 cells
 
@@ -232,6 +248,11 @@ Water lines: `waterway=*` → list-1 with water annotation type `0x10` (class/ty
 > `landuse=industrial`/`farmland`/`orchard`, `natural=grassland`/`scrub`, `leisure=pitch`/`garden`, and
 > `building=*` have **no confirmed Bosch land-use code** in this dataset and are intentionally **not**
 > emitted — mapping them to a neighbouring code (e.g. industrial→`0x3A`) would mislabel them.
+
+**Water-area polygons (`0x48`, full code `0x5048`):** unlike grass/forest, stock always gives them a `0x10`
+water annotation (`{size=4,type=0x10,u16 code}`, dominant lake value `type=2/class=8` = `0x28`). `osm2map`
+emits it by default (`OSM2MAP_WATER_POLY_ANN=0` disables); unlike the `0x9c` DCM case this is *not* reboot-
+critical (09m proved unannotated areas boot), it is style fidelity.
 
 **Ring storage:** OSM repeats the first node at the end; Bosch stores each vertex **once** (open loop).
 Drop the closing node before computing `count` and emitting the point pool (writer_guide §8).
@@ -274,8 +295,11 @@ level so the renderer shows it at the right zoom. Policy (v1, tunable):
 Implementation: a pure function `select(obj) -> Vec<(level, feature)>` driven by the tables above + a few
 numeric thresholds (population, highway rank). Keep it data-driven so tuning is a table edit, not code.
 
-Geometry per level: v1 re-encodes the **same** vertices at every selected level (no simplification); optional
-Douglas–Peucker for coarse levels is a later optimization.
+Geometry per level: by default v1 re-encodes the **same** vertices at every selected level. Optional
+level-of-detail (Douglas–Peucker `simplify_ring` + per-level min-shape/road-vertex/POI-rank cuts) is
+**implemented but OFF by default** (`OSM2MAP_LOD=1` enables; `SIM_EPS_ON`/`MAX_ROAD_NC`/`MAX_POI_RANK`). The
+car-validated geometry is the no-LOD one — the earlier #08 LOD build's reboot was actually the water-line bug,
+so LOD has never been validated in isolation; keep it off until re-tested on car.
 
 ---
 
@@ -339,10 +363,11 @@ Primary automated gate is a **round-trip**, exactly mirroring `writer_guide.md` 
 
 ## 9. Milestones / execution order
 
-- **M0 — de-risk (mostly done).** ✅ full read pipeline on real N6E2; ✅ decompressed IDX+MAP headers;
-  ✅ profile→filename encoding (`0x8400|prof`); ✅ TCI is optional. Remaining: (a) confirm a single-profile
-  region + omitted TCI still loads in the runtime; (b) measure the dominant `state` value; (c) confirm
-  `CONTENT.DAT` doesn't encode base sizes (signature.md §7.4).
+- **M0 — de-risk (DONE).** ✅ full read pipeline on real N6E2; ✅ decompressed IDX+MAP headers;
+  ✅ profile→filename encoding (`0x8400|prof`); ✅ TCI is optional. ✅ **single-profile region loads + renders
+  on the head unit** (#09p); ✅ omitted TCI tolerated (empty/all-empty TCI emitted, `0x307` logs only).
+  Remaining: (c) confirm `CONTENT.DAT` doesn't encode base sizes (signature.md §7.4).
+
 - **M1 — skeleton that round-trips.** `osm2map_rs` parses OSM and emits a **minimal** valid region (one tile,
   one profile, a handful of points + one line) that `map2osm_rs` reads back without error. Proves the format.
 - **M2 — full tiling.** all three levels, point pool + delta encoding, cross-tile splitting; round-trip the

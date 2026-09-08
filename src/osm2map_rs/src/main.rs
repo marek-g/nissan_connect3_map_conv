@@ -29,16 +29,17 @@ fn deg2pau(d: f64) -> i64 {
 
 const STATE: u16 = 0x25D4; // measured from reference N6E2 polygon cells
 
-// Two-profile output (see doc/TravelMap_format §11): Bosch's `0I` profile is a hydrography-only
-// overlay present in EVERY region (coastline/water lines + water-area polygons, zero POI/settlement),
-// while land content lives in separate shard profiles. No shipped region puts roads/POI into `0I`.
-// osm2map previously dumped everything into a lone `0I`, which no stock map does (leading suspect for
-// the #04/#05 reboot). We now split: hydro -> `0I` (0x12), land -> shard profile `02` (0x02), both of
-// which are already declared for region N6E2 in the resinf metadata catalog. base32(low) -> file name
+// Profile model (see doc/TravelMap_format §11). Ground truth from stock N6E2 (Kraków bbox): EVERY
+// element — roads, POI, land-use polygons AND inland water (371 water lines + 261 water polygons) —
+// lives in the single land shard profile `02` (regProf 0x402); profile `0I` (0x412) does NOT occur
+// inland. `0I` is Bosch's hydrography OVERLAY used where water needs a separate layer (coastlines /
+// maritime regions). So the default (validated on the car, trial #09p) emits everything into `02`
+// (OSM2MAP_HYDRO=land, single profile, no multi-slot). The `0I` overlay + multi-profile-slot path is
+// retained behind OSM2MAP_HYDRO=overlay for coastal regions but is not the default. Both `02` and
+// `0I` are already declared for region N6E2 in the resinf metadata catalog. base32(low) -> file name
 // via `<REGION>1<B32[low/32]><B32[low%32]>`.
 const HYDRO_PROF: u16 = 0x12; // "0I" -> N6E210I.MAP : waterways + water areas, no POI
 const LAND_PROF: u16 = 0x02; // "02" -> N6E2102.MAP : roads + POI + land-use polygons
-const PROF: u16 = HYDRO_PROF; // kept for reference / single-profile callers
 
 // water-area polygon feature low byte (area_feat returns this for natural/landuse water)
 fn is_water_area_feat(feat: u16) -> bool {
@@ -127,6 +128,20 @@ fn ann_words(typ: u8) -> u32 {
     }
 }
 
+// Name/number text-record string-variant flag byte. A text record is
+//   { u8 n_strings, (u8 NAME_STR_FLAG, u8 len) × n, bytes×n, u8 term }
+// Stock always uses 0xA7 here; map2osm ignores this byte (so a wrong value still decodes) but the
+// head-unit renderer refuses to draw a label whose variant flag isn't 0xA7 — that's why our names
+// decoded fine yet showed nothing on the car.
+const NAME_STR_FLAG: u8 = 0xa7;
+
+// Generic boolean env switch; default ON unless set to 0/n/none/false/off. Used by the #09
+// isolation ladder so each rung differs from the car-proven land baseline by exactly one mechanism.
+fn env_on(key: &str) -> bool {
+    !matches!(env::var(key).unwrap_or_else(|_| "1".into()).as_str(),
+        "0" | "n" | "none" | "false" | "off")
+}
+
 // Which annotation a land-use polygon must carry, chosen by CATEGORY (measured on stock N6E2):
 //   * feat low 0x9c (OSM landuse=residential / settlement area) ALWAYS carries 0x04 (DCM = 3D city
 //     model) — 2.77M cells, ~100% of that category, and it is the ONLY category that ever does.
@@ -151,13 +166,34 @@ fn poly_annot_type(feat_low: u8) -> u8 {
     }
 }
 
-// Words the polygon's annotation occupies (0x04 DCM = 8 B = 2 words; 0 when none).
-fn poly_annot_words(feat_low: u8) -> u32 {
-    if poly_annot_type(feat_low) != 0 {
-        2
-    } else {
-        0
+// A land/water-area polygon's annotation KIND: 0 = none, 0x04 = DCM (residential, 2 words),
+// 0x10 = water (water-area 0x48, 1 word). Stock N6E2: residential 0x9c always carries 0x04; water
+// 0x48 areas always carry 0x10 (type=2/class=8 dominant) — the water record is what the water-area
+// reader dereferences, its absence is the #09f reboot suspect. Water 0x10 gated by OSM2MAP_WATER_POLY_ANN
+// (default on). Controlled independently of POLY_ANN so the 0x04 ladder stays intact.
+fn poly_ann_kind(feat_low: u8) -> u8 {
+    let d = poly_annot_type(feat_low);
+    if d != 0 {
+        return d; // 0x04 on 0x9c (cat/all)
     }
+    if feat_low == 0x48 && env_on("OSM2MAP_WATER_POLY_ANN") {
+        return 0x10;
+    }
+    0
+}
+// Record size in words for a polygon annotation kind (0x04 DCM = 2 words, 0x10 water = 1 word).
+fn poly_ann_words(kind: u8) -> u32 {
+    match kind {
+        0x04 => 2,
+        0x10 => 1,
+        _ => 0,
+    }
+}
+// The 0x10 payload for a water-area polygon (u16: high nibble=type, low nibble=class). Stock N6E2
+// water_area values cluster on type=2 (146/261) with class 8/7/6 and type=3 class 0/1; the single
+// dominant lake value is type=2,class=8 = 0x28.
+fn area_watercode() -> u16 {
+    0x28
 }
 
 // ---- decompressed MAP block (inverted from map2osm parse_block) ------------
@@ -210,11 +246,14 @@ fn build_block(
     // one variable-size entry per line that has an ann, then one 0x7A text entry per named POI,
     // then the POI text records.
     let mut w = pool_end;
-    let mut poly_ann = vec![0u32; np]; // 0 = none; else start word of the 0x04 record
+    let mut poly_ann = vec![0u32; np]; // 0 = none; else start word of the annotation record
+    let mut poly_ann_k = vec![0u8; np]; // annotation kind per polygon (0x04 DCM | 0x10 water)
     for i in 0..np {
-        if poly_annot_type((polys[i].1 & 0xff) as u8) != 0 {
+        let k = poly_ann_kind((polys[i].1 & 0xff) as u8);
+        if k != 0 {
             poly_ann[i] = w;
-            w += 2; // 0x04 record = 8 bytes = 2 words
+            poly_ann_k[i] = k;
+            w += poly_ann_words(k);
         }
     }
     // Line annotations live in the `w` region; a road may carry 0x11 (roadinfo) AND 0x14 (road
@@ -351,16 +390,25 @@ fn build_block(
         }
     }
 
-    // polygon 0x04 DCM annotations (8 bytes): {size=8, type=0x04, u16=0x0020, 0x11,0,0,0}
-    // payload copied verbatim from a stock land-use polygon annotation. Emitted only where
-    // poly_annot_type chose it (residential 0x9c by default). u16=0x0020 is the DCM class selector
-    // (u8ConvertDCMClass(0x20)=2); 0x11 and 0x00 are two x10-scaled params; last 2 bytes unused.
+    // polygon annotations, dispatched by kind:
+    //   0x04 DCM (8 B): {size=8, type=0x04, u16=0x0020, 0x11,0,0,0}  (residential; verbatim stock)
+    //   0x10 water (4 B): {size=4, type=0x10, u16 watercode}          (water-area 0x48; stock value)
     for i in 0..np {
-        if poly_ann[i] != 0 {
-            let bo = (poly_ann[i] as usize) * 4;
-            b[bo] = 8;
-            b[bo + 1] = 0x04;
-            b[bo + 2..bo + 8].copy_from_slice(&[0x20, 0x00, 0x11, 0x00, 0x00, 0x00]);
+        if poly_ann[i] == 0 {
+            continue;
+        }
+        let bo = (poly_ann[i] as usize) * 4;
+        match poly_ann_k[i] {
+            0x10 => {
+                b[bo] = 4;
+                b[bo + 1] = 0x10;
+                put_u16(&mut b, bo + 2, area_watercode());
+            }
+            _ => {
+                b[bo] = 8;
+                b[bo + 1] = 0x04;
+                b[bo + 2..bo + 8].copy_from_slice(&[0x20, 0x00, 0x11, 0x00, 0x00, 0x00]);
+            }
         }
     }
 
@@ -385,7 +433,7 @@ fn build_block(
                 let tp = (text_word[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
-                b[tp + 1] = 0;
+                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock always 0xA7; 0x00 => renderer skips the label)
                 b[tp + 2] = bytes.len() as u8;
                 b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
                 b[tp + 3 + bytes.len()] = 0; // terminator
@@ -399,7 +447,7 @@ fn build_block(
                 let tp = (rn_text[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
-                b[tp + 1] = 0;
+                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock 0xA7)
                 b[tp + 2] = bytes.len() as u8;
                 b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
                 b[tp + 3 + bytes.len()] = 0; // terminator
@@ -789,7 +837,7 @@ fn distribute(
     let mut map: HashMap<i64, TileShapes> = HashMap::new();
     // Per-level level-of-detail: simplify geometry to sub-pixel tolerance and drop shapes smaller
     // than one tolerance unit. Coarser levels (small `level`) carry far less detail.
-    let eps = SIM_EPS[level] as f64;
+    let eps = sim_eps(level) as f64;
     let eps2 = eps * eps;
 
     for (lo, la, feat, name, city) in pois {
@@ -941,6 +989,9 @@ fn poi_feat(tags: &HashMap<String, String>) -> u16 {
 //   bit 15 name-overlap. Stock correlation: cities size~6 disp~4-6, towns 9-11, villages 12-15,
 //   admin=7 for all non-capitals. Display is clamped at 12 for the smallest settlements.
 fn city_bits(tags: &HashMap<String, String>) -> u16 {
+    if !env_on("OSM2MAP_CITY_ANN") {
+        return 0; // #09 ladder: suppress the 0x21 city annotation to isolate it
+    }
     let (disp, size) = match tags.get("place").map(|s| s.as_str()) {
         Some("city") => (5u16, 6u16),
         Some("town") => (9, 9),
@@ -981,6 +1032,26 @@ fn roadinfo_w(hw: &str, junction: Option<&str>, toll: bool) -> u16 {
         w |= 0x10; // toll bits 4-5 (decodes to "3" = toll)
     }
     w
+}
+
+// Road-tier line feature LOW byte from the 3-bit netclass, matching stock N6E2 usage:
+//   nc 0      -> 0x30  (motorway/expressway; fewest, unnamed, shown at coarse zoom)
+//   nc 1-2    -> 0x31  (trunk / primary: major arterials)
+//   nc 3      -> 0x32  (secondary)
+//   nc 4-6    -> 0x33  (tertiary / unclassified / residential: local through-streets)
+//   nc 7      -> 0x21  (minor local: service / track / path / footway / pedestrian)
+// The line's feature LOW code is what the base-map renderer styles with (pen weight + colour,
+// per u8ConvertFeature2LineType type + class tier). Emitting one code (0x30) for every road is what
+// made motorways and footpaths look identical on the car. 0x30..0x33 are all type-4 road codes (the
+// same reader our proven-safe 0x30+0x11 records use); 0x21 is the type-2 "line" minor class.
+fn road_feat_low(nc: u16) -> u16 {
+    match nc & 7 {
+        0 => 0x30,
+        1 | 2 => 0x31,
+        3 => 0x32,
+        4 | 5 | 6 => 0x33,
+        _ => 0x21,
+    }
 }
 
 // OSM area tags -> TravelMap landuse/natural feature code (polygon low byte). None = not a
@@ -1044,18 +1115,34 @@ fn poi_rank(tags: &HashMap<String, String>) -> u8 {
     3
 }
 
-// Max netclass shown at each populated level (higher threshold = more detail). Measured from stock
-// N6E2AA: max road netclass present per level is L0=0(motorway), L1=1, L2=3, L3=7(everything).
-const MAX_ROAD_NC: [u8; 4] = [0, 1, 3, 7];
-// Max POI rank shown at each level (lower rank = more important). Settlements scale with size
-// (city->town->village); amenities and hamlets (rank>=3) are L3-only, matching stock.
-const MAX_POI_RANK: [u8; 4] = [1, 2, 2, 4];
-
-// Per-level level-of-detail simplification tolerance in PAU: ~ tile_width/1024 (sub-pixel), where
-// tile_width = regionW/grid_size[L] and regionW = 0x0CCCCCCC..0x19999998 span = 214_748_364 PAU.
-// Coarser levels simplify much harder (L0 ~1.95 km, L3 ~3.9 m). Also used as the min-shape size so
-// sub-visible stubs/slivers are dropped entirely at coarse zoom.
-const SIM_EPS: [i64; 4] = [209715, 41943, 4194, 419];
+// Level-of-detail is toggled by OSM2MAP_LOD (default OFF). Off = the car-validated geometry (#09p:
+// pre-LOD per-level caps [2,4,7,7]/[1,2,3,3], no RDP simplification). The LOD path (sub-pixel
+// Douglas-Peucker + coarser caps) is implemented and stock-motivated but has NOT been car-validated
+// on its own (the earlier #08 reboot was the water-line code, not LOD) — set OSM2MAP_LOD=1 to test it.
+fn lod_on() -> bool {
+    matches!(
+        env::var("OSM2MAP_LOD").unwrap_or_else(|_| "0".into()).as_str(),
+        "1" | "y" | "yes" | "on" | "true"
+    )
+}
+// Max netclass shown at each populated level (higher threshold = more detail). On: measured stock
+// N6E2AA caps (L0=0 motorway, L1=1, L2=3, L3=7). Off: [2,4,6,7] — the minor local tier (nc7 =
+// service/path/footway, feature 0x21) appears at L3 only, matching stock (its 0x21 lines are L3-only).
+fn max_road_nc() -> [u8; 4] {
+    if lod_on() { [0, 1, 3, 7] } else { [2, 4, 6, 7] }
+}
+// Max POI rank shown at each level (lower rank = more important). On: settlements scale by size,
+// amenities/hamlets (rank>=3) L3-only. Off: the pre-LOD [1,2,3,3].
+fn max_poi_rank() -> [u8; 4] {
+    if lod_on() { [1, 2, 2, 4] } else { [1, 2, 3, 3] }
+}
+// Per-level RDP simplification tolerance in PAU: ~ tile_width/1024 (sub-pixel), where tile_width =
+// regionW/grid_size[L], regionW = 214_748_364 PAU. Coarser levels simplify harder (L0 ~1.95 km,
+// L3 ~3.9 m); also the min-shape size so sub-visible stubs/slivers drop at coarse zoom. Off => 1.
+const SIM_EPS_ON: [i64; 4] = [209715, 41943, 4194, 419];
+fn sim_eps(level: usize) -> i64 {
+    if lod_on() { SIM_EPS_ON[level] } else { 1 }
+}
 
 struct OsmData {
     pois: Vec<(i64, i64, u16, String, u8, u16)>, // (lon_pau, lat_pau, feat, name, rank, city_bits)
@@ -1367,7 +1454,7 @@ fn pack_and_build_blocks(
     // word cost per feature (3 cell words + point-pool words + annotation words)
     let mut cost: Vec<u32> = Vec::with_capacity(n);
     for (pts, feat) in polys {
-        cost.push(3 + pts.len() as u32 + poly_annot_words((*feat & 0xff) as u8));
+        cost.push(3 + pts.len() as u32 + poly_ann_words(poly_ann_kind((*feat & 0xff) as u8)));
     }
     for lc in lines {
         let aw = match lc.ann {
@@ -1584,7 +1671,7 @@ fn main() {
     // Each mode is a CUMULATIVE superset of the previous, so the first rung that reboots pins the
     // single mechanism it introduced. full == the #07 build (known to reboot => positive control).
     //   empty      : no features; all slots 0x8000. Tests generated headers/IDX/TCI/container only.
-    //   roads      : + road polylines into land `02` (line cells + feat 0x30 + annot 0x11). Single profile.
+    //   roads      : + road polylines into land `02` (line cells + feat 0x30..0x33/0x21 per class + annot 0x11 on road tiers). Single profile.
     //   land       : + land-use polygons (polygon cells + area feats; water polygons stripped). Still `02` only.
     //   poi_noname : + POI point cells + POI feats, names STRIPPED (no text annotation).
     //   poi_name   : + POI name annotations (the 0x7A TEXT record) — isolates the name/text encoder.
@@ -1631,6 +1718,24 @@ fn main() {
         osm.areas.truncate(max_areas);
     }
     let emit_names = matches!(mode.as_str(), "full" | "poi_name");
+    // OSM2MAP_HYDRO: "land" (DEFAULT, car-validated #09p) = put water into the land shard `02`, a
+    // single profile with no 0I and no multi-profile slots — the model stock uses inland (every
+    // element incl. water is profile 02). "overlay" = split water into a separate `0I` profile +
+    // multi-profile slots (Bosch's coastline/maritime model); retained for coastal regions, off by
+    // default.
+    let hydro_overlay = matches!(
+        env::var("OSM2MAP_HYDRO").unwrap_or_else(|_| "land".into()).as_str(),
+        "overlay" | "0I" | "0i" | "split" | "multi"
+    );
+    // Optional water sub-filters (both on by default) for isolating lines vs areas within a rung.
+    let water_lines = env_on("OSM2MAP_WATER_LINES");
+    let water_areas = env_on("OSM2MAP_WATER_AREAS");
+    // Water-LINE feature code (low byte). Stock N6E2 water lines = 0x20 (feature_type "line" => 3,
+    // the hydrography reader that consumes the 0x10 annotation). 0x30 is a ROAD line (reader expects
+    // 0x11 roadinfo) — emitting 0x10 on a 0x30 line misparses and reboots (#09l evidence). Default 0x20.
+    let waterline_feat: u16 =
+        u16::from_str_radix(&env::var("OSM2MAP_WATERLINE_FEAT").unwrap_or_else(|_| "20".into()), 16)
+            .unwrap_or(0x20);
     eprintln!("OSM2MAP_MODE={}  (emit_names={})", mode, emit_names);
 
     eprintln!(
@@ -1657,16 +1762,19 @@ fn main() {
 
     for L in 0..4usize { // populate all four levels (L3 = finest, 500x500 grid)
         let shift = SHIFTS[L];
-        let mnc = MAX_ROAD_NC[L];
-        let mpr = MAX_POI_RANK[L];
+        let (mnc_arr, mpr_arr) = (max_road_nc(), max_poi_rank());
+        let mnc = mnc_arr[L];
+        let mpr = mpr_arr[L];
+        let roadnum_on = env_on("OSM2MAP_ROADNUM");
 
         // Per-level selection: roads by netclass (w & 7), POIs by rank. Waterways and landuse
         // areas are local detail, so they're only emitted at L1/L2 (not the whole-country L0).
+        // OSM2MAP_ROADNUM=0 clears every `ref`, which suppresses the whole 0x14 + text path.
         let roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)> = osm
             .roads
             .iter()
             .filter(|(_, w, _)| (*w & 7) <= mnc as u16)
-            .cloned()
+            .map(|(g, w, rn)| (g.clone(), *w, if roadnum_on { rn.clone() } else { None }))
             .collect();
         let pois: Vec<(i64, i64, u16, String, u16)> = osm
             .pois
@@ -1712,21 +1820,36 @@ fn main() {
             // Bosch's `0I` carries ONLY water: waterway lines + water-area polygons, never roads/POI.
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
             for (geom, w, rn) in &ts.roads {
-                lines_land.push(LineCell {
-                    pts: geom.clone(),
-                    feat: 0x30,
-                    ann: Some((0x11, *w, 0)),
-                    rn: rn.clone(),
-                });
+                let nc = *w & 7;
+                let feat = road_feat_low(nc);
+                if nc >= 7 {
+                    // Minor local (0x21, type-2 line): stock emits NO roadinfo on these, and 0x21+0x11
+                    // is unproven on the reader -> keep it annotation-free like stock (never rebooted).
+                    lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None });
+                } else {
+                    // Road tiers (0x30..0x33, type-4): keep the proven 0x11 roadinfo (+ 0x14 ref).
+                    lines_land.push(LineCell {
+                        pts: geom.clone(),
+                        feat,
+                        ann: Some((0x11, *w, 0)),
+                        rn: rn.clone(),
+                    });
+                }
             }
             let mut lines_hydro: Vec<LineCell> = Vec::with_capacity(ts.waterways.len());
-            for (geom, wc) in &ts.waterways {
-                lines_hydro.push(LineCell { pts: geom.clone(), feat: 0x30, ann: Some((0x10, *wc, 0)), rn: None });
+            if water_lines {
+                for (geom, wc) in &ts.waterways {
+                    lines_hydro.push(LineCell { pts: geom.clone(), feat: waterline_feat, ann: Some((0x10, *wc, 0)), rn: None });
+                }
             }
             let mut land_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
             let mut hydro_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
             for a in ts.areas.iter().cloned() {
-                if is_water_area_feat(a.1) { hydro_polys.push(a); } else { land_polys.push(a); }
+                if is_water_area_feat(a.1) {
+                    if water_areas { hydro_polys.push(a); }
+                } else {
+                    land_polys.push(a);
+                }
             }
             let tpois_named: Vec<(i64, i64, u16, Option<&str>, u16)> = ts
                 .pois
@@ -1738,18 +1861,33 @@ fn main() {
 
             // Append a profile's sub-blocks to its own MAP buffer, tagging each slot entry with that
             // profile's regProf word. Land first, then the 0I hydro overlay (matches stock co-refs).
+            // In HYDRO=land mode, water is merged into the land shard `02` (single profile, no 0I,
+            // no multi-slot) — the inland model stock actually uses.
             let mut entries: Vec<(u16, u16, u32)> = Vec::new();
-            for blk in pack_and_build_blocks(shift, cx, cy, &land_polys, &lines_land, &tpois_named) {
-                let offb = map_binoff + map_land.len() as u32;
-                let lw = (blk.len() / 4) as u16;
-                map_land.extend_from_slice(&blk);
-                entries.push((0x400 | LAND_PROF, lw, offb));
-            }
-            for blk in pack_and_build_blocks(shift, cx, cy, &hydro_polys, &lines_hydro, &[]) {
-                let offb = map_binoff + map_hydro.len() as u32;
-                let lw = (blk.len() / 4) as u16;
-                map_hydro.extend_from_slice(&blk);
-                entries.push((0x400 | HYDRO_PROF, lw, offb));
+            if hydro_overlay {
+                for blk in pack_and_build_blocks(shift, cx, cy, &land_polys, &lines_land, &tpois_named) {
+                    let offb = map_binoff + map_land.len() as u32;
+                    let lw = (blk.len() / 4) as u16;
+                    map_land.extend_from_slice(&blk);
+                    entries.push((0x400 | LAND_PROF, lw, offb));
+                }
+                for blk in pack_and_build_blocks(shift, cx, cy, &hydro_polys, &lines_hydro, &[]) {
+                    let offb = map_binoff + map_hydro.len() as u32;
+                    let lw = (blk.len() / 4) as u16;
+                    map_hydro.extend_from_slice(&blk);
+                    entries.push((0x400 | HYDRO_PROF, lw, offb));
+                }
+            } else {
+                let mut lp = land_polys;
+                lp.extend(hydro_polys);
+                let mut ll = lines_land;
+                ll.extend(lines_hydro);
+                for blk in pack_and_build_blocks(shift, cx, cy, &lp, &ll, &tpois_named) {
+                    let offb = map_binoff + map_land.len() as u32;
+                    let lw = (blk.len() / 4) as u16;
+                    map_land.extend_from_slice(&blk);
+                    entries.push((0x400 | LAND_PROF, lw, offb));
+                }
             }
             nsub += entries.len();
             if entries.len() > 15 {

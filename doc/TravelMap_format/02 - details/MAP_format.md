@@ -367,6 +367,26 @@ functions.
 | 0x30–0x37 | 4 |
 | 0x71–0x73 | 100 |
 
+> **Water lines vs road lines (writer-critical).** A line's low code selects its reader: `0x20`
+> (type 3) = **hydrography** line → consumes the `0x10` water annotation; `0x30..0x37`/`0x21`
+> (types 4/2) = **road** line → its reader expects the `0x11` roadinfo. So a water line MUST use
+> feature `0x20`, never `0x30`. Emitting `0x10` on a `0x30` line makes the road reader misparse the
+> annotation and reboots the head unit (confirmed on car, trial #09l vs #09n). Stock N6E2: water
+> lines `0x20`.
+>
+> **Road-class tiers (writer-critical — why roads looked identical).** Within the road lines the
+> feature **low byte encodes the road class tier**, and the base-map renderer styles the pen by it
+> (weight + colour). Stock N6E2 (Kraków bbox) uses: `0x30` motorway/expressway (unnamed, shown at
+> coarse zoom) · `0x31` trunk/primary (major arterials) · `0x32` secondary · `0x33`
+> tertiary/unclassified/residential (local through-streets) · `0x21` minor local
+> (service/track/footway/path, **L3-only, and stock puts NO `0x11` on these**). `u8ConvertFeature2LineType`
+> collapses `0x30..0x37`→type 4 and `0x21`→type 2, so the class survives as the low byte, NOT via the
+> `0x11` netclass (stock road lines carry no `0x11` at all — the netclass→`u8GetUserDefRoadClass` table
+> only refines roads that do have a `0x11`). Writing a single code for every road therefore draws every
+> road — motorways and footpaths alike — with one pen. `osm2map` maps OSM `highway` → tier via
+> `road_feat_low()`; minor tier (`0x21`) is emitted annotation-free and shown at L3 only. See
+> `trials/10 - road class styles`.
+
 ### POI (list 2) — code → type
 
 | code (hex) | type |
@@ -582,8 +602,9 @@ packed sequence, each `{u8 size, u8 type, payload[size-2]}` (`size` counts itsel
 > (`{size=8, type=4, u16=0x0020, u8=0x11, u8=0x00, u8=0x00, u8=0x00}`); per `u16ConvertDCMInfo` the `u16=0x0020`
 > low byte is the DCM-class selector (`u8ConvertDCMClass(0x20)=2`), `0x11`/`0x00` are two ×10-scaled params
 > (model height/extent, rendering-side), last 2 bytes unused. **`osm2map` emits `0x04` only on `0x9c`**
-> (`OSM2MAP_POLY_ANN=cat`, the default; `all` = on every polygon, `0` = none). Water-area `0x48` should carry
-> `0x10` (hydro builds) — see TODO.
+> (`OSM2MAP_POLY_ANN=cat`, the default; `all` = on every polygon, `0` = none). Water-area `0x48`
+> polygons carry the `0x10` water annotation (`{size=4,type=0x10,u16 code}`), stock's dominant lake value
+> `type=2/class=8` = `0x28` — `osm2map` emits this by default (`OSM2MAP_WATER_POLY_ANN=0` disables).
 >
 > Mechanism: `map_tclMapElm_Landuse_Area::ReadFrom @ 0x003ebc64` resolves a style via
 > `GetPolyConfigOffsetBasedOnType` and dereferences `configTable[off]` (→ `*(float*)(pmVar13+0x38)`); the
@@ -727,11 +748,15 @@ Key facts (all verified on data):
 Two shapes (100 % parse rate over 64,027 name annotations on Poland L2+L3):
 
 ```
-name:   {u8 n_langs, (u8 lang, u8 len) x n_langs, utf8 str1 .. strn, 0x00}
+name:   {u8 n_langs, (u8 variant, u8 len) x n_langs, utf8 str1 .. strn, 0x00}
 number: {ascii digits, 0x00}
 ```
 
 Multi-language variants are stored in one record (e.g. `["SZÁPÁR", "SZÁPÂR"]`).
+**`variant` is always `0xA7`** in stock (a name-string variant/locale tag, not a per-language code).
+This byte is **write-critical for rendering**: `map2osm` ignores it (a wrong value still decodes), but
+the head-unit renderer only draws a label whose `variant == 0xA7` — emitting `0x00` produces a label that
+is present in the file but shows nothing on the car (observed). Stock stores names UPPERCASE.
 Interning on the write side: `u16AddText` / `u16DumpToMem` @ `0x008e0584`.
 
 ### Annotation type distribution (N6E2 L2+L3 sample)
@@ -1006,8 +1031,10 @@ present to avoid the `0x307` logs.
   profiles; no shipped region ships a lone `0I` carrying roads/POI. osm2map previously did exactly that, so
   `#07` now emits `10I` (hydro only) + `02` (land), each L2 tile → its shard (+ `0I` when it has water). This
   matches Bosch's layout and cluster/overlay conventions; since the renderer is profile-agnostic it is a
-  *fidelity* change, **not** a proven reboot fix. Confirm on-car with #07 first, then isolate (#06: inject one
-  osm2map block into a stock map tile at its empty slot's off/len).
+  *fidelity* change, **not** a proven reboot fix. **SUPERSEDED by `#09`:** the actual `#07`/`#08` reboot was the
+  water-line feature-code bug (below), and stock N6E2 keeps *inland* water in the land shard, so the validated
+  default is now single-profile `02` (`OSM2MAP_HYDRO=land`); the `10I` hydro-overlay split stays available only
+  for coastal regions (`OSM2MAP_HYDRO=overlay`, untested on car).
 
 - **Geometry is NOT the fault vector (offline reader-model verification).** Decompiling the actual
   path `vConvertMapData` @0x00847604 → `u16Convert` @0x008d8248 → `u16ConvertCells` @0x008d7660 shows
@@ -1022,8 +1049,11 @@ present to avoid the `0x307` logs.
   @0x008d56a0/0x008d582c/0x008d5a10 return a FastMap **type** via switch/if-ranges (default → `0`), never
   index a table by the raw feature ⇒ no OOB from feature codes. Our `#07` scan: poly low ∈
   {0x38,0x39,0x3A,0x2B,0x48,0x9C}, line low = {0x30}, POI low ⊂ valid `{1-9,0x10-0x17,0x21,0x22}`, feature
-   high byte = 0 everywhere; annotations only {0x10,0x11,0x7A}. So `feature`/annot cannot crash the renderer
-   and none of our POIs fall to an unmapped type. NOTE (corrected §7): the polygon high byte only feeds the
+    high byte = 0 everywhere; annotations only {0x10,0x11,0x7A}. So `feature`/annot cannot crash the renderer
+    and none of our POIs fall to an unmapped type. **CORRECTION (later #09):** the feature *dispatcher* never
+    faults, but the code still selects the *reader*, and a code/annotation **mismatch** (water line written as
+    road `0x30` while carrying `0x10`) mis-sizes the record → reader OOB → reboot — "individually valid codes" ≠
+    "safe in combination"; see the water-line bullet below. NOTE (corrected §7): the polygon high byte only feeds the
    **clamped** `PolygonConfigMatrix::u16GetDisplayScale@0x8d9b08` (no OOB), so even a high byte of 0 is not a
    fault source in DAPIAPP — reinforcing that the reboot is downstream. Combined with tasks A–C (bounded
     reader; no map-profile registry / fatal-`0x204`; profile-agnostic renderer), **every DAPIAPP data-path
@@ -1039,8 +1069,23 @@ present to avoid the `0x307` logs.
   display-scale, sub-type, geometry, or quantity issue — all of those were excluded and #05/#06c passed tmcheck
   yet rebooted. **It is category-specific** (see §8 cross-tab): `0x04` (DCM) belongs only to `residential`
   (`0x9c`), which stock annotates ~100 %; grass/forest/cemetery are legitimately unannotated. **Fix: emit the
-  `0x04` DCM (`08 04 20 00 11 00 00 00`) on `0x9c` polygons** — `osm2map build_block` default `OSM2MAP_POLY_ANN=cat`.
+   `0x04` DCM (`08 04 20 00 11 00 00 00`) on `0x9c` polygons** — `osm2map build_block` default `OSM2MAP_POLY_ANN=cat`.
+- **RESOLVED (car test #09n/#09p): a second reboot — the same misparse class — was WATER LINES carrying feature
+  low `0x30`.** After #06c3 was fixed, #07/#08/#09f still rebooted. Isolation ladder `trials/09` (09a–09f, 09j–09p,
+  one feature per rung, tmcheck-PASS) localised it: 09a–09e (land areas, POI, `0x21` cities, `0x14` road-nums) all
+  render; **09f (water) reboots**. Splitting 09f: **09m = water *areas* → OK**, **09l = water *lines* → reboot**.
+  Root cause: osm2map wrote water lines with feature low `0x30`, which `u8ConvertFeature2LineType` classifies as
+  a **ROAD** line (type 4) → the road reader parses the record expecting a `0x11` roadinfo but finds our `0x10`
+  water annotation → misparse → fault (identical failure mode to the `0x9c` case). Stock N6E2 puts inland water in
+  the same shard as land and uses feature low **`0x20`** (type 3 = hydrography) for water lines. **Fixes: water-line
+  feature `0x30`→`0x20` (`OSM2MAP_WATERLINE_FEAT`, default) AND default water into the land shard (`02`) rather than
+  a separate `0I` — `OSM2MAP_HYDRO=land` (default), `overlay` retained for coastal `0I`.** Confirmed on car:
+  09n (lines@0x20) and 09p (full map, single `02`) both boot + render. NOTE: every prior water reboot is now fully
+  explained by the `0x30`-line bug, so the `0I`/multi-slot mechanism itself was **never proven broken** — `overlay`
+  stays available for coastal regions pending a dedicated test. `#07`'s two-profile split above was a *fidelity*
+  guess, not a fix; single-`02` inland is both stock-matching and car-validated.
 - **`diag/tmcheck.py` is now a calibrated strict model.** Added: marker hi==`0xFFFF`, in-block marker len ==
+
   slot length (accessor window), multi sub-entry count ≤ 15. Calibrated to **PASS 17/17 diverse stock
   regions** (1–9 profiles, oceanic→dense; e.g. N4E2/N5E1/N5E2/N6E1) with zero false positives, still FAILs
   the old #04 empty-slot bug (`0x8412`), and PASSes `#07`.
