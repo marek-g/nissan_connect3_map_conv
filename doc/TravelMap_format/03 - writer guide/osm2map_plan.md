@@ -267,9 +267,14 @@ support unconfirmed) plus hole-aware tile clipping. Net on `krzeszowice` full: l
 
 ### 4.4 Names & text records
 
-`name` + `name:*` → a text record in the block, referenced by a `0x7A` name annotation whose payload is the
-record's word offset. Multi-language names become the multi-string text record (`read_text_record` inverse:
-`{u8 n, u16 len_i…, bytes…}` — verify exact layout in M3).
+`name` → a text record referenced by a **`0x7A`** annotation whose payload is the record's word offset.
+Confirmed record layout (see MAP_format §Text records): `{u8 n_langs, (u8 variant=0xA7, u8 len) × n, utf8
+bytes…, 0x00}`. The **`0xA7` variant flag is mandatory for rendering** (`NAME_STR_FLAG`; a `0x00` there
+decodes but draws nothing on the car). Names are emitted on **POIs** (`0x7A` + optional `0x21`) **and on
+road lines** (`0x7A` street label laid in the annotDesc run after `0x11`/`0x14`, order `0x11,0x14,0x7A`)
+— minor tier `0x21` roads carry no label (stock). `OSM2MAP_STREETNAMES=0` suppresses road-name labels;
+`OSM2MAP_ROADNUM=0` suppresses `0x14` refs. Multi-language (`name:*`) multi-string records are still single-
+string on the write side.
 
 ### 4.5 `state` and feature high byte
 

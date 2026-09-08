@@ -109,7 +109,11 @@ struct LineCell {
     feat: u16,
     ann: Option<(u8, u16, u32)>,
     rn: Option<String>, // road number (OSM `ref`) -> 0x14 annotation + text record
+    nm: Option<String>, // street name (OSM `name`) -> 0x7A annotation + text record
 }
+
+// A parsed road: (polyline, roadinfo word, OSM `ref` -> 0x14, OSM `name` -> 0x7A street label).
+type Road = (Vec<(i64, i64)>, u16, Option<String>, Option<String>);
 
 // Words a road-number (0x14) feature contributes beyond its 0x11: the 8-byte annotation record
 // (2 words) plus its text-pool record ({u8 n,u8 0,u8 len,bytes,NUL} word-aligned). 0 if no ref.
@@ -256,12 +260,13 @@ fn build_block(
             w += poly_ann_words(k);
         }
     }
-    // Line annotations live in the `w` region; a road may carry 0x11 (roadinfo) AND 0x14 (road
-    // number) back-to-back (count in annotDesc = number of records laid here, per map2osm's
-    // annotation walk). The 0x14 payload points at a text record in the POI text pool (same
-    // multi-string format), so the road-number text words are reserved after the POI names.
+    // Line annotations live in the `w` region; a road may carry 0x11 (roadinfo), 0x14 (road
+    // number) and 0x7A (street name) laid back-to-back (annotDesc count = number of records here,
+    // per map2osm's annotation walk; each record self-describes size+type). The 0x14 and 0x7A
+    // payloads point at text records in the shared text pool, reserved after the POI names.
     let mut line_ann = vec![None::<u32>; nl]; // 0x11/0x10 record word (if present)
     let mut line_rn = vec![None::<u32>; nl]; // 0x14 record word (if present)
+    let mut line_nm = vec![None::<u32>; nl]; // 0x7A street-name record word (if present)
     let mut line_nrec = vec![0u16; nl]; // annotDesc count for the cell
     for i in 0..nl {
         if let Some((typ, _, _)) = lines[i].ann {
@@ -273,6 +278,13 @@ fn build_block(
             line_rn[i] = Some(w);
             w += 2; // 0x14 = 8 bytes
             line_nrec[i] += 1;
+        }
+        if let Some(s) = lines[i].nm.as_deref() {
+            if !s.is_empty() && s.len() <= 254 {
+                line_nm[i] = Some(w);
+                w += 1; // 0x7A = 4 bytes {size, type, u16 textRef}
+                line_nrec[i] += 1;
+            }
         }
     }
     // POI annotations: 0x7A name (1 word) + optional 0x21 city (1 word), laid contiguously; annotDesc
@@ -315,6 +327,15 @@ fn build_block(
             }
         }
     }
+    let mut nm_text = vec![0u32; nl];
+    for i in 0..nl {
+        if let Some(s) = lines[i].nm.as_deref() {
+            if !s.is_empty() && s.len() <= 254 {
+                nm_text[i] = tw;
+                tw += ((s.len() + 4 + 3) / 4) as u32;
+            }
+        }
+    }
     let total_words = tw;
 
     let mut b = vec![0u8; (total_words as usize) * 4];
@@ -333,12 +354,14 @@ fn build_block(
         cw += 3;
     }
     for (i, lc) in lines.iter().enumerate() {
-        // annotDesc start = first record laid (0x11 then 0x14); count = line_nrec[i].
-        let (t0, t1) = match (line_ann[i], line_rn[i]) {
-            (Some(aw), _) => (aw as u16, line_nrec[i]),
-            (None, Some(rw)) => (rw as u16, line_nrec[i]),
-            (None, None) => (0, 0),
+        // annotDesc start = first record laid (order 0x11, 0x14, 0x7A); count = line_nrec[i].
+        let t0 = match (line_ann[i], line_rn[i], line_nm[i]) {
+            (Some(aw), _, _) => aw as u16,
+            (None, Some(rw), _) => rw as u16,
+            (None, None, Some(nw)) => nw as u16,
+            (None, None, None) => 0,
         };
+        let t1 = if line_nrec[i] != 0 { line_nrec[i] } else { 0 };
         write_cell(&mut b, cw, lc.feat, line_idx[i] as u16, lc.pts.len() as u16, t0, t1);
         cw += 3;
     }
@@ -386,6 +409,19 @@ fn build_block(
                 put_u16(&mut b, bo + 2, rn_text[i] as u16);
                 put_u16(&mut b, bo + 4, 0); // mid
                 put_u16(&mut b, bo + 6, 0); // status
+            }
+        }
+    }
+
+    // street-name 0x7A annotations (4 bytes): {size=4, type=0x7A, u16 textRef -> road's name text
+    // record (same multi-string format as POI names, with the 0xA7 variant flag)}.
+    for i in 0..nl {
+        if let (Some(nw), Some(s)) = (line_nm[i], lines[i].nm.as_deref()) {
+            if !s.is_empty() && s.len() <= 254 {
+                let bo = (nw as usize) * 4;
+                b[bo] = 4;
+                b[bo + 1] = 0x7A;
+                put_u16(&mut b, bo + 2, nm_text[i] as u16);
             }
         }
     }
@@ -445,6 +481,20 @@ fn build_block(
         if let Some(s) = lines[i].rn.as_deref() {
             if !s.is_empty() && s.len() <= 254 {
                 let tp = (rn_text[i] as usize) * 4;
+                let bytes = s.as_bytes();
+                b[tp] = 1; // n strings
+                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock 0xA7)
+                b[tp + 2] = bytes.len() as u8;
+                b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
+                b[tp + 3 + bytes.len()] = 0; // terminator
+            }
+        }
+    }
+    // street-name text records (same multi-string format, single string, 0xA7 variant flag).
+    for i in 0..nl {
+        if let Some(s) = lines[i].nm.as_deref() {
+            if !s.is_empty() && s.len() <= 254 {
+                let tp = (nm_text[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
                 b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock 0xA7)
@@ -819,7 +869,7 @@ fn bbox_diag2(pts: &[(i64, i64)]) -> f64 {
 // Per-tile geometry after clipping.
 #[derive(Default)]
 struct TileShapes {
-    roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)>, // (slice, roadinfo_w, ref)
+    roads: Vec<Road>,                         // (slice, roadinfo_w, ref, name)
     waterways: Vec<(Vec<(i64, i64)>, u16)>, // (slice, watercode)
     areas: Vec<(Vec<(i64, i64)>, u16)>,     // (clipped ring, landuse feat)
     pois: Vec<(i64, i64, u16, String, u16)>, // (lon, lat, feat, name, city_bits)
@@ -829,7 +879,7 @@ struct TileShapes {
 // polygons are clipped so each cell holds only the slice inside its extent.
 fn distribute(
     level: usize,
-    roads: &[(Vec<(i64, i64)>, u16, Option<String>)],
+    roads: &[Road],
     waterways: &[(Vec<(i64, i64)>, u16)],
     areas: &[(Vec<(i64, i64)>, u16)],
     pois: &[(i64, i64, u16, String, u16)],
@@ -848,7 +898,7 @@ fn distribute(
             .push((*lo, *la, *feat, name.clone(), *city));
     }
 
-    for (geom, w, rn) in roads {
+    for (geom, w, rn, nm) in roads {
         let (c0, c1, r0, r1) = cell_span(level, geom);
         for c in c0..=c1 {
             for r in r0..=r1 {
@@ -861,7 +911,7 @@ fn distribute(
                     map.entry(cell_to_k(level, c, r))
                         .or_default()
                         .roads
-                        .push((slice, *w, rn.clone()));
+                        .push((slice, *w, rn.clone(), nm.clone()));
                 }
             }
         }
@@ -1146,7 +1196,7 @@ fn sim_eps(level: usize) -> i64 {
 
 struct OsmData {
     pois: Vec<(i64, i64, u16, String, u8, u16)>, // (lon_pau, lat_pau, feat, name, rank, city_bits)
-    roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)>, // (geometry, roadinfo_w, ref)
+    roads: Vec<Road>,                        // (geometry, roadinfo_w, ref, name)
     waterways: Vec<(Vec<(i64, i64)>, u16)>,  // (geometry, watercode)
     areas: Vec<(Vec<(i64, i64)>, u16)>,      // (open ring, landuse feat)
 }
@@ -1205,7 +1255,7 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
     let mut reader = quick_xml::Reader::from_reader(BufReader::new(file));
     let mut nodes: HashMap<i64, (i64, i64)> = HashMap::new();
     let mut pois: Vec<(i64, i64, u16, String, u8, u16)> = Vec::new();
-    let mut roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)> = Vec::new();
+    let mut roads: Vec<Road> = Vec::new();
     let mut waterways: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
     let mut areas: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
 
@@ -1327,7 +1377,8 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                                 if pts.len() >= 2 {
                                     let toll = matches!(g("toll"), Some("yes") | Some("1"));
                                     let refn = g("ref").map(|s| s.to_string());
-                                    roads.push((pts, roadinfo_w(hw, g("junction"), toll), refn));
+                                    let stname = g("name").map(|s| s.to_string());
+                                    roads.push((pts, roadinfo_w(hw, g("junction"), toll), refn, stname));
                                 }
                             } else if let Some(ww) = g("waterway") {
                                 if pts.len() >= 2 {
@@ -1461,7 +1512,12 @@ fn pack_and_build_blocks(
             Some((t, _, _)) => ann_words(t),
             None => 0,
         };
-        cost.push(3 + lc.pts.len() as u32 + aw + rn_words(lc.rn.as_deref()));
+        // 0x7A street-name: 1 annotation word + its text record, when a name is present.
+        let nm_w = match lc.nm.as_deref() {
+            Some(s) if !s.is_empty() && s.len() <= 254 => 1 + ((s.len() + 4 + 3) / 4) as u32,
+            _ => 0,
+        };
+        cost.push(3 + lc.pts.len() as u32 + aw + rn_words(lc.rn.as_deref()) + nm_w);
     }
     for p in pois {
         cost.push(poi_cost(p.3.unwrap_or("")) + if p.4 != 0 { 1 } else { 0 });
@@ -1766,15 +1822,24 @@ fn main() {
         let mnc = mnc_arr[L];
         let mpr = mpr_arr[L];
         let roadnum_on = env_on("OSM2MAP_ROADNUM");
+        let streetname_on = env_on("OSM2MAP_STREETNAMES");
 
         // Per-level selection: roads by netclass (w & 7), POIs by rank. Waterways and landuse
         // areas are local detail, so they're only emitted at L1/L2 (not the whole-country L0).
-        // OSM2MAP_ROADNUM=0 clears every `ref`, which suppresses the whole 0x14 + text path.
-        let roads: Vec<(Vec<(i64, i64)>, u16, Option<String>)> = osm
+        // OSM2MAP_ROADNUM=0 clears every `ref` (suppresses 0x14 + text); OSM2MAP_STREETNAMES=0 clears
+        // every street `name` (suppresses the 0x7A line label + text).
+        let roads: Vec<Road> = osm
             .roads
             .iter()
-            .filter(|(_, w, _)| (*w & 7) <= mnc as u16)
-            .map(|(g, w, rn)| (g.clone(), *w, if roadnum_on { rn.clone() } else { None }))
+            .filter(|(_, w, _, _)| (*w & 7) <= mnc as u16)
+            .map(|(g, w, rn, nm)| {
+                (
+                    g.clone(),
+                    *w,
+                    if roadnum_on { rn.clone() } else { None },
+                    if streetname_on { nm.clone() } else { None },
+                )
+            })
             .collect();
         let pois: Vec<(i64, i64, u16, String, u16)> = osm
             .pois
@@ -1819,27 +1884,28 @@ fn main() {
             // Split this tile's content into LAND (shard profile `02`) vs HYDRO (`0I` overlay).
             // Bosch's `0I` carries ONLY water: waterway lines + water-area polygons, never roads/POI.
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
-            for (geom, w, rn) in &ts.roads {
+            for (geom, w, rn, nm) in &ts.roads {
                 let nc = *w & 7;
                 let feat = road_feat_low(nc);
                 if nc >= 7 {
-                    // Minor local (0x21, type-2 line): stock emits NO roadinfo on these, and 0x21+0x11
-                    // is unproven on the reader -> keep it annotation-free like stock (never rebooted).
-                    lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None });
+                    // Minor local (0x21, type-2 line): stock emits NO roadinfo and no label on these, and
+                    // 0x21+0x11 is unproven on the reader -> keep it annotation-free (never rebooted).
+                    lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None, nm: None });
                 } else {
-                    // Road tiers (0x30..0x33, type-4): keep the proven 0x11 roadinfo (+ 0x14 ref).
+                    // Road tiers (0x30..0x33, type-4): proven 0x11 roadinfo (+ 0x14 ref + 0x7A street name).
                     lines_land.push(LineCell {
                         pts: geom.clone(),
                         feat,
                         ann: Some((0x11, *w, 0)),
                         rn: rn.clone(),
+                        nm: nm.clone(),
                     });
                 }
             }
             let mut lines_hydro: Vec<LineCell> = Vec::with_capacity(ts.waterways.len());
             if water_lines {
                 for (geom, wc) in &ts.waterways {
-                    lines_hydro.push(LineCell { pts: geom.clone(), feat: waterline_feat, ann: Some((0x10, *wc, 0)), rn: None });
+                    lines_hydro.push(LineCell { pts: geom.clone(), feat: waterline_feat, ann: Some((0x10, *wc, 0)), rn: None, nm: None });
                 }
             }
             let mut land_polys: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
