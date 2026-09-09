@@ -249,15 +249,16 @@ Sub-attributes (same roadinfo word): `junction=roundabout` → road_type 2; `hig
 a road class). The full roadinfo payload is written as annotation type `0x11` `{u16 w, u32 d}`.
 
 **Line feature LOW byte = the class tier the renderer styles by (writer-critical).** The drawn pen comes
-from the line's feature low code, not from the `0x11` netclass. **Stock-measured** (`map2osm` over N6E2
-Kraków L2 ways that carry `0x11`): one code per arterial class — `nc 0→0x30` motorway · `nc1→0x31` trunk ·
-`nc2→0x32` primary · `nc3→0x33` secondary · `nc≥4→0x21` **all local** (tertiary/unclassified/residential/
-living_street/service/track/path). The classed arterials `0x30..0x33` carry `0x11` roadinfo; the `0x21` local
-network carries **no `0x11`** and dominates the finest level (stock L3 = only `0x21` lines). So `road_feat_low`
-emits `0x11` only on `0x30..0x33` and none on `0x21` (`max_road_nc` cap `[…,6,7]`). Trap #1: one code for all
-roads (old constant `0x30`) draws everything with one pen. Trap #2: a WRONG tier mapping is equally bad —
-`osm2map` briefly mapped `nc4-6→0x33`, i.e. the yellow *secondary* pen, so residential looked like a major
-(trial #13); fixed to the table above in #14. See MAP_format §7, `trials/13`, `trials/14`.
+from the line's feature low code, not from the `0x11` netclass. The pen is fully RE-derived
+(`u8ConvertFeature2LineSubType` → `GetLineConfigOffsetRoad` → `3D/config.bin` line-data; see MAP_format
+§road tiers for the measured colour table): `nc0→0x30` blue motorway · `nc1→0x31` blue trunk ·
+`nc2→0x32` pale-cyan primary · `nc3/nc4→0x33` pale-cyan secondary/tertiary (matches #09 ul. Żbicka) ·
+`nc5→0x34` **white** unclassified · `nc6→0x35` **white** residential · `nc7→0x21` thin local
+(service/track/path). Bosch's stock actually hairlines everything below secondary as `0x21` (stock L3 =
+only `0x21`), which reads too thin, so we lift `nc5/nc6` to the white type-4 pen. All `0x30..0x36` are
+type-4 and carry `0x11`; only `0x21` omits it. Trap #1: one code for all roads (old constant `0x30`)
+draws everything with one pen. Trap #2: `nc≥4→0x21` (#14) made every local street an invisible hairline.
+See MAP_format §road tiers, `trials/13` (boot), `trials/14` (too thin), `trials/15` (theme colours).
 
 Road number: `ref=*` → a `0x14` annotation laid right after the `0x11` (`annotDesc.count = 2`), payload
 `{u16 textRef, u16 mid=0, u16 status=0}`; `textRef` points at a name-format text record holding the ref

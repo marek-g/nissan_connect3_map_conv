@@ -374,20 +374,33 @@ functions.
 > annotation and reboots the head unit (confirmed on car, trial #09l vs #09n). Stock N6E2: water
 > lines `0x20`.
 >
-> **Road-class tiers (writer-critical — why roads looked identical, and why residential looked like a
-> major).** Within the road lines the feature **low byte encodes the road class tier**, and the base-map
-> renderer styles the pen (weight + colour) by it. STOCK-MEASURED via `map2osm` over the N6E2 Kraków
-> bbox (L2 ways that carry a `0x11` roadinfo → netclass), the map is **one code per arterial class**:
-> `0x30` motorway (`nc0`) · `0x31` trunk (`nc1`) · `0x32` primary (`nc2`) · `0x33` secondary (`nc3`) ·
-> `0x21` **everything local** (`nc≥4`: tertiary/unclassified/residential/living_street/service/track/path).
-> The classed arterials `0x30..0x33` carry a `0x11` roadinfo (netclass + link/roundabout/toll); the
-> `0x21` local network carries **no `0x11`** and dominates the finest level (stock **L3 has only `0x21`
-> lines**, no `0x30..0x37`). `u8ConvertFeature2LineType` collapses `0x30..0x37`→type 4 and `0x21`→type 2.
-> Two writer traps: (1) one code for every road draws motorways and footpaths with the same pen; (2)
-> getting the tier mapping wrong is as bad — `osm2map` once emitted `nc4-6→0x33`, which is the yellow
-> *secondary* pen, so residential streets rendered as major roads (trial #13 visual bug; fixed in #14 to
-> the table above). `osm2map` maps OSM `highway` → netclass via `roadinfo_w()`, then netclass → tier via
-> `road_feat_low()`. See `trials/13` (codes boot OK) and `trials/14` (stock-correct tiers).
+> **Road-class tiers (writer-critical).** Within the road lines the feature **low byte is the SOLE pen
+> selector** — colour + width + border all come from it. Chain (two binaries): the raw feature →
+> `u8ConvertFeature2LineSubType` (DAPIAPP) → `subtypeRoad` (`0x30..0x37`→`0x3d..0x44`, `0x21`→`0x15`) →
+> `GetLineConfigOffsetRoad(subtypeRoad,subAttributes)` (procmapengine) → an offset into the theme
+> `3D/config.bin` line-data table (`g_LineReferences[offset]` → RGBA body + border + width). The netclass
+> in the `0x11` roadinfo drives routing/level-select, **NOT** the pen. Colours measured directly from
+> `3D/config.bin` (the theme the car loads — confirmed by the pale-cyan `0x33` seen on-car for ul. Żbicka
+> in #09), with day widths:
+>
+> | feature | subtypeRoad | body RGB | look | w | Bosch tier |
+> |---------|-------------|----------|------|---|------------|
+> | 0x30 | 0x3d | (15,17,133) | blue  | 7 | motorway (`nc0`) |
+> | 0x31 | 0x3e | (0,108,180) | blue  | 6 | trunk (`nc1`) |
+> | 0x32 | 0x3f | (147,227,226) | pale-cyan | 5 | primary (`nc2`) |
+> | 0x33 | 0x40 | (147,227,226) | pale-cyan | 4 | secondary (`nc3`) — also used for tertiary (`nc4`) |
+> | 0x34 | 0x41 | (255,255,255) | **white** + border 0x171717 | 2 | local road — unclassified (`nc5`) |
+> | 0x35 | 0x42 | (255,255,255) | **white** + border | 2 | local road — residential (`nc6`) |
+> | 0x36/0x37 | 0x43/0x44 | (255,255,255) | white (thinner) | 2/1 | (reserves) |
+> | 0x21 | 0x15 | (type-2 LINE) | thin grey | — | service/track/path (`nc7`) — **no `0x11`** |
+>
+> Bosch's OWN stock N6E2 puts everything below secondary in the thin `0x21` type-2 line (stock L3 has only
+> `0x21`), so on the stock map local streets are hairlines — but that reads as *too thin* next to the
+> yellow/pale arterials, so `osm2map` upgrades `nc4→0x33` (matches the #09 look the user approved) and
+> `nc5/nc6→0x34/0x35` (the WHITE local-road pen that stock under-uses). `0x34..0x36` share the same reader
+> path as `0x30..0x33` (type-4, `GetLineConfigOffsetRoad` handles `0x41..0x44`) → car-safe. `osm2map`
+> maps OSM `highway`→netclass via `roadinfo_w()`, then netclass→feature via `road_feat_low()`. See
+> `trials/13` (codes boot), `trials/14` (nc≥4→0x21 — read as too thin), `trials/15` (theme-derived colours).
 
 
 ### POI (list 2) — code → type

@@ -1231,25 +1231,30 @@ fn roadinfo_w(hw: &str, junction: Option<&str>, toll: bool) -> u16 {
     w
 }
 
-// Road-tier line feature LOW byte from the 3-bit netclass. STOCK-MEASURED (map2osm over stock N6E2
-// Kraków L2, ways carrying 0x11 roadinfo):
-//   nc 0 motorway   -> 0x30
-//   nc 1 trunk      -> 0x31
-//   nc 2 primary    -> 0x32
-//   nc 3 secondary  -> 0x33
-//   nc >=4 (tertiary / unclassified / residential / living_street / service / track / path) -> 0x21
-// The stock L3 network contains ONLY 0x21 lines (no 0x30..0x37 at all): everything below "secondary"
-// is the local street network drawn as the thin 0x21 line WITHOUT a 0x11 roadinfo. The earlier mapping
-// put nc2->0x31 / nc3->0x32 / nc4-6->0x33, i.e. one arterial tier too bright AND residential/unclassified
-// as 0x33 = the yellow "secondary" pen -> residential looked like a major road on the car (trial #13
-// visual bug). 0x30..0x33 are all type-4 road codes (u8ConvertFeature2LineType); 0x21 is the type-2
-// "line" local-network code (validated on car, trial #13a).
+// Road-tier line feature LOW byte from the 3-bit netclass. The pen (colour + width + border) is chosen
+// ONLY by this feature byte: u8ConvertFeature2LineSubType maps 0x30..0x37 -> subtypeRoad 0x3d..0x44 (all
+// type-4 ROAD) and 0x21 -> subtypeRoad 0x15 (type-2 thin LINE); GetLineConfigOffsetRoad then indexes the
+// theme 3D/config.bin line-data table (g_LineReferences[offset] -> RGBA body + border + width). Measured
+// straight from that config (the theme the car actually loads, confirmed by the pale-cyan 0x33 seen on
+// car for ul. Żbicka in #09):
+//   0x30 blue      (15,17,133) w7/10  motorway     <- nc0
+//   0x31 blue      (0,108,180) w6/8   trunk        <- nc1
+//   0x32 pale-cyan (147,227,226) w5/7  primary     <- nc2
+//   0x33 pale-cyan (147,227,226) w4/6  secondary   <- nc3  (also tertiary: matches #09 Żbicka "greenish")
+//   0x34 white     (255,255,255) w2/3  local road  <- nc5  (unclassified)
+//   0x35 white     (255,255,255) w2/3  local road  <- nc6  (residential; the white pen that was missing)
+//   0x21 thin LINE (type-2)              service/track/path <- nc7 (no 0x11 roadinfo, stock L3 model)
+// 0x34/0x35 are WHITE and go through the SAME type-4 reader as 0x30..0x33 (subtypeRoad 0x41/0x42 handled
+// by GetLineConfigOffsetRoad) -> safe. The netclass in the 0x11 annotation drives routing/level-select,
+// NOT the pen, so this byte is the sole styling knob. 0x36/0x37 are also white (thinner) reserves.
 fn road_feat_low(nc: u16) -> u16 {
     match nc & 7 {
         0 => 0x30,
         1 => 0x31,
         2 => 0x32,
-        3 => 0x33,
+        3 | 4 => 0x33,
+        5 => 0x34,
+        6 => 0x35,
         _ => 0x21,
     }
 }
@@ -2069,20 +2074,19 @@ fn main() {
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
             for (geom, w, rn, nm) in &ts.roads {
                 let nc = *w & 7;
-                // Stock-measured road feature codes (see road_feat_low): nc0..3 = 0x30/0x31/0x32/0x33
-                // arterials (carry 0x11 roadinfo); nc>=4 = local street network = 0x21 thin line, NO 0x11
-                // (stock L3 has only 0x21 lines). roadclass off => the proven flat #09p: every road 0x30+0x11.
-                // OSM2MAP_MINOR21=0 folds the local network into tier 0x33 + 0x11 (safe non-0x21 fallback).
+                // Road feature codes (see road_feat_low): nc0..6 = 0x30/0x31/0x32/0x33/0x33/0x34/0x35,
+                // all type-4 ROAD -> carry the 0x11 roadinfo (+ 0x14 ref + 0x7A name). nc7 (service/
+                // track/path) = 0x21 type-2 thin local line, NO 0x11 (stock L3 model). roadclass off =>
+                // the proven flat #09p: every road 0x30 + 0x11. OSM2MAP_MINOR21=0 avoids the risky thin
+                // 0x21 entirely by folding nc7 into the thinnest type-4 white 0x36.
                 let rc = roadclass_on();
-                let local = rc && nc >= 4;
                 let feat = if !rc {
                     0x30
-                } else if local {
-                    if minor21_on() { 0x21 } else { 0x33 }
                 } else {
-                    road_feat_low(nc)
+                    let f = road_feat_low(nc);
+                    if f == 0x21 && !minor21_on() { 0x36 } else { f }
                 };
-                // 0x21 local lines carry no roadinfo/label (stock); road tiers + flat #09p keep 0x11.
+                // 0x21 thin local lines carry no roadinfo/label (stock); all type-4 tiers keep 0x11.
                 if feat == 0x21 {
                     lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None, nm: None });
                 } else {
