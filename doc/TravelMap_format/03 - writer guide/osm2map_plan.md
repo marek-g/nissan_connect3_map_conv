@@ -18,14 +18,50 @@ Companion to [`writer_guide.md`](writer_guide.md) (byte-level how-to), [`MAP_for
   `/home/marek/Ext/reverse_engineering/NissanMaps/OSM-map/krzeszowice.osm` (Kraków area, ~50.1N 19.6E).
 - **Output:** a full set of decompressed `N6E2AA.IDX` + `N6E2<prof>.MAP` files for a chosen region, then
   compressed to CPRNAV_2 and dropped into `DATA/DATA/MAP/` **in place of** the originals.
-- **Region parameter:** `-r N6E2` selects which region's files to (re)generate. The region's geographic
-  extent (BBox in PAU) is **copied from the existing region file**, so tiles align with what the car
-  already expects and no signed directory file (`IDX_CNT.TBL` / `RPITABLE.RPI` / `NAV_ROOT.DAT`) changes.
+- **Region parameter:** `-r NAME` / `--region=NAME` (or env `OSM2MAP_REGION`; default `N6E2`) selects
+  which region's files to (re)generate. The region's geographic extent (BBox in PAU) **and** its IDX
+  descriptive prefix `[0x00..partOff*4)` are **copied from the stock `<NAME>AA.IDX`** (`STOCK_DIR`,
+  default the unpacked firmware MAP dir), so tiles align with what the car expects. A non-default
+  region **requires** its stock IDX (bbox + the region-specific header fields); missing stock aborts.
+  BBox may be overridden with `--bbox W,S,E,N`. No signed directory file (`IDX_CNT.TBL` /
+  `RPITABLE.RPI` / `NAV_ROOT.DAT`) changes. See §Per-region profile/resinf model below for what is
+  actually region-specific and the rules that keep a regenerated region consistent.
 - **Signature-safe:** only `DATA/DATA/MAP/*` (unsigned base) is touched (§signature.md §7). Rendering does
   not involve the RNW patches, so no patch neutralization is needed for a render test.
-  - *Caveat:* replacing `.MAP`/`.IDX` changes file sizes. Confirm `DATA/DATA/MISC/CONTENT.DAT` (signed,
+  - *Caveat:* replacing `.MAP`/`.IDX` changes file sizes. Confirm `DATA/DATA/DATA/MISC/CONTENT.DAT` (signed,
     first 2 KB) does not encode per-file sizes — see signature.md §7.4. If it does, sizes must be kept
     stable or that file is out of reach.
+
+### Per-region profile / resinf model (from `RPITABLE.RPI`, `DAPIAPP.OUT` `resinf/*`, stock IDX audit)
+
+Established what "per-region" really means, so we don't over- or under-engineer region selection:
+
+- **The stock IDX descriptive prefix `[0x00..0x1f8)` is essentially GLOBAL build metadata.** Every
+  descriptive string (Project `2-LCN2KAI_NT_EUR_2021.1`, `MapName`, `MILL_RELEASE`, copyright) is
+  **byte-identical across all regions**. The only region-specific header fields are: bbox
+  (`0x04` W/S/E/N — we patch), `binOff` (`0x00` — we overwrite), and **`u16 @0x1a` = number of profile
+  MAP files** in that region (e.g. N6E2=5: `0x2,0xe,0x11,0x12,0x2a`; N6E1=9). The differing byte near
+  `0x6b` is only a build timestamp, not a region name — no string patching is ever needed.
+- **`0x1a` is NOT a render gate.** The car renders the tiles our IDX slot-table points at (profile
+  word per tile); it does not iterate `0x1a`. Proof: N6E2 was car-validated emitting only profile
+  `0x02` while the copied stock prefix still says `5`. Keep `0x1a` as the copied stock value **and do
+  not delete the other stock profile MAP files** → header count stays consistent with files present.
+- **Feature category ids resolve via GLOBAL firmware tables** — there is no per-region category
+  catalog inside the region files — so the same OSM→feature mapping renders identically in any region.
+- **`resinf`** = a DAPI IPC subsystem (`components/dapi/resinf/ri_Worker.cpp`) that advertises
+  `RegionCode`/`ProfileId` metadata sourced from the **signed** `RPITABLE.RPI` / `IDX_CNT.TBL`
+  (`DATA/CONNECT/MAP`). It keys on region+profile (not our `@0x1a`) and is often a no-op ("No Update
+  necessary"). It never inspects bytes we generate.
+
+**Rules for choosing a target region (encoded in `gen/regions.json`):**
+1. Only regions already in the stock MAP dir may be replaced (the signed root/RPI tables list them;
+   adding a NEW region is out of reach). 24 land regions qualify.
+2. Emit land profile **`0x02`** (car-validated). Only **N6E1 and N6E2** ship `0x02`, so they are the
+   fully RPI-consistent targets for a straight `0x02` swap. For a region lacking `0x02`, emit a profile
+   id its stock already uses (via `OSM2MAP_PROFILE`, §C) so its signed RPI already declares it — do not
+   invent a profile id that no RPI entry covers.
+3. Deploy = overwrite `<NAME>AA.IDX` + `<NAME>1<prof>.MAP` (+`.TCI`) only; **leave the other stock
+   profile files in place** (keeps `@0x1a`/file-count consistent; they are present-but-unreferenced).
 
 Out of scope for v1 (later milestones): RNW routing writer, "augment existing map" mode, re-signing.
 
@@ -212,14 +248,16 @@ Sub-attributes (same roadinfo word): `junction=roundabout` → road_type 2; `hig
 (interconnect) or 1 (long ramp); `toll=yes` → toll bits; `route=ferry` → ferry bits (emitted as a line, not
 a road class). The full roadinfo payload is written as annotation type `0x11` `{u16 w, u32 d}`.
 
-**Line feature LOW byte = the class tier that the renderer styles by (writer-critical).** The netclass in
-`0x11` does **not** set the drawn pen (stock road lines carry no `0x11` yet render with full hierarchy); the
-pen comes from the line's feature low code, which is a class tier. `road_feat_low(nc)` derives it from the
-netclass: `nc 0→0x30` motorway · `1–2→0x31` trunk/primary · `3→0x32` secondary · `4–6→0x33`
-tertiary/unclassified/residential · `7→0x21` minor local (service/track/path/footway/pedestrian). Road tiers
-keep the `0x11`; the `0x21` minor tier is emitted **annotation-free** (stock does, and `0x21`+`0x11` is
-unproven on the reader) and shown at **L3 only** (`max_road_nc` cap `[…,6,7]`). Using one code for all roads
-(the old constant `0x30`) is what made every road/footpath look identical — see MAP_format §7, `trials/10`.
+**Line feature LOW byte = the class tier the renderer styles by (writer-critical).** The drawn pen comes
+from the line's feature low code, not from the `0x11` netclass. **Stock-measured** (`map2osm` over N6E2
+Kraków L2 ways that carry `0x11`): one code per arterial class — `nc 0→0x30` motorway · `nc1→0x31` trunk ·
+`nc2→0x32` primary · `nc3→0x33` secondary · `nc≥4→0x21` **all local** (tertiary/unclassified/residential/
+living_street/service/track/path). The classed arterials `0x30..0x33` carry `0x11` roadinfo; the `0x21` local
+network carries **no `0x11`** and dominates the finest level (stock L3 = only `0x21` lines). So `road_feat_low`
+emits `0x11` only on `0x30..0x33` and none on `0x21` (`max_road_nc` cap `[…,6,7]`). Trap #1: one code for all
+roads (old constant `0x30`) draws everything with one pen. Trap #2: a WRONG tier mapping is equally bad —
+`osm2map` briefly mapped `nc4-6→0x33`, i.e. the yellow *secondary* pen, so residential looked like a major
+(trial #13); fixed to the table above in #14. See MAP_format §7, `trials/13`, `trials/14`.
 
 Road number: `ref=*` → a `0x14` annotation laid right after the `0x11` (`annotDesc.count = 2`), payload
 `{u16 textRef, u16 mid=0, u16 status=0}`; `textRef` points at a name-format text record holding the ref
@@ -268,13 +306,18 @@ support unconfirmed) plus hole-aware tile clipping. Net on `krzeszowice` full: l
 ### 4.4 Names & text records
 
 `name` → a text record referenced by a **`0x7A`** annotation whose payload is the record's word offset.
-Confirmed record layout (see MAP_format §Text records): `{u8 n_langs, (u8 variant=0xA7, u8 len) × n, utf8
-bytes…, 0x00}`. The **`0xA7` variant flag is mandatory for rendering** (`NAME_STR_FLAG`; a `0x00` there
-decodes but draws nothing on the car). Names are emitted on **POIs** (`0x7A` + optional `0x21`) **and on
-road lines** (`0x7A` street label laid in the annotDesc run after `0x11`/`0x14`, order `0x11,0x14,0x7A`)
-— minor tier `0x21` roads carry no label (stock). `OSM2MAP_STREETNAMES=0` suppresses road-name labels;
-`OSM2MAP_ROADNUM=0` suppresses `0x14` refs. Multi-language (`name:*`) multi-string records are still single-
-string on the write side.
+Confirmed record layout (see MAP_format §Text records): `{u8 n_langs, (u8 variant, u8 len) × n, bytes…,
+0x00}`. **The `variant` flag is safety-critical** (`name_str_flag()` / `OSM2MAP_TEXTVARIANT`). Stock uses
+`0xA7` = "display label" but **only on Bosch-normalised text: UPPERCASE ASCII, diacritics stripped
+(KRAKOWIE/KOSCIUSZKI), often a 2-variant record**. CAR-VALIDATED (#12 vs #10/A/B/C): writing `0xA7` with
+our **raw OSM text (mixed case + UTF-8 diacritics) REBOOTS the head unit** (its text engine OOBs on the
+non-normalised payload); `0x00` = "no display string", boots and draws nothing. Because label normalisation
+is NOT yet implemented, the writer **defaults the flag to `0x00`** → names are stored but not drawn (safe,
+== the car-validated #09p). Making labels render is a separate task: normalise to the Bosch form (upper +
+de-diacritic, likely the 2-variant record), then flip the flag back to `0xA7`. Names attach on **POIs**
+(`0x7A` + optional `0x21`) and **road lines** (`0x7A` after `0x11`/`0x14`); `OSM2MAP_STREETNAMES=0` drops
+road-name labels, `OSM2MAP_ROADNUM=0` drops `0x14` refs.
+
 
 ### 4.5 `state` and feature high byte
 
@@ -338,14 +381,33 @@ New crate mirroring `map2osm_rs` (deps: `quick-xml`, `serde`). Modules:
 CLI (mirrors the sibling tools):
 
 ```
-osm2map_rs <in.osm> -r N6E2 [-l 123] [-o OUTDIR] [--bbox W,S,E,N]
-            → writes decompressed N6E2AA.IDX + N6E2<prof>.MAP to OUTDIR
+osm2map_rs <in.osm> [OUTDIR] [-r NAME | --region=NAME] [--bbox W,S,E,N]
+   # env: OSM2MAP_REGION, STOCK_DIR, plus OSM2MAP_MODE/HYDRO/… feature switches
+   # NAME's stock <NAME>AA.IDX (in STOCK_DIR) supplies bbox + IDX descriptive prefix.
+   # levels L0..L3 always emitted. Legacy positional form `<in.osm> <OUTDIR> "W,S,E,N"` still works.
+   → writes decompressed <NAME>AA.IDX + <NAME>1<prof>.MAP (+ .TCI) to OUTDIR (default /tmp/opencode/wt2)
 # then:
-cprnav_compress_rs <OUTDIR>/N6E2AA.IDX  <deploy>/N6E2AA.IDX   (per file)
+cprnav_compress_rs <OUTDIR>/<NAME>AA.IDX  <deploy>/<NAME>AA.IDX   (per file)
 ```
 
 Memory: process per tile; never hold the whole region as formatted strings. The largest reference profile is
 160 MB decompressed, so streaming + integer coords matter.
+
+### 7.1 Bulk pipeline (multi-region) — `gen/`
+
+- **`gen/mk_manifest.py` [STOCK_DIR] [-o regions.json] [--all]`** → enumerates every stock region and
+  emits `gen/regions.json`: bbox (PAU + deg), partOff, all profile ids + sizes, `has_land`,
+  `has_profile_02`. This manifest is the complete set of legally-replaceable regions (24 land).
+- **`gen/pipeline.sh`** — manifest → per-region `osmium extract` → `osm2map --region` → **tmcheck gate**
+  → `cprnav` deploy pack, run **in parallel** (`xargs -P`) and **resumable** (per-region `.done` stamp).
+  - `--src <file.pbf | dir/>`  single OSM source (whole `europe-latest.osm.pbf`, or a dir of geofabrik
+    country files) each region is clipped from with `osmium extract -b W,S,E,N`. If `WORK/region_<REG>.osm`
+    already exists it is used as-is (lets you hand-place an extract / avoid re-downloading).
+  - default targets = the `0x02` regions (N6E1, N6E2 = car-safe). `--all` = every land region, each with
+    its OWN largest land profile id (via `OSM2MAP_PROFILE`, so its signed RPI declares it) — UNVALIDATED.
+  - `--regions "N6E1 N5E1"`, `--profile ID`, `--jobs N`, `--force`, `--out DIR`. Output:
+    `OUT/regions/<REG>/{raw/, deploy/DATA/{DATA,CONNECT}/MAP/, *.log, .done|FAILED}` + a PASS/FAIL summary.
+- Proven end-to-end on **N6E1** (Luxembourg window) → `trials/11 - region swap N6E1 (luxembourg)/`.
 
 ---
 

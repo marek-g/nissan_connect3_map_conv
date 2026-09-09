@@ -374,18 +374,21 @@ functions.
 > annotation and reboots the head unit (confirmed on car, trial #09l vs #09n). Stock N6E2: water
 > lines `0x20`.
 >
-> **Road-class tiers (writer-critical — why roads looked identical).** Within the road lines the
-> feature **low byte encodes the road class tier**, and the base-map renderer styles the pen by it
-> (weight + colour). Stock N6E2 (Kraków bbox) uses: `0x30` motorway/expressway (unnamed, shown at
-> coarse zoom) · `0x31` trunk/primary (major arterials) · `0x32` secondary · `0x33`
-> tertiary/unclassified/residential (local through-streets) · `0x21` minor local
-> (service/track/footway/path, **L3-only, and stock puts NO `0x11` on these**). `u8ConvertFeature2LineType`
-> collapses `0x30..0x37`→type 4 and `0x21`→type 2, so the class survives as the low byte, NOT via the
-> `0x11` netclass (stock road lines carry no `0x11` at all — the netclass→`u8GetUserDefRoadClass` table
-> only refines roads that do have a `0x11`). Writing a single code for every road therefore draws every
-> road — motorways and footpaths alike — with one pen. `osm2map` maps OSM `highway` → tier via
-> `road_feat_low()`; minor tier (`0x21`) is emitted annotation-free and shown at L3 only. See
-> `trials/10 - road class styles`.
+> **Road-class tiers (writer-critical — why roads looked identical, and why residential looked like a
+> major).** Within the road lines the feature **low byte encodes the road class tier**, and the base-map
+> renderer styles the pen (weight + colour) by it. STOCK-MEASURED via `map2osm` over the N6E2 Kraków
+> bbox (L2 ways that carry a `0x11` roadinfo → netclass), the map is **one code per arterial class**:
+> `0x30` motorway (`nc0`) · `0x31` trunk (`nc1`) · `0x32` primary (`nc2`) · `0x33` secondary (`nc3`) ·
+> `0x21` **everything local** (`nc≥4`: tertiary/unclassified/residential/living_street/service/track/path).
+> The classed arterials `0x30..0x33` carry a `0x11` roadinfo (netclass + link/roundabout/toll); the
+> `0x21` local network carries **no `0x11`** and dominates the finest level (stock **L3 has only `0x21`
+> lines**, no `0x30..0x37`). `u8ConvertFeature2LineType` collapses `0x30..0x37`→type 4 and `0x21`→type 2.
+> Two writer traps: (1) one code for every road draws motorways and footpaths with the same pen; (2)
+> getting the tier mapping wrong is as bad — `osm2map` once emitted `nc4-6→0x33`, which is the yellow
+> *secondary* pen, so residential streets rendered as major roads (trial #13 visual bug; fixed in #14 to
+> the table above). `osm2map` maps OSM `highway` → netclass via `roadinfo_w()`, then netclass → tier via
+> `road_feat_low()`. See `trials/13` (codes boot OK) and `trials/14` (stock-correct tiers).
+
 
 ### POI (list 2) — code → type
 
@@ -753,10 +756,15 @@ number: {ascii digits, 0x00}
 ```
 
 Multi-language variants are stored in one record (e.g. `["SZÁPÁR", "SZÁPÂR"]`).
-**`variant` is always `0xA7`** in stock (a name-string variant/locale tag, not a per-language code).
-This byte is **write-critical for rendering**: `map2osm` ignores it (a wrong value still decodes), but
-the head-unit renderer only draws a label whose `variant == 0xA7` — emitting `0x00` produces a label that
-is present in the file but shows nothing on the car (observed). Stock stores names UPPERCASE.
+**`variant == 0xA7`** in stock (a "real display label" flag; `0x00` = "no display string"). This byte is
+**write-critical and safety-critical**: `map2osm` ignores it (a wrong value still decodes), so round-trips
+never caught this. CAR-VALIDATED (trial #12 vs #10/A/B/C): `0x00` boots and draws nothing (label present
+in file, skipped by the render engine); `0xA7` **REBOOTS the head unit** when the string payload is raw
+OSM text (mixed case / UTF-8 diacritics), because it hands the payload to Bosch's text engine, which
+then walks off the buffer. `0xA7` is only safe on **Bosch-normalised labels: UPPERCASE ASCII with
+diacritics stripped (KRAKOWIE, KOSCIUSZKI), often a 2-variant record**. Our writer therefore defaults
+the flag to `0x00` (no-label, safe) until label normalisation is implemented — see `name_str_flag()` /
+`OSM2MAP_TEXTVARIANT`.
 Interning on the write side: `u16AddText` / `u16DumpToMem` @ `0x008e0584`.
 
 ### Annotation type distribution (N6E2 L2+L3 sample)

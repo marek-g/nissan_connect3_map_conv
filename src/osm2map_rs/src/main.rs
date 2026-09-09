@@ -11,16 +11,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 const SHIFTS: [i32; 4] = [13, 10, 7, 4]; // coordinate delta shift per level (u32a low byte)
 const LATPART: [u8; 4] = [1, 5, 10, 10]; // partition bytes +1 and +2
 const TILECNT: [usize; 4] = [1, 25, 2500, 250000];
 
-// N6E2 region BBox in PAU (measured from the stock decompressed N6E2AA.IDX).
-const W: i64 = 0x0CCCCCCC; // 18.00 deg E
-const S: i64 = 0x21999997; // 47.25 deg N
-const E: i64 = 0x19999998; // 36.00 deg E
-const N: i64 = 0x2851EB82; // 56.70 deg N
+// Target region bbox in PAU, resolved at startup (see setup_region). Defaults = the N6E2 region
+// (measured from the stock decompressed N6E2AA.IDX): 18.00E / 47.25N / 36.00E / 56.70N.
+static BBOX: OnceLock<(i64, i64, i64, i64)> = OnceLock::new();
+const DEF_W: i64 = 0x0CCCCCCC; // 18.00 deg E
+const DEF_S: i64 = 0x21999997; // 47.25 deg N
+const DEF_E: i64 = 0x19999998; // 36.00 deg E
+const DEF_N: i64 = 0x2851EB82; // 56.70 deg N
+fn W() -> i64 { BBOX.get().map_or(DEF_W, |b| b.0) }
+fn S() -> i64 { BBOX.get().map_or(DEF_S, |b| b.1) }
+fn E() -> i64 { BBOX.get().map_or(DEF_E, |b| b.2) }
+fn N() -> i64 { BBOX.get().map_or(DEF_N, |b| b.3) }
 
 const PAU: f64 = (1i64 << 31) as f64 / 180.0;
 fn deg2pau(d: f64) -> i64 {
@@ -39,7 +46,31 @@ const STATE: u16 = 0x25D4; // measured from reference N6E2 polygon cells
 // `0I` are already declared for region N6E2 in the resinf metadata catalog. base32(low) -> file name
 // via `<REGION>1<B32[low/32]><B32[low%32]>`.
 const HYDRO_PROF: u16 = 0x12; // "0I" -> N6E210I.MAP : waterways + water areas, no POI
-const LAND_PROF: u16 = 0x02; // "02" -> N6E2102.MAP : roads + POI + land-use polygons
+const LAND_PROF: u16 = 0x02; // "02" -> N6E2102.MAP : roads + POI + land-use polygons (default)
+// Emitted LAND profile id. Default 0x02 (car-validated on N6E2/N6E1, the two stock regions that
+// carry 0x02). For a region whose signed RPI declares a different land profile, set OSM2MAP_PROFILE
+// (hex "0x16" or decimal) to a profile id that region already ships, so its RPI metadata matches.
+static LAND_P: OnceLock<u16> = OnceLock::new();
+fn land_prof() -> u16 {
+    *LAND_P.get().unwrap_or(&LAND_PROF)
+}
+// Road-class feature-code emission. Default ON: per-class line feature LOW byte (0x30..0x33 by netclass,
+// 0x21 for minor). OSM2MAP_ROADCLASS=0 reverts EVERY road to the proven #09p encoding (feat 0x30 + 0x11
+// roadinfo, no 0x21 minor special-case, no tier variation) — isolates the road-class change from the
+// street-name change when a build reboots the head unit.
+static ROADCLASS: OnceLock<bool> = OnceLock::new();
+fn roadclass_on() -> bool {
+    *ROADCLASS.get().unwrap_or(&true)
+}
+
+// Sub-switch of ROADCLASS: emit the minor-local tier as feature 0x21 (type-2 line, stock's minor class,
+// NEVER car-flashed before #10) vs folding nc>=7 into the proven local-road tier 0x33 + 0x11. Default on
+// (stock model). OSM2MAP_MINOR21=0 keeps road tiers 0x31/0x32/0x33 but avoids the risky 0x21 code, so a
+// road-class card can be split into "safe tiers" vs "the 0x21 experiment" if a flash reboots.
+static MINOR21: OnceLock<bool> = OnceLock::new();
+fn minor21_on() -> bool {
+    *MINOR21.get().unwrap_or(&true)
+}
 
 // water-area polygon feature low byte (area_feat returns this for natural/landuse water)
 fn is_water_area_feat(feat: u16) -> bool {
@@ -69,22 +100,123 @@ fn poly_full_feat(low_only: u16) -> u16 {
     ((hi as u16) << 8) | (low_only & 0xFF)
 }
 
-const REGION: &str = "N6E2"; // whole region replaced; ids must be declared in its resinf catalog
+// Target region id (e.g. "N6E2"). Resolved at startup via setup_region(); whole-region replace,
+// so ids must be declared in that region's resinf catalog (hence the per-region IDX header).
+const DEF_REGION: &str = "N6E2";
+static REGION_NAME: OnceLock<String> = OnceLock::new();
+fn region() -> &'static str {
+    REGION_NAME.get().map(String::as_str).unwrap_or(DEF_REGION)
+}
 // profile id -> MAP/TCI file base name: <REGION> + "1" + base32(low byte as 2 chars).
 fn prof_file(prof: u16) -> String {
     const B32: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
     let v = (prof & 0xFF) as usize;
     let s: String = [B32[v / 32], B32[v % 32]].iter().map(|&c| c as char).collect();
-    format!("{}1{}", REGION, s)
+    format!("{}1{}", region(), s)
 }
 
-// Stock header/info/metadata templates (verbatim Bosch bytes, static across every region — see
-// doc). The MAP info/partition/metadata block [0x20..binOff) and the IDX descriptive block are
-// byte-identical for all shipped regions; only W/S/E/N + profile differ, which we patch at runtime.
-// Emitting these verbatim (instead of a fabricated 0x40 header with zeros) is what keeps the head
-// unit's strict parser from walking garbage pointers in [0x20..binOff) and rebooting.
+// Stock header/info/metadata templates (verbatim Bosch bytes). The MAP info/partition/metadata
+// block [0x20..binOff) is Bosch-static across every region; only W/S/E/N + profile word + total
+// size differ, which we patch at runtime. Emitting these verbatim (instead of a fabricated header
+// full of zeros) is what keeps the head unit's strict parser from walking garbage pointers in
+// [0x20..binOff) and rebooting.
 const MAP_HEADER: &[u8] = include_bytes!("../templates/map_header.bin"); // [0x00..0x7bc), binOff=0x7bc
-const IDX_HEADER: &[u8] = include_bytes!("../templates/idx_header.bin"); // [0x00..partOff*4), partOff=0x7e
+// IDX descriptive prefix [0x00..partOff*4) (partOff=0x7e, =504 B). Defaults to the baked N6E2
+// template; setup_region() replaces it with the target region's OWN stock <REGION>AA.IDX prefix,
+// because that block carries region-specific bytes (the resinf catalog reference) the renderer
+// needs. Everything from partOff*4 onward is regenerated by emit_idx.
+const IDX_HEADER: &[u8] = include_bytes!("../templates/idx_header.bin"); // [0x00..0x1f8), partOff=0x7e
+static IDX_HDR: OnceLock<Vec<u8>> = OnceLock::new();
+fn idx_header() -> &'static [u8] {
+    IDX_HDR.get().map(Vec::as_slice).unwrap_or(IDX_HEADER)
+}
+
+// Default directory holding the stock decompressed MAP set (*AA.IDX / *1XX.MAP), used to source
+// each region's real IDX header + bbox. Override with the STOCK_DIR env var.
+const DEF_STOCK_DIR: &str =
+    "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/MAP";
+
+// Resolve the target region from argv/env BEFORE any geometry runs: set the region name, read the
+// region bbox + per-region IDX descriptive prefix from the stock <REGION>AA.IDX, and (when no
+// explicit --bbox was passed) adopt that stock bbox as the clip window. Non-default regions REQUIRE
+// their stock IDX (for the resinf catalog); with none present this aborts rather than emitting an
+// IDX that points the reader at the wrong catalog. Default = N6E2 (works from the baked template).
+fn setup_region(region_arg: Option<String>, bbox_given: bool) {
+    let name = region_arg
+        .or_else(|| env::var("OSM2MAP_REGION").ok())
+        .unwrap_or_else(|| DEF_REGION.to_string());
+    let stock_dir =
+        env::var("STOCK_DIR").unwrap_or_else(|_| DEF_STOCK_DIR.to_string());
+    REGION_NAME.set(name.clone()).ok();
+
+    // Emitted land profile id (default 0x02). OSM2MAP_PROFILE accepts hex ("0x16"/"16" with 0x) or
+    // decimal. Lets a region lacking 0x02 emit a profile its signed RPI already declares.
+    if let Ok(p) = env::var("OSM2MAP_PROFILE") {
+        let t = p.trim();
+        let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u16::from_str_radix(h, 16)
+        } else {
+            t.parse::<u16>()
+        };
+        match v {
+            Ok(v) if v != HYDRO_PROF => {
+                LAND_P.set(v).ok();
+            }
+            Ok(_) => {
+                eprintln!("error: OSM2MAP_PROFILE must not be the hydro profile 0x12");
+                std::process::exit(2)
+            }
+            Err(_) => {
+                eprintln!("error: OSM2MAP_PROFILE '{p}' is not a valid hex (0x..) or decimal id");
+                std::process::exit(2)
+            }
+        }
+    }
+
+    // Road-class code emission (default on). OSM2MAP_ROADCLASS=0/off reverts roads to #09p 0x30+0x11.
+    if let Ok(v) = env::var("OSM2MAP_ROADCLASS") {
+        ROADCLASS.set(!matches!(v.trim(), "0" | "off" | "false")).ok();
+    }
+    // Minor-tier 0x21 emission (default on). OSM2MAP_MINOR21=0 folds nc>=7 into tier 0x33+0x11 instead.
+    if let Ok(v) = env::var("OSM2MAP_MINOR21") {
+        MINOR21.set(!matches!(v.trim(), "0" | "off" | "false")).ok();
+    }
+
+    let stock_path = format!("{}/{}AA.IDX", stock_dir, name);
+    let have = std::path::Path::new(&stock_path).exists();
+    if have {
+        let d = fs::read(&stock_path).expect("read stock IDX");
+        let g32 = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as i64;
+        let w = g32(4);
+        let s = g32(8);
+        let e = g32(12);
+        let n = g32(16);
+        if !bbox_given {
+            BBOX.set((w, s, e, n)).ok();
+        }
+        let part_off = u16::from_le_bytes([d[0x14], d[0x15]]) as usize;
+        let plen = (part_off * 4).min(d.len());
+        IDX_HDR.set(d[..plen].to_vec()).expect("set IDX header");
+        let d2 = |v: i64| (v as u32 as f64) / PAU;
+        eprintln!(
+            "[region {}] stock {} bbox W{:.2} S{:.2} E{:.2} N{:.2}  (IDX prefix {} B)",
+            name, stock_path, d2(w), d2(s), d2(e), d2(n), plen
+        );
+    } else if name != DEF_REGION {
+        eprintln!(
+            "error: region '{}' has no stock IDX at {} — cannot resolve its resinf catalog / bbox.\n\
+             set STOCK_DIR to the stock MAP directory, or run region '{}'.",
+            name, stock_path, DEF_REGION
+        );
+        std::process::exit(2);
+    } else {
+        eprintln!(
+            "[region {}] no stock IDX ({}); using baked template + default bbox",
+            name, stock_path
+        );
+    }
+}
+
 
 fn put_u16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -133,11 +265,26 @@ fn ann_words(typ: u8) -> u32 {
 }
 
 // Name/number text-record string-variant flag byte. A text record is
-//   { u8 n_strings, (u8 NAME_STR_FLAG, u8 len) × n, bytes×n, u8 term }
-// Stock always uses 0xA7 here; map2osm ignores this byte (so a wrong value still decodes) but the
-// head-unit renderer refuses to draw a label whose variant flag isn't 0xA7 — that's why our names
-// decoded fine yet showed nothing on the car.
-const NAME_STR_FLAG: u8 = 0xa7;
+//   { u8 n_strings, (u8 <flag>, u8 len) × n, bytes×n, u8 term }   (4-byte aligned in the pool)
+// The flag byte is fixed-width (1 B) so its VALUE never shifts record offsets (map2osm ignores it
+// either way). CAR-VALIDATED (trial #12 vs #10/A/B/C): the head unit REBOOTS on 0xA7 when the string
+// payload is our raw OSM text (mixed case + UTF-8 diacritics), and boots with 0x00. Ground truth from
+// stock N6E2 text pool: 0xA7 IS the real "display label" flag, but stock stores labels Bosch-
+// normalised — UPPERCASE ASCII with diacritics stripped (KRAKOWIE/KOSCIUSZKI, not Kraków/Kościuszki),
+// frequently as a 2-variant record (02 a7 len a7 len). 0x00 means "no display string": the renderer
+// skips the label engine entirely, so it never parses the payload -> no reboot, no label (exactly the
+// #09p state: names present in data but nothing drawn). Emitting 0xA7 hands our raw UTF-8 to that
+// engine, which walks off the buffer. Until labels are Bosch-normalised, DEFAULT 0x00 (safe);
+// OSM2MAP_TEXTVARIANT=<hex/dec> overrides for experiments (0xa7 = will reboot on non-normalised text).
+fn name_str_flag() -> u8 {
+    let s = env::var("OSM2MAP_TEXTVARIANT").unwrap_or_else(|_| "0".into());
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(h, 16).unwrap_or(0)
+    } else {
+        s.parse::<u8>().unwrap_or_else(|_| u8::from_str_radix(s, 16).unwrap_or(0))
+    }
+}
 
 // Generic boolean env switch; default ON unless set to 0/n/none/false/off. Used by the #09
 // isolation ladder so each rung differs from the car-proven land baseline by exactly one mechanism.
@@ -469,7 +616,7 @@ fn build_block(
                 let tp = (text_word[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
-                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock always 0xA7; 0x00 => renderer skips the label)
+                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT; #09p used 0x00, 0xA7 unvalidated)
                 b[tp + 2] = bytes.len() as u8;
                 b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
                 b[tp + 3 + bytes.len()] = 0; // terminator
@@ -483,7 +630,7 @@ fn build_block(
                 let tp = (rn_text[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
-                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock 0xA7)
+                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT)
                 b[tp + 2] = bytes.len() as u8;
                 b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
                 b[tp + 3 + bytes.len()] = 0; // terminator
@@ -497,7 +644,7 @@ fn build_block(
                 let tp = (nm_text[i] as usize) * 4;
                 let bytes = s.as_bytes();
                 b[tp] = 1; // n strings
-                b[tp + 1] = NAME_STR_FLAG; // string-variant flag (stock 0xA7)
+                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT)
                 b[tp + 2] = bytes.len() as u8;
                 b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
                 b[tp + 3 + bytes.len()] = 0; // terminator
@@ -509,8 +656,8 @@ fn build_block(
 
 // Tile center (PAU) for tile K of `level` — mirrors map2osm_rs tile_extent+tile_box.
 fn tile_center(level: usize, k: i64) -> (i64, i64) {
-    let w = E - W;
-    let h = N - S;
+    let w = E() - W();
+    let h = N() - S();
     let (rw, rs, re, rn) = match level {
         0 => (0, 0, w, h),
         1 => {
@@ -536,10 +683,10 @@ fn tile_center(level: usize, k: i64) -> (i64, i64) {
     };
     let a = SHIFTS[level] as i64 + 1;
     let al = |x: i64| (x >> a) << a;
-    let w2 = al(W + rw);
-    let s2 = al(S + rs);
-    let e2 = al(W + re);
-    let n2 = al(S + rn);
+    let w2 = al(W() + rw);
+    let s2 = al(S() + rs);
+    let e2 = al(W() + re);
+    let n2 = al(S() + rn);
     ((w2 + e2) / 2, (s2 + n2) / 2)
 }
 
@@ -557,8 +704,8 @@ fn grid_size(level: usize) -> i64 {
 
 // Aligned rectangular extent (PAU) of cell (col,row) at `level` — mirrors map2osm tile_extent.
 fn cell_rect(level: usize, col: i64, row: i64) -> (i64, i64, i64, i64) {
-    let w = E - W;
-    let h = N - S;
+    let w = E() - W();
+    let h = N() - S();
     let G = grid_size(level);
     let rw = w * col / G;
     let rs = h * row / G;
@@ -566,7 +713,7 @@ fn cell_rect(level: usize, col: i64, row: i64) -> (i64, i64, i64, i64) {
     let rn = h * (row + 1) / G;
     let a = SHIFTS[level] as i64 + 1;
     let al = |x: i64| (x >> a) << a;
-    (al(W + rw), al(S + rs), al(W + re), al(S + rn))
+    (al(W() + rw), al(S() + rs), al(W() + re), al(S() + rn))
 }
 
 // (col,row) -> tile index K, inverse of the level's space-filling mapping.
@@ -590,11 +737,11 @@ fn cell_to_k(level: usize, col: i64, row: i64) -> i64 {
 
 // Which cell a point falls in at `level` (0..G-1 per axis).
 fn point_col_row(level: usize, lon: i64, lat: i64) -> (i64, i64) {
-    let w = E - W;
-    let h = N - S;
+    let w = E() - W();
+    let h = N() - S();
     let G = grid_size(level);
-    let fx = ((lon - W) as f64 / w as f64).clamp(0.0, 1.0) * (1.0 - 1e-9);
-    let fy = ((lat - S) as f64 / h as f64).clamp(0.0, 1.0) * (1.0 - 1e-9);
+    let fx = ((lon - W()) as f64 / w as f64).clamp(0.0, 1.0) * (1.0 - 1e-9);
+    let fy = ((lat - S()) as f64 / h as f64).clamp(0.0, 1.0) * (1.0 - 1e-9);
     ((fx * G as f64) as i64, (fy * G as f64) as i64)
 }
 
@@ -1084,22 +1231,25 @@ fn roadinfo_w(hw: &str, junction: Option<&str>, toll: bool) -> u16 {
     w
 }
 
-// Road-tier line feature LOW byte from the 3-bit netclass, matching stock N6E2 usage:
-//   nc 0      -> 0x30  (motorway/expressway; fewest, unnamed, shown at coarse zoom)
-//   nc 1-2    -> 0x31  (trunk / primary: major arterials)
-//   nc 3      -> 0x32  (secondary)
-//   nc 4-6    -> 0x33  (tertiary / unclassified / residential: local through-streets)
-//   nc 7      -> 0x21  (minor local: service / track / path / footway / pedestrian)
-// The line's feature LOW code is what the base-map renderer styles with (pen weight + colour,
-// per u8ConvertFeature2LineType type + class tier). Emitting one code (0x30) for every road is what
-// made motorways and footpaths look identical on the car. 0x30..0x33 are all type-4 road codes (the
-// same reader our proven-safe 0x30+0x11 records use); 0x21 is the type-2 "line" minor class.
+// Road-tier line feature LOW byte from the 3-bit netclass. STOCK-MEASURED (map2osm over stock N6E2
+// Kraków L2, ways carrying 0x11 roadinfo):
+//   nc 0 motorway   -> 0x30
+//   nc 1 trunk      -> 0x31
+//   nc 2 primary    -> 0x32
+//   nc 3 secondary  -> 0x33
+//   nc >=4 (tertiary / unclassified / residential / living_street / service / track / path) -> 0x21
+// The stock L3 network contains ONLY 0x21 lines (no 0x30..0x37 at all): everything below "secondary"
+// is the local street network drawn as the thin 0x21 line WITHOUT a 0x11 roadinfo. The earlier mapping
+// put nc2->0x31 / nc3->0x32 / nc4-6->0x33, i.e. one arterial tier too bright AND residential/unclassified
+// as 0x33 = the yellow "secondary" pen -> residential looked like a major road on the car (trial #13
+// visual bug). 0x30..0x33 are all type-4 road codes (u8ConvertFeature2LineType); 0x21 is the type-2
+// "line" local-network code (validated on car, trial #13a).
 fn road_feat_low(nc: u16) -> u16 {
     match nc & 7 {
         0 => 0x30,
-        1 | 2 => 0x31,
-        3 => 0x32,
-        4 | 5 | 6 => 0x33,
+        1 => 0x31,
+        2 => 0x32,
+        3 => 0x33,
         _ => 0x21,
     }
 }
@@ -1456,10 +1606,10 @@ fn emit_map(path: &Path, data: &[u8], prof: u16) {
     let mut d = MAP_HEADER.to_vec();
     d.resize(filesize, 0);
     d[4..8].copy_from_slice(&(filesize as u32).to_le_bytes()); // fileSize
-    d[8..12].copy_from_slice(&(W as u32).to_le_bytes());
-    d[12..16].copy_from_slice(&(S as u32).to_le_bytes());
-    d[16..20].copy_from_slice(&(E as u32).to_le_bytes());
-    d[20..24].copy_from_slice(&(N as u32).to_le_bytes());
+    d[8..12].copy_from_slice(&(W() as u32).to_le_bytes());
+    d[12..16].copy_from_slice(&(S() as u32).to_le_bytes());
+    d[16..20].copy_from_slice(&(E() as u32).to_le_bytes());
+    d[20..24].copy_from_slice(&(N() as u32).to_le_bytes());
     d[0x1e..0x20].copy_from_slice(&(0x8400u16 | prof).to_le_bytes()); // profile word @0x1e
     d[binoff..].copy_from_slice(data);
     fs::write(path, &d).expect("write MAP");
@@ -1467,10 +1617,10 @@ fn emit_map(path: &Path, data: &[u8], prof: u16) {
 
 // Map-region bbox into a header buffer at `base` (W,S,E,N as u32 LE, 4 consecutive words).
 fn patch_bbox(d: &mut [u8], base: usize) {
-    d[base..base + 4].copy_from_slice(&(W as u32).to_le_bytes());
-    d[base + 4..base + 8].copy_from_slice(&(S as u32).to_le_bytes());
-    d[base + 8..base + 12].copy_from_slice(&(E as u32).to_le_bytes());
-    d[base + 12..base + 16].copy_from_slice(&(N as u32).to_le_bytes());
+    d[base..base + 4].copy_from_slice(&(W() as u32).to_le_bytes());
+    d[base + 4..base + 8].copy_from_slice(&(S() as u32).to_le_bytes());
+    d[base + 8..base + 12].copy_from_slice(&(E() as u32).to_le_bytes());
+    d[base + 12..base + 16].copy_from_slice(&(N() as u32).to_le_bytes());
 }
 
 // ---- sub-block packing -----------------------------------------------------
@@ -1562,7 +1712,7 @@ fn pack_and_build_blocks(
 // tables follow immediately after it (binOff = first tile table). Multi-entry slots keep their
 // sub-entry arrays appended after all four tile tables, exactly like stock dense tiles do.
 fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u16, u32)>>>; 4]) {
-    let mut d = IDX_HEADER.to_vec();
+    let mut d = idx_header().to_vec();
     let part_off_word = u16::from_le_bytes([d[0x14], d[0x15]]); // stock value (0x7e), kept as-is
     let pt = (part_off_word as usize) * 4; // partition table byte offset
     if d.len() < pt {
@@ -1702,22 +1852,55 @@ fn emit_tci(path: &Path, tilecnt: &[usize; 4]) {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let osm_in = args.get(1).cloned().unwrap_or_else(|| {
-        "/home/marek/Ext/reverse_engineering/NissanMaps/OSM-map/krzeszowice.osm".into()
-    });
-    let outdir = args.get(2).cloned().unwrap_or_else(|| "/tmp/opencode/wt2".into());
+    let argv: Vec<String> = env::args().collect();
+    // Robust parse: options --region=NAME / --bbox=W,S,E,N (anywhere) + positional
+    // osm_in [outdir [bbox]]. Keeps the legacy `osm2map in.osm outdir "W,S,E,N"` form working and
+    // lets --region=N6E1 appear in any position without being mistaken for the bbox.
+    let mut region_arg: Option<String> = None;
+    let mut bbox_arg: Option<String> = None;
+    let mut pos: Vec<String> = Vec::new();
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--region=").or_else(|| a.strip_prefix("-r=")) {
+            region_arg = Some(v.to_string());
+        } else if a == "--region" || a == "-r" {
+            if let Some(v) = it.next() {
+                region_arg = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--bbox=") {
+            bbox_arg = Some(v.to_string());
+        } else if a == "--bbox" {
+            if let Some(v) = it.next() {
+                bbox_arg = Some(v.clone());
+            }
+        } else if bbox_arg.is_none() && pos.len() >= 2 && a.contains(',') {
+            bbox_arg = Some(a.clone()); // 3rd positional = bbox, legacy form
+        } else {
+            pos.push(a.clone());
+        }
+    }
+    region_arg = region_arg.or_else(|| env::var("OSM2MAP_REGION").ok());
+    let osm_in = pos
+        .get(0)
+        .cloned()
+        .unwrap_or_else(|| "/home/marek/Ext/reverse_engineering/NissanMaps/OSM-map/krzeszowice.osm".into());
+    let outdir = pos
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/opencode/wt2".into());
     fs::create_dir_all(&outdir).ok();
 
-    // Parse bbox in PAU. Optional 3rd arg "W,S,E,N" (degrees); default = full N6E2
-    // region bounds (all of Poland) so every object in the file is placed into the
-    // region-wide tile grid.
-    let (bw, bs, be, bn) = match args.get(3) {
+    // setup_region loads the target region's real stock <REGION>AA.IDX header + bbox (resinf
+    // catalog). MUST run before any geometry, which reads W()/S()/E()/N().
+    setup_region(region_arg, bbox_arg.is_some());
+
+    // bbox in PAU from --bbox/legacy 3rd positional (degrees), else the region's stock bounds.
+    let (bw, bs, be, bn) = match &bbox_arg {
         Some(s) => {
             let mut it = s.split(',').map(|x| deg2pau(x.trim().parse().unwrap()));
             (it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
         }
-        None => (W, S, E, N),
+        None => (W(), S(), E(), N()),
     };
 
     let t0 = std::time::Instant::now();
@@ -1886,10 +2069,21 @@ fn main() {
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
             for (geom, w, rn, nm) in &ts.roads {
                 let nc = *w & 7;
-                let feat = road_feat_low(nc);
-                if nc >= 7 {
-                    // Minor local (0x21, type-2 line): stock emits NO roadinfo and no label on these, and
-                    // 0x21+0x11 is unproven on the reader -> keep it annotation-free (never rebooted).
+                // Stock-measured road feature codes (see road_feat_low): nc0..3 = 0x30/0x31/0x32/0x33
+                // arterials (carry 0x11 roadinfo); nc>=4 = local street network = 0x21 thin line, NO 0x11
+                // (stock L3 has only 0x21 lines). roadclass off => the proven flat #09p: every road 0x30+0x11.
+                // OSM2MAP_MINOR21=0 folds the local network into tier 0x33 + 0x11 (safe non-0x21 fallback).
+                let rc = roadclass_on();
+                let local = rc && nc >= 4;
+                let feat = if !rc {
+                    0x30
+                } else if local {
+                    if minor21_on() { 0x21 } else { 0x33 }
+                } else {
+                    road_feat_low(nc)
+                };
+                // 0x21 local lines carry no roadinfo/label (stock); road tiers + flat #09p keep 0x11.
+                if feat == 0x21 {
                     lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None, nm: None });
                 } else {
                     // Road tiers (0x30..0x33, type-4): proven 0x11 roadinfo (+ 0x14 ref + 0x7A street name).
@@ -1935,7 +2129,7 @@ fn main() {
                     let offb = map_binoff + map_land.len() as u32;
                     let lw = (blk.len() / 4) as u16;
                     map_land.extend_from_slice(&blk);
-                    entries.push((0x400 | LAND_PROF, lw, offb));
+                    entries.push((0x400 | land_prof(), lw, offb));
                 }
                 for blk in pack_and_build_blocks(shift, cx, cy, &hydro_polys, &lines_hydro, &[]) {
                     let offb = map_binoff + map_hydro.len() as u32;
@@ -1952,7 +2146,7 @@ fn main() {
                     let offb = map_binoff + map_land.len() as u32;
                     let lw = (blk.len() / 4) as u16;
                     map_land.extend_from_slice(&blk);
-                    entries.push((0x400 | LAND_PROF, lw, offb));
+                    entries.push((0x400 | land_prof(), lw, offb));
                 }
             }
             nsub += entries.len();
@@ -1966,10 +2160,10 @@ fn main() {
         eprintln!("L{}: {} non-empty tiles -> {} sub-blocks", L, ntiles, nsub);
     }
 
-    let idx_path = format!("{}/{}AA.IDX", outdir, REGION);
-    let land_file = prof_file(LAND_PROF); // N6E2102
+    let idx_path = format!("{}/{}AA.IDX", outdir, region());
+    let land_file = prof_file(land_prof()); // e.g. N6E2102 (profile 0x02)
     let hydro_file = prof_file(HYDRO_PROF); // N6E210I
-    emit_map(Path::new(&format!("{}/{}.MAP", outdir, land_file)), &map_land, LAND_PROF);
+    emit_map(Path::new(&format!("{}/{}.MAP", outdir, land_file)), &map_land, land_prof());
     emit_map(Path::new(&format!("{}/{}.MAP", outdir, hydro_file)), &map_hydro, HYDRO_PROF);
     emit_idx(Path::new(&idx_path), &slots);
     emit_tci(Path::new(&format!("{}/{}.TCI", outdir, land_file)), &TILECNT);
