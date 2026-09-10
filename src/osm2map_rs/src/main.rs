@@ -1542,19 +1542,23 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                                     let stname = g("name").map(|s| s.to_string());
                                     let mut w = roadinfo_w(hw, g("junction"), toll);
                                     // Drivable local streets -> the thin WHITE + dark-outline pen:
-                                    // feature 0x35 with netclass forced to 7. Measured on-car
+                                    // feature 0x35 with netclass forced to 4. Measured on-car
                                     // (trials/18-20): the pen is f(feature, netclass); netclass 5/6
                                     // force a THICK yellow/red pen regardless of the feature byte, while
-                                    // netclass 7 is feature-driven, so 0x35 there renders white. netclass
-                                    // 7 is also the lowest class, so these stay at the L3 town-street
-                                    // zoom, matching stock's local-street LOD. (service/track/path also
-                                    // use netclass 7 but keep feature 0x21, so they remain thin grey.)
+                                    // netclass 4 is feature-driven, so 0x35 there renders white. netclass
+                                    // 4 (not 7) is deliberate for LOD: the thin grey 0x21 lines carry no
+                                    // netclass hint so the engine can only hide them once the L3 tile
+                                    // unloads, which let them outlive the white streets on zoom-out.
+                                    // Giving white netclass 4 (shown from the coarser tiers like tertiary)
+                                    // keeps it visible no shorter than the thin lines -> correct ordering.
+                                    // (service/track/path also use netclass 7 but keep feature 0x21, so
+                                    // they remain thin grey and L3-only.)
                                     let local = matches!(
                                         hw.strip_suffix("_link").unwrap_or(hw),
                                         "residential" | "living_street" | "unclassified"
                                     );
                                     if local {
-                                        w = (w & !7) | 7;
+                                        w = (w & !7) | 4;
                                     }
                                     let fo = if local { Some(0x35) } else { None };
                                     roads.push((pts, w, refn, stname, fo));
