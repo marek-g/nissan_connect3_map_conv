@@ -957,7 +957,10 @@ fn decimate_ring(ring: &[(i64, i64)]) -> Vec<(i64, i64)> {
         let b = rdp(&ring[ek..], eps2);
         let mut out = a;
         if b.len() >= 2 {
-            out.extend_from_slice(&b[1..b.len() - 1]);
+            // Drop only the shared seam b[0] (= ring[ek], already a's last). KEEP b[last]
+            // (= ring[n-1]): the ring is an open loop, so that vertex closes back to ring[0];
+            // dropping it removed a real corner and turned rectangles into triangles.
+            out.extend_from_slice(&b[1..]);
         }
         if out.len() <= MAX_RING_PTS {
             return out;
@@ -995,7 +998,8 @@ fn simplify_ring(ring: &[(i64, i64)], eps2: f64) -> Vec<(i64, i64)> {
     let b = rdp(&ring[ek..], eps2);
     let mut out = a;
     if b.len() >= 2 {
-        out.extend_from_slice(&b[1..b.len() - 1]);
+        // Keep b[last] (= ring[n-1]); only b[0] (the seam at ring[ek]) duplicates a's end.
+        out.extend_from_slice(&b[1..]);
     }
     out
 }
@@ -1050,6 +1054,15 @@ fn distribute(
     }
 
     for (geom, w, rn, nm, fo) in roads {
+        // Level-of-detail by rank. Low-class roads (netclass 5/6/7: unclassified/residential/
+        // living_street, the white drivable-local 0x35 override, and service/track/path 0x21) are
+        // stock-stored ONLY at the finest level L3, so they show only in the street view and vanish
+        // on zoom-out (0x21 carries no 0x11/netclass, so without this the engine never hides them
+        // and they outlived the white streets). The engine composites levels 0..Z, so nc0..4 (auto-
+        // way..tertiary) stay visible at every zoom and must NOT be gated.
+        if (*w & 7) >= 5 && level < 3 {
+            continue;
+        }
         let (c0, c1, r0, r1) = cell_span(level, geom);
         for c in c0..=c1 {
             for r in r0..=r1 {
