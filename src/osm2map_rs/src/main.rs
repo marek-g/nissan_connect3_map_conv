@@ -34,7 +34,8 @@ fn deg2pau(d: f64) -> i64 {
     (d * PAU).round() as i64
 }
 
-const STATE: u16 = 0x25D4; // measured from reference N6E2 polygon cells
+const STATE: u16 = 0x41EC; // stock N6E2 cell state word (all levels/kinds read state=0x41EC; matches
+                            // the stock map byte-for-byte so the renderer applies the same styling)
 
 // Profile model (see doc/TravelMap_format §11). Ground truth from stock N6E2 (Kraków bbox): EVERY
 // element — roads, POI, land-use polygons AND inland water (371 water lines + 261 water polygons) —
@@ -244,8 +245,11 @@ struct LineCell {
     nm: Option<String>, // street name (OSM `name`) -> 0x7A annotation + text record
 }
 
-// A parsed road: (polyline, roadinfo word, OSM `ref` -> 0x14, OSM `name` -> 0x7A street label).
-type Road = (Vec<(i64, i64)>, u16, Option<String>, Option<String>);
+// A parsed road: (geometry, roadinfo_w word, OSM `ref` -> 0x14, OSM `name` -> 0x7A label,
+// feature-override). The 5th field forces an exact road feature byte for that way, bypassing
+// road_feat_low; it is set to 0x35 for drivable local streets so they render as the thin WHITE +
+// dark-outline pen (see road_feat_low / the emit step). None = derive the feature from netclass.
+type Road = (Vec<(i64, i64)>, u16, Option<String>, Option<String>, Option<u16>);
 
 // Words a road-number (0x14) feature contributes beyond its 0x11: the 8-byte annotation record
 // (2 words) plus its text-pool record ({u8 n,u8 0,u8 len,bytes,NUL} word-aligned). 0 if no ref.
@@ -1045,7 +1049,7 @@ fn distribute(
             .push((*lo, *la, *feat, name.clone(), *city));
     }
 
-    for (geom, w, rn, nm) in roads {
+    for (geom, w, rn, nm, fo) in roads {
         let (c0, c1, r0, r1) = cell_span(level, geom);
         for c in c0..=c1 {
             for r in r0..=r1 {
@@ -1058,7 +1062,7 @@ fn distribute(
                     map.entry(cell_to_k(level, c, r))
                         .or_default()
                         .roads
-                        .push((slice, *w, rn.clone(), nm.clone()));
+                        .push((slice, *w, rn.clone(), nm.clone(), *fo));
                 }
             }
         }
@@ -1231,31 +1235,21 @@ fn roadinfo_w(hw: &str, junction: Option<&str>, toll: bool) -> u16 {
     w
 }
 
-// Road-tier line feature LOW byte from the 3-bit netclass. The pen (colour + width + border) is chosen
-// ONLY by this feature byte: u8ConvertFeature2LineSubType maps 0x30..0x37 -> subtypeRoad 0x3d..0x44 (all
-// type-4 ROAD) and 0x21 -> subtypeRoad 0x15 (type-2 thin LINE); GetLineConfigOffsetRoad then indexes the
-// theme 3D/config.bin line-data table (g_LineReferences[offset] -> RGBA body + border + width). Measured
-// straight from that config (the theme the car actually loads, confirmed by the pale-cyan 0x33 seen on
-// car for ul. Żbicka in #09):
-//   0x30 blue      (15,17,133) w7/10  motorway     <- nc0
-//   0x31 blue      (0,108,180) w6/8   trunk        <- nc1
-//   0x32 pale-cyan (147,227,226) w5/7  primary     <- nc2
-//   0x33 pale-cyan (147,227,226) w4/6  secondary   <- nc3  (also tertiary: matches #09 Żbicka "greenish")
-//   0x34 white     (255,255,255) w2/3  local road  <- nc5  (unclassified)
-//   0x35 white     (255,255,255) w2/3  local road  <- nc6  (residential; the white pen that was missing)
-//   0x21 thin LINE (type-2)              service/track/path <- nc7 (no 0x11 roadinfo, stock L3 model)
-// 0x34/0x35 are WHITE and go through the SAME type-4 reader as 0x30..0x33 (subtypeRoad 0x41/0x42 handled
-// by GetLineConfigOffsetRoad) -> safe. The netclass in the 0x11 annotation drives routing/level-select,
-// NOT the pen, so this byte is the sole styling knob. 0x36/0x37 are also white (thinner) reserves.
+// Road-tier line feature LOW byte from the 3-bit netclass. The pen is f(feature, netclass): the
+// feature maps 0x30..0x37 -> subtypeRoad 0x3d..0x44 (type-4 ROAD) and 0x21 -> 0x15 (type-2 thin
+// LINE); GetLineConfigOffsetRoad(subtypeRoad, subAttributes) then indexes the theme line-data. On-car
+// legend (trials/18+19) proved netclass also drives the pen: netclass 1,2,3,4,7 are feature-driven
+// (0x32=orange, 0x33=green, 0x34/0x35/0x36=thin white+dark), but netclass 5 and 6 force a THICK
+// yellow/red pen regardless of the feature. So drivable local streets (residential/unclassified/
+// living_street) are emitted upstream with a feature-override of 0x35 + netclass 7 (thin white,
+// L3-only), which bypasses this function; it therefore only ever sees nc0..4 + nc7 here.
 fn road_feat_low(nc: u16) -> u16 {
     match nc & 7 {
         0 => 0x30,
         1 => 0x31,
         2 => 0x32,
         3 | 4 => 0x33,
-        5 => 0x34,
-        6 => 0x35,
-        _ => 0x21,
+        _ => 0x21, // nc7 = service/track/path: thin local line
     }
 }
 
@@ -1533,7 +1527,24 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                                     let toll = matches!(g("toll"), Some("yes") | Some("1"));
                                     let refn = g("ref").map(|s| s.to_string());
                                     let stname = g("name").map(|s| s.to_string());
-                                    roads.push((pts, roadinfo_w(hw, g("junction"), toll), refn, stname));
+                                    let mut w = roadinfo_w(hw, g("junction"), toll);
+                                    // Drivable local streets -> the thin WHITE + dark-outline pen:
+                                    // feature 0x35 with netclass forced to 7. Measured on-car
+                                    // (trials/18-20): the pen is f(feature, netclass); netclass 5/6
+                                    // force a THICK yellow/red pen regardless of the feature byte, while
+                                    // netclass 7 is feature-driven, so 0x35 there renders white. netclass
+                                    // 7 is also the lowest class, so these stay at the L3 town-street
+                                    // zoom, matching stock's local-street LOD. (service/track/path also
+                                    // use netclass 7 but keep feature 0x21, so they remain thin grey.)
+                                    let local = matches!(
+                                        hw.strip_suffix("_link").unwrap_or(hw),
+                                        "residential" | "living_street" | "unclassified"
+                                    );
+                                    if local {
+                                        w = (w & !7) | 7;
+                                    }
+                                    let fo = if local { Some(0x35) } else { None };
+                                    roads.push((pts, w, refn, stname, fo));
                                 }
                             } else if let Some(ww) = g("waterway") {
                                 if pts.len() >= 2 {
@@ -2019,13 +2030,14 @@ fn main() {
         let roads: Vec<Road> = osm
             .roads
             .iter()
-            .filter(|(_, w, _, _)| (*w & 7) <= mnc as u16)
-            .map(|(g, w, rn, nm)| {
+            .filter(|(_, w, _, _, fo)| fo.is_some() || (*w & 7) <= mnc as u16)
+            .map(|(g, w, rn, nm, fo)| {
                 (
                     g.clone(),
                     *w,
                     if roadnum_on { rn.clone() } else { None },
                     if streetname_on { nm.clone() } else { None },
+                    *fo,
                 )
             })
             .collect();
@@ -2072,25 +2084,31 @@ fn main() {
             // Split this tile's content into LAND (shard profile `02`) vs HYDRO (`0I` overlay).
             // Bosch's `0I` carries ONLY water: waterway lines + water-area polygons, never roads/POI.
             let mut lines_land: Vec<LineCell> = Vec::with_capacity(ts.roads.len());
-            for (geom, w, rn, nm) in &ts.roads {
+            for (geom, w, rn, nm, fo) in &ts.roads {
                 let nc = *w & 7;
-                // Road feature codes (see road_feat_low): nc0..6 = 0x30/0x31/0x32/0x33/0x33/0x34/0x35,
-                // all type-4 ROAD -> carry the 0x11 roadinfo (+ 0x14 ref + 0x7A name). nc7 (service/
-                // track/path) = 0x21 type-2 thin local line, NO 0x11 (stock L3 model). roadclass off =>
-                // the proven flat #09p: every road 0x30 + 0x11. OSM2MAP_MINOR21=0 avoids the risky thin
-                // 0x21 entirely by folding nc7 into the thinnest type-4 white 0x36.
+                // Road feature (see road_feat_low): netclass 0..4 -> type-4 tiers 0x30/0x31/0x32/0x33/
+                // 0x33 (carry the 0x11 roadinfo + 0x14 ref + 0x7A name). Drivable local streets arrive
+                // here with fo=0x35 (thin white + dark outline, nc7) -> also type-4, keeps 0x11. Only
+                // service/track/path (nc7, fo=None) fall through to 0x21 type-2, which carries no
+                // roadinfo/label (stock model). roadclass off => proven flat #09p (every road 0x30 + 0x11).
+                // OSM2MAP_MINOR21=0 folds those 0x21 streets into the thinnest SAFE type-4 tier 0x33.
                 let rc = roadclass_on();
-                let feat = if !rc {
-                    0x30
-                } else {
-                    let f = road_feat_low(nc);
-                    if f == 0x21 && !minor21_on() { 0x36 } else { f }
+                let feat = match fo {
+                    Some(f) => *f,
+                    None => {
+                        if !rc {
+                            0x30
+                        } else {
+                            let f = road_feat_low(nc);
+                            if f == 0x21 && !minor21_on() { 0x33 } else { f }
+                        }
+                    }
                 };
                 // 0x21 thin local lines carry no roadinfo/label (stock); all type-4 tiers keep 0x11.
                 if feat == 0x21 {
                     lines_land.push(LineCell { pts: geom.clone(), feat, ann: None, rn: None, nm: None });
                 } else {
-                    // Road tiers (0x30..0x33, type-4): proven 0x11 roadinfo (+ 0x14 ref + 0x7A street name).
+                    // Road tiers (type-4): proven 0x11 roadinfo (+ 0x14 ref + 0x7A street name).
                     lines_land.push(LineCell {
                         pts: geom.clone(),
                         feat,

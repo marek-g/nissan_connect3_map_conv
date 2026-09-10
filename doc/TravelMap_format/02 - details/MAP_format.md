@@ -374,33 +374,49 @@ functions.
 > annotation and reboots the head unit (confirmed on car, trial #09l vs #09n). Stock N6E2: water
 > lines `0x20`.
 >
-> **Road-class tiers (writer-critical).** Within the road lines the feature **low byte is the SOLE pen
-> selector** — colour + width + border all come from it. Chain (two binaries): the raw feature →
-> `u8ConvertFeature2LineSubType` (DAPIAPP) → `subtypeRoad` (`0x30..0x37`→`0x3d..0x44`, `0x21`→`0x15`) →
-> `GetLineConfigOffsetRoad(subtypeRoad,subAttributes)` (procmapengine) → an offset into the theme
-> `3D/config.bin` line-data table (`g_LineReferences[offset]` → RGBA body + border + width). The netclass
-> in the `0x11` roadinfo drives routing/level-select, **NOT** the pen. Colours measured directly from
-> `3D/config.bin` (the theme the car loads — confirmed by the pale-cyan `0x33` seen on-car for ul. Żbicka
-> in #09), with day widths:
+> **Road-class tiers (writer-critical).** The rendered pen is a function of BOTH the feature low byte AND
+> the netclass in the `0x11` roadinfo: **`pen = f(feature, netclass)`** (measured on-car, trials 18–20).
+> Chain (two binaries): raw feature → `u8ConvertFeature2LineSubType` (DAPIAPP) → `subtypeRoad`
+> (`0x30..0x37`→`0x3d..0x44`, `0x21`→`0x15`, `0x20`→`0x29`, `0x07`→`0x65`) → `GetLineConfigOffsetRoad`
+> (procmapengine) → offset into the theme `3D/config.bin` line-data table (`g_LineReferences[view*0x9b0 +
+> theme*0x87a0][offset]` → RGBA body + border + width). Colours read from `config_5eur.bin` (RGBA packed
+> `0xAARRGGBB` little-endian), cross-checked on-car.
 >
-> | feature | subtypeRoad | body RGB | look | w | Bosch tier |
-> |---------|-------------|----------|------|---|------------|
-> | 0x30 | 0x3d | (15,17,133) | blue  | 7 | motorway (`nc0`) |
-> | 0x31 | 0x3e | (0,108,180) | blue  | 6 | trunk (`nc1`) |
-> | 0x32 | 0x3f | (147,227,226) | pale-cyan | 5 | primary (`nc2`) |
-> | 0x33 | 0x40 | (147,227,226) | pale-cyan | 4 | secondary (`nc3`) — also used for tertiary (`nc4`) |
-> | 0x34 | 0x41 | (255,255,255) | **white** + border 0x171717 | 2 | local road — unclassified (`nc5`) |
-> | 0x35 | 0x42 | (255,255,255) | **white** + border | 2 | local road — residential (`nc6`) |
-> | 0x36/0x37 | 0x43/0x44 | (255,255,255) | white (thinner) | 2/1 | (reserves) |
-> | 0x21 | 0x15 | (type-2 LINE) | thin grey | — | service/track/path (`nc7`) — **no `0x11`** |
+> **⚠ Netclass gates the pen — the netclass 5/6 trap.** When the netclass is *feature-driven* (`1,2,3,4,7`)
+> the feature byte picks the colour below. But **netclass `5` and `6` force a THICK yellow-body /
+> red-casing pen regardless of the feature byte.** This is why emitting `0x35` on a residential street
+> (`nc6`) rendered fat yellow/red (the `trials/15` bug) — the netclass, not the feature, was at fault.
+> To get the feature-driven colour use a netclass ∉ {5,6}.
 >
-> Bosch's OWN stock N6E2 puts everything below secondary in the thin `0x21` type-2 line (stock L3 has only
-> `0x21`), so on the stock map local streets are hairlines — but that reads as *too thin* next to the
-> yellow/pale arterials, so `osm2map` upgrades `nc4→0x33` (matches the #09 look the user approved) and
-> `nc5/nc6→0x34/0x35` (the WHITE local-road pen that stock under-uses). `0x34..0x36` share the same reader
-> path as `0x30..0x33` (type-4, `GetLineConfigOffsetRoad` handles `0x41..0x44`) → car-safe. `osm2map`
-> maps OSM `highway`→netclass via `roadinfo_w()`, then netclass→feature via `road_feat_low()`. See
-> `trials/13` (codes boot), `trials/14` (nc≥4→0x21 — read as too thin), `trials/15` (theme-derived colours).
+> | feature | subtypeRoad | config_5eur body / border | on-car look (feature-driven netclass) | Bosch tier |
+> |---------|-------------|---------------------------|-----------------------------------------|------------|
+> | 0x30 | 0x3d | `#fff35f` / `#c71a16` | yellow body + **red** casing, thick | motorway (`nc0`) |
+> | 0x31 | 0x3e | `#a52323` / `#22231d` | dark-red | trunk (`nc1`) |
+> | 0x32 | 0x3f | `#f0733a` / `#283459` | orange + slate casing (ul. Krakowska) | primary (`nc2`) |
+> | 0x33 | 0x40 | `#e2e393` / `#1f2000` | pale **green** + dark casing (ul. Żbicka) | secondary `nc3` / tertiary `nc4` |
+> | **0x35** | 0x42 | `#ffffff` / `#222222` | **WHITE + dark outline** (`nc7` medium, `nc3` thin) | drivable local — see below |
+> | 0x34 / 0x36 | 0x41 / 0x43 | `#ffffff` / `#222222` | white + dark casing (theme white family) | spare |
+> | **0x21** | 0x15 | `#616161` (type-2 fixed) | thin **grey** hairline — grey in every view/theme | service/track/path (`nc7`) — **no `0x11`** |
+> | any feature @ nc5/nc6 | — | overridden | ⚠ **thick yellow/red regardless of feature** (netclass trap) | — |
+>
+> `0x21` (type-2) resolves through `GetLineConfigOffsetBasedOntype@0x46cb88` subtype `0x15` → FIXED offset
+> → grey `#616161` in every view/theme; it can never be white or carry a casing. Stock's own local streets
+> are `0x21` = grey. The **white** thin local look is an improvement only reachable via the type-4 white
+> family `0x34/0x35/0x36` with a feature-driven netclass. It is NOT present in stock N6E2 near Krzeszowice
+> (stock there has only `0x33` + unnamed `0x21`); the white local streets seen on a 2022+ head unit come
+> from newer source data, not a runtime route-network generator — the FastMap/`Drop` converters only
+> *annotate* existing display roads with routing state (one-way, closures, style inheritance; see
+> `FastMapToLineMapFeature`/`enDetermineLineType`) and add no new roads.
+>
+> `osm2map` maps OSM `highway`→netclass via `roadinfo_w()` (motorway`nc0`, trunk`nc1`, primary`nc2`,
+> secondary`nc3`, tertiary`nc4`, unclassified`nc5`, residential/living_street`nc6`, service/track/path`nc7`),
+> then netclass→feature via `road_feat_low()` (`nc0→0x30, nc1→0x31, nc2→0x32, nc3|nc4→0x33, nc7→0x21`).
+> **Drivable local streets** (`residential`/`living_street`/`unclassified`) are overridden at the parse step
+> to **feature `0x35` + netclass `7`** → white + dark outline, shown only at the L3 town zoom (canonical
+> look, `trials/20`, approved on-car). `service`/`track`/`path` stay `0x21` grey. Trials: `13` boot,
+> `14` nc≥4→0x21, `15` `0x35`@nc6 → yellow/red (netclass trap), `16` minors→0x21, `17` byte-match stock
+> (still grey), `18`/`19` on-car legends isolated the `f(feature,netclass)` law, `20` local→`0x35`+nc7 =
+> white (approved).
 
 
 ### POI (list 2) — code → type

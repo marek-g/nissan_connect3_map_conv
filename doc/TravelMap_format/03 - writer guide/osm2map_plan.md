@@ -248,17 +248,20 @@ Sub-attributes (same roadinfo word): `junction=roundabout` → road_type 2; `hig
 (interconnect) or 1 (long ramp); `toll=yes` → toll bits; `route=ferry` → ferry bits (emitted as a line, not
 a road class). The full roadinfo payload is written as annotation type `0x11` `{u16 w, u32 d}`.
 
-**Line feature LOW byte = the class tier the renderer styles by (writer-critical).** The drawn pen comes
-from the line's feature low code, not from the `0x11` netclass. The pen is fully RE-derived
-(`u8ConvertFeature2LineSubType` → `GetLineConfigOffsetRoad` → `3D/config.bin` line-data; see MAP_format
-§road tiers for the measured colour table): `nc0→0x30` blue motorway · `nc1→0x31` blue trunk ·
-`nc2→0x32` pale-cyan primary · `nc3/nc4→0x33` pale-cyan secondary/tertiary (matches #09 ul. Żbicka) ·
-`nc5→0x34` **white** unclassified · `nc6→0x35` **white** residential · `nc7→0x21` thin local
-(service/track/path). Bosch's stock actually hairlines everything below secondary as `0x21` (stock L3 =
-only `0x21`), which reads too thin, so we lift `nc5/nc6` to the white type-4 pen. All `0x30..0x36` are
-type-4 and carry `0x11`; only `0x21` omits it. Trap #1: one code for all roads (old constant `0x30`)
-draws everything with one pen. Trap #2: `nc≥4→0x21` (#14) made every local street an invisible hairline.
-See MAP_format §road tiers, `trials/13` (boot), `trials/14` (too thin), `trials/15` (theme colours).
+**Line feature LOW byte + netclass together = the pen (writer-critical).** The drawn pen is
+`f(feature, netclass)`, fully RE-derived (`u8ConvertFeature2LineSubType` → `GetLineConfigOffsetRoad` →
+`3D/config.bin`; full measured colour table in MAP_format §road tiers). Netclasses `1,2,3,4,7` are
+feature-driven; **netclasses `5`/`6` force a thick yellow/red pen regardless of the feature byte** (this
+is what broke `trials/15`). Base mapping `road_feat_low`: `nc0→0x30` yellow/red motorway · `nc1→0x31`
+dark-red trunk · `nc2→0x32` orange primary (ul. Krakowska) · `nc3/nc4→0x33` pale-green secondary/tertiary
+(matches on-car ul. Żbicka) · `nc7→0x21`. **`0x21` (type-2) is a fixed GREY `#616161` hairline, NOT white**
+— it can never be white nor carry a casing, and it omits the `0x11`. All `0x30..0x33`/`0x35` are type-4 and
+carry `0x11`; only `0x21` omits it. **Drivable local streets** (`residential`/`living_street`/`unclassified`)
+are emitted as **feature `0x35` + netclass `7`** → the thin WHITE + dark-outline pen (`0x35`→subtypeRoad
+`0x42`, white family, feature-driven at nc7, L3-only), approved on-car in `trials/20`. `service`/`track`/
+`path` stay `0x21` grey. Traps: #1 one code for all roads (old constant `0x30`); #2 `0x35`@nc6 (#15) = the
+netclass 5/6 yellow/red trap; #3 assuming `0x21` is white (it is grey). See MAP_format §road tiers,
+`trials/14`→`20`.
 
 Road number: `ref=*` → a `0x14` annotation laid right after the `0x11` (`annotDesc.count = 2`), payload
 `{u16 textRef, u16 mid=0, u16 status=0}`; `textRef` points at a name-format text record holding the ref
