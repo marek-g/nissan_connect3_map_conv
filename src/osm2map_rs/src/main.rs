@@ -255,7 +255,7 @@ type Road = (Vec<(i64, i64)>, u16, Option<String>, Option<String>, Option<u16>);
 // (2 words) plus its text-pool record ({u8 n,u8 0,u8 len,bytes,NUL} word-aligned). 0 if no ref.
 fn rn_words(s: Option<&str>) -> u32 {
     match s {
-        Some(r) if !r.is_empty() && r.len() <= 254 => 2 + ((r.len() + 4 + 3) / 4) as u32,
+        Some(r) if label_ok(r) => 2 + text_rec_words(r),
         _ => 0,
     }
 }
@@ -268,26 +268,88 @@ fn ann_words(typ: u8) -> u32 {
     }
 }
 
-// Name/number text-record string-variant flag byte. A text record is
-//   { u8 n_strings, (u8 <flag>, u8 len) × n, bytes×n, u8 term }   (4-byte aligned in the pool)
-// The flag byte is fixed-width (1 B) so its VALUE never shifts record offsets (map2osm ignores it
-// either way). CAR-VALIDATED (trial #12 vs #10/A/B/C): the head unit REBOOTS on 0xA7 when the string
-// payload is our raw OSM text (mixed case + UTF-8 diacritics), and boots with 0x00. Ground truth from
-// stock N6E2 text pool: 0xA7 IS the real "display label" flag, but stock stores labels Bosch-
-// normalised — UPPERCASE ASCII with diacritics stripped (KRAKOWIE/KOSCIUSZKI, not Kraków/Kościuszki),
-// frequently as a 2-variant record (02 a7 len a7 len). 0x00 means "no display string": the renderer
-// skips the label engine entirely, so it never parses the payload -> no reboot, no label (exactly the
-// #09p state: names present in data but nothing drawn). Emitting 0xA7 hands our raw UTF-8 to that
-// engine, which walks off the buffer. Until labels are Bosch-normalised, DEFAULT 0x00 (safe);
-// OSM2MAP_TEXTVARIANT=<hex/dec> overrides for experiments (0xa7 = will reboot on non-normalised text).
+// Name/number text-record string-variant flag byte (the PRIMARY/display variant flag). A text
+// record is  { u8 n_strings, (u8 <flag>, u8 len) x n, bytes x n, u8 NUL }  (4-byte aligned pool).
+// CAR-VALIDATED: 0x00 = "no display string" -> the label engine is skipped entirely, so labels sit
+// in the data but NOTHING is drawn (this was the "street names missing" bug). 0xA7 is the real
+// "display label" flag. Ground truth from the stock N6E2 text pool (scanned): stock labels are all
+// UPPERCASE, and when a name carries Polish diacritics it is stored as a TWO-variant record
+//   02 a7 <lenPL> c5 <lenASCII> <PL-UTF8> <ASCII-translit> 00
+// (71k records of the (a7,c5) pair vs only ~0.4k single a7-with-diacritics); pure-ASCII labels are
+// single  01 a7 <len> <bytes> 00  (133k). Emitting 0xA7 with raw MIXED-CASE text reboots the head
+// unit (trial #12), so labels MUST be Bosch-uppercased first. Default is now 0xA7 (labels ON);
+// OSM2MAP_TEXTVARIANT=0 restores the old blank-but-safe behaviour for experiments.
 fn name_str_flag() -> u8 {
-    let s = env::var("OSM2MAP_TEXTVARIANT").unwrap_or_else(|_| "0".into());
+    let s = env::var("OSM2MAP_TEXTVARIANT").unwrap_or_else(|_| "0xa7".to_string());
     let s = s.trim();
-    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u8::from_str_radix(h, 16).unwrap_or(0)
-    } else {
-        s.parse::<u8>().unwrap_or_else(|_| u8::from_str_radix(s, 16).unwrap_or(0))
+    if s.eq_ignore_ascii_case("0") || s.eq_ignore_ascii_case("none") {
+        return 0;
     }
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(h, 16).unwrap_or(0xA7)
+    } else {
+        s.parse::<u8>().unwrap_or_else(|_| u8::from_str_radix(s, 16).unwrap_or(0xA7))
+    }
+}
+
+// Second (ASCII / transliterated) variant flag, seen beside 0xA7 in stock two-variant records.
+const TXT_ASCII_FLAG: u8 = 0xC5;
+
+// Upper-case + fold to pure ASCII the way Bosch labels store the latinised variant: map the Polish
+// letters to their base letter (Ą->A ... Ż->Z) and drop any other non-ASCII byte. Input is assumed
+// already upper-cased; kept defensive (handles lower-case too).
+fn ascii_fold(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        let m = match c {
+            'Ą' | 'ą' => Some('A'), 'Ć' | 'ć' => Some('C'), 'Ę' | 'ę' => Some('E'),
+            'Ł' | 'ł' => Some('L'),  'Ń' | 'ń' => Some('N'), 'Ó' | 'ó' => Some('O'),
+            'Ś' | 'ś' => Some('S'),  'Ź' | 'ź' => Some('Z'), 'Ż' | 'ż' => Some('Z'),
+            _ => {
+                if c.is_ascii() {
+                    Some(c)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(x) = m {
+            o.push(x);
+        }
+    }
+    o
+}
+
+// Full text-record payload for a label: one upper-cased UTF-8 variant (pure-ASCII names) or the
+// stock two-variant upper-cased PL + ASCII pair (names with diacritics). flag 0 -> legacy blank.
+fn text_rec_bytes(raw: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    let flag = name_str_flag();
+    if flag == 0 {
+        let pl = raw.as_bytes();
+        v.push(1); v.push(0); v.push(pl.len() as u8); v.extend_from_slice(pl); v.push(0);
+        return v;
+    }
+    let up = raw.to_uppercase();
+    let pl = up.as_bytes();
+    let ab = ascii_fold(&up).into_bytes();
+    if pl == ab {
+        v.push(1); v.push(flag); v.push(pl.len() as u8); v.extend_from_slice(pl); v.push(0);
+    } else {
+        v.push(2); v.push(flag); v.push(pl.len() as u8); v.push(TXT_ASCII_FLAG); v.push(ab.len() as u8);
+        v.extend_from_slice(pl); v.extend_from_slice(&ab); v.push(0);
+    }
+    v
+}
+
+// Word-aligned pool cost of a label record (header+payloads+NUL, rounded up to a 4-byte word).
+fn text_rec_words(raw: &str) -> u32 {
+    ((text_rec_bytes(raw).len() as u32) + 3) / 4
+}
+
+// A label is emit-safe when non-empty and short enough that both variant length bytes fit in a u8.
+fn label_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 250
 }
 
 // Generic boolean env switch; default ON unless set to 0/n/none/false/off. Used by the #09
@@ -431,7 +493,7 @@ fn build_block(
             line_nrec[i] += 1;
         }
         if let Some(s) = lines[i].nm.as_deref() {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 line_nm[i] = Some(w);
                 w += 1; // 0x7A = 4 bytes {size, type, u16 textRef}
                 line_nrec[i] += 1;
@@ -444,7 +506,7 @@ fn build_block(
     let mut city_word = vec![0u32; nq];
     let mut poi_nrec = vec![0u16; nq];
     for i in 0..nq {
-        let has_name = pois[i].3.map_or(false, |s| !s.is_empty());
+        let has_name = pois[i].3.map_or(false, label_ok);
         let has_city = pois[i].4 != 0;
         if has_name {
             ann_word[i] = w;
@@ -463,27 +525,27 @@ fn build_block(
     let mut text_word = vec![0u32; nq];
     for i in 0..nq {
         if let Some(s) = pois[i].3 {
-            if !s.is_empty() {
+            if label_ok(s) {
                 text_word[i] = tw;
-                tw += ((s.len() + 4 + 3) / 4) as u32; // record = L+4 bytes, word-aligned
+                tw += text_rec_words(s);
             }
         }
     }
     let mut rn_text = vec![0u32; nl];
     for i in 0..nl {
         if let Some(s) = lines[i].rn.as_deref() {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 rn_text[i] = tw;
-                tw += ((s.len() + 4 + 3) / 4) as u32;
+                tw += text_rec_words(s);
             }
         }
     }
     let mut nm_text = vec![0u32; nl];
     for i in 0..nl {
         if let Some(s) = lines[i].nm.as_deref() {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 nm_text[i] = tw;
-                tw += ((s.len() + 4 + 3) / 4) as u32;
+                tw += text_rec_words(s);
             }
         }
     }
@@ -553,7 +615,7 @@ fn build_block(
     // the neutral codes the decoder reads back as tm:roadnum_mid/status=0 (unclassified shield).
     for i in 0..nl {
         if let (Some(rw), Some(s)) = (line_rn[i], lines[i].rn.as_deref()) {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 let bo = (rw as usize) * 4;
                 b[bo] = 8;
                 b[bo + 1] = 0x14;
@@ -568,7 +630,7 @@ fn build_block(
     // record (same multi-string format as POI names, with the 0xA7 variant flag)}.
     for i in 0..nl {
         if let (Some(nw), Some(s)) = (line_nm[i], lines[i].nm.as_deref()) {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 let bo = (nw as usize) * 4;
                 b[bo] = 4;
                 b[bo + 1] = 0x7A;
@@ -612,46 +674,34 @@ fn build_block(
 
     for i in 0..nq {
         if let Some(s) = pois[i].3 {
-            if !s.is_empty() {
+            if label_ok(s) {
                 let aw = (ann_word[i] as usize) * 4;
                 b[aw] = 4; // size
                 b[aw + 1] = 0x7A; // type = TEXT
                 put_u16(&mut b, aw + 2, text_word[i] as u16);
                 let tp = (text_word[i] as usize) * 4;
-                let bytes = s.as_bytes();
-                b[tp] = 1; // n strings
-                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT; #09p used 0x00, 0xA7 unvalidated)
-                b[tp + 2] = bytes.len() as u8;
-                b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
-                b[tp + 3 + bytes.len()] = 0; // terminator
+                let rec = text_rec_bytes(s); // stock 1- or 2-variant upper-cased label
+                b[tp..tp + rec.len()].copy_from_slice(&rec);
             }
         }
     }
-    // road-number text records (same multi-string format as names, single string).
+    // road-number text records (refs are ASCII -> single variant; same encoder as names).
     for i in 0..nl {
         if let Some(s) = lines[i].rn.as_deref() {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 let tp = (rn_text[i] as usize) * 4;
-                let bytes = s.as_bytes();
-                b[tp] = 1; // n strings
-                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT)
-                b[tp + 2] = bytes.len() as u8;
-                b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
-                b[tp + 3 + bytes.len()] = 0; // terminator
+                let rec = text_rec_bytes(s);
+                b[tp..tp + rec.len()].copy_from_slice(&rec);
             }
         }
     }
-    // street-name text records (same multi-string format, single string, 0xA7 variant flag).
+    // street-name text records (single ASCII variant, or the stock 2-variant PL+ASCII pair).
     for i in 0..nl {
         if let Some(s) = lines[i].nm.as_deref() {
-            if !s.is_empty() && s.len() <= 254 {
+            if label_ok(s) {
                 let tp = (nm_text[i] as usize) * 4;
-                let bytes = s.as_bytes();
-                b[tp] = 1; // n strings
-                b[tp + 1] = name_str_flag(); // string-variant flag (OSM2MAP_TEXTVARIANT)
-                b[tp + 2] = bytes.len() as u8;
-                b[tp + 3..tp + 3 + bytes.len()].copy_from_slice(bytes);
-                b[tp + 3 + bytes.len()] = 0; // terminator
+                let rec = text_rec_bytes(s);
+                b[tp..tp + rec.len()].copy_from_slice(&rec);
             }
         }
     }
