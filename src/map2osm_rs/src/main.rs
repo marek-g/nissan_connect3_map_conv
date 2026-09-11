@@ -998,7 +998,10 @@ fn tile_in_bbox(region: &Region, level: usize, k: i64, bbox: &Option<BBox>) -> b
     }
 }
 
-fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize, bbox: &Option<BBox>) -> io::Result<(usize, usize)> {
+// Collect every node (POIs + way vertices, deduped by coordinate, ids 1..) and every
+// way of one region+level. Shared by the OSM XML and PBF writers so both container
+// formats carry the exact same objects, tags and ids.
+fn collect_region(region: &Region, level: usize, bbox: &Option<BBox>) -> io::Result<(Vec<Node>, Vec<Way>)> {
     let mut maps: HashMap<String, Vec<u8>> = HashMap::new();
     // pass 1: assign node ids (dedup by coordinate) + remember POI tags
     let mut node_ids: HashMap<String, i64> = HashMap::new();
@@ -1100,33 +1103,118 @@ fn write_region_level<W: Write>(w: &mut W, region: &Region, level: usize, bbox: 
             }
         }
     }
+    Ok((nodes, ways))
+}
 
-	let ways_len = ways.len();
-	
+// Serialize the collected elements to OSM XML (the historical output form).
+fn write_region_xml<W: Write>(w: &mut W, nodes: Vec<Node>, ways: Vec<Way>) -> io::Result<(usize, usize)> {
+    let ncount = nodes.len();
+    let wcount = ways.len();
     let osm = OsmData {
         version: "0.6".to_string(),
         generator: GENERATOR.to_string(),
         nodes,
         ways,
     };
-
-	w.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
-
-	let mut xml_buf = String::new();
+    w.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
+    let mut xml_buf = String::new();
     let mut serializer = quick_xml::se::Serializer::new(&mut xml_buf);
-    serializer.indent(' ', 4); // 4 spacje wcięcia
+    serializer.indent(' ', 4); // 4 spaces of indentation
     osm.serialize(serializer).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-	w.write_all(xml_buf.as_bytes())?;
+    w.write_all(xml_buf.as_bytes())?;
+    w.write_all(b"\n")?;
+    Ok((ncount, wcount))
+}
 
-	w.write_all(b"\n")?;
+// An `{:.8}`-formatted degree string -> integer nanodegrees, parsed as an exact decimal
+// so it equals the value the OSM XML writer emitted (then truncated to the PBF block's
+// 100-ns grid on encode). Avoids f64*1e9 rounding drift between the two writers.
+fn deg_str_to_nd(s: &str) -> i64 {
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, s),
+    };
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let whole_v: i64 = whole.parse().unwrap_or(0);
+    let mut f = frac.to_string();
+    while f.len() < 9 {
+        f.push('0');
+    }
+    let frac_v: i64 = f[..9].parse().unwrap_or(0);
+    let mut nd = whole_v.saturating_mul(1_000_000_000) + frac_v;
+    if neg {
+        nd = -nd;
+    }
+    nd
+}
 
-    Ok((key_order.len(), ways_len))
+// Emit the collected elements as an OSM PBF (.osm.pbf) via pbf-craft. Nodes are written
+// before ways (conventional order, ascending ids) so index readers accept the file.
+fn pbf_io_err(ctx: impl Into<String>, e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    let e: Box<dyn std::error::Error + Send + Sync> = e.into();
+    io::Error::new(io::ErrorKind::Other, format!("{}: {}", ctx.into(), e))
+}
+
+fn write_region_pbf(path: &str, region: &Region, nodes: &[Node], ways: &[Way]) -> io::Result<(usize, usize)> {
+    use chrono::{DateTime, Utc};
+    use pbf_craft::models::{Bound, Element, Node as PbfNode, Tag as PbfTag, Way as PbfWay, WayNode};
+    use pbf_craft::writers::PbfWriter;
+
+    let ts = DateTime::parse_from_rfc3339(TIMESTAMP).ok().map(|d| d.with_timezone(&Utc));
+    let conv_tags = |tags: &[Tag]| -> Vec<PbfTag> {
+        tags.iter().map(|t| PbfTag { key: t.k.clone(), value: t.v.clone() }).collect()
+    };
+
+    let mut writer = PbfWriter::from_path(path, true)
+        .map_err(|e| pbf_io_err(format!("open pbf {}", path), e))?;
+    writer.set_bbox(Bound {
+        left: (pau_to_deg(region.west) * 1e9).round() as i64,
+        right: (pau_to_deg(region.east) * 1e9).round() as i64,
+        top: (pau_to_deg(region.north) * 1e9).round() as i64,
+        bottom: (pau_to_deg(region.south) * 1e9).round() as i64,
+        origin: GENERATOR.to_string(),
+    });
+    for n in nodes {
+        let el = PbfNode {
+            id: n.id,
+            version: 1,
+            timestamp: ts,
+            user: None,
+            changeset_id: 1,
+            latitude: deg_str_to_nd(&n.lat),
+            longitude: deg_str_to_nd(&n.lon),
+            visible: true,
+            tags: conv_tags(&n.tags),
+        };
+        writer.write(Element::Node(el)).map_err(|e| pbf_io_err("write node", e))?;
+    }
+    for wd in ways {
+        let el = PbfWay {
+            id: wd.id,
+            version: 1,
+            timestamp: ts,
+            user: None,
+            changeset_id: 1,
+            visible: true,
+            tags: conv_tags(&wd.tags),
+            way_nodes: wd.nds.iter().map(|r| WayNode::new_without_coords(r.reference)).collect(),
+        };
+        writer.write(Element::Way(el)).map_err(|e| pbf_io_err("write way", e))?;
+    }
+    writer.finish().map_err(|e| pbf_io_err("finish pbf", e))?;
+    Ok((nodes.len(), ways.len()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutFormat {
+    Xml,
+    Pbf,
 }
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: map2osm_rs <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-b W,S,E,N|none] [-o OUTDIR]");
+        eprintln!("usage: map2osm_rs <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUTDIR]");
         exit(1);
     }
     let src = &args[0];
@@ -1134,6 +1222,7 @@ fn main() {
     let mut rfilter: Option<String> = None;
     let mut outdir: Option<String> = None;
     let mut bbox_spec = "none".to_string();
+    let mut format = OutFormat::Xml;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1151,6 +1240,17 @@ fn main() {
             }
             "-b" => {
                 bbox_spec = args[i + 1].clone();
+                i += 2;
+            }
+            "-f" | "--format" => {
+                format = match args[i + 1].trim().to_ascii_lowercase().as_str() {
+                    "pbf" | "osm.pbf" => OutFormat::Pbf,
+                    "xml" | "osm" => OutFormat::Xml,
+                    other => {
+                        eprintln!("error: unknown -f '{}', expected 'xml' or 'pbf'", other);
+                        exit(1);
+                    }
+                };
                 i += 2;
             }
             _ => i += 1,
@@ -1196,9 +1296,17 @@ fn main() {
         .map(|d| d as usize)
         .filter(|&d| d <= 3)
         .collect();
+    if format == OutFormat::Pbf && outdir.is_none() {
+        eprintln!("error: PBF output writes a file per level; use -o OUTDIR");
+        exit(1);
+    }
     if let Some(od) = &outdir {
         fs::create_dir_all(od).ok();
     }
+    let ext = match format {
+        OutFormat::Xml => "osm",
+        OutFormat::Pbf => "osm.pbf",
+    };
     let t0 = Instant::now();
     for ip in &idx_files {
         let r = match Region::load(ip) {
@@ -1210,16 +1318,27 @@ fn main() {
         };
         for &level in &lvls {
             if let Some(od) = &outdir {
-                let p = format!("{}/{}_L{}.osm", od, r.name, level);
-                match fs::File::create(&p).and_then(|f| write_region_level(&mut BufWriter::new(f), &r, level, &bbox)) {
-                    Ok((nn, nw)) => eprintln!("{}: {} nodes, {} ways", p, nn, nw),
+                let p = format!("{}/{}_L{}.{}", od, r.name, level, ext);
+                match collect_region(&r, level, &bbox) {
+                    Ok((nodes, ways)) => {
+                        let res = match format {
+                            OutFormat::Xml => fs::File::create(&p)
+                                .and_then(|f| write_region_xml(&mut BufWriter::new(f), nodes, ways)),
+                            OutFormat::Pbf => write_region_pbf(&p, &r, &nodes, &ways),
+                        };
+                        match res {
+                            Ok((nn, nw)) => eprintln!("{}: {} nodes, {} ways", p, nn, nw),
+                            Err(e) => eprintln!("error: {}: {}", p, e),
+                        }
+                    }
                     Err(e) => eprintln!("error: {}: {}", p, e),
                 }
             } else {
                 let stdout = io::stdout();
                 let mut w = BufWriter::new(stdout.lock());
-                if let Err(e) = write_region_level(&mut w, &r, level, &bbox) {
-                    eprintln!("error: {}", e);
+                match collect_region(&r, level, &bbox).and_then(|(nodes, ways)| write_region_xml(&mut w, nodes, ways)) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("error: {}", e),
                 }
             }
         }

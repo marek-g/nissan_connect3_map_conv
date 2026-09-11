@@ -1225,6 +1225,19 @@ fn attr<'i>(e: &'i quick_xml::events::BytesStart<'i>, key: &str) -> Option<&'i s
         })
 }
 
+// Entity-decoded attribute value (String). OSM XML escapes `& " ' < >` inside tag
+// values (e.g. name="KISS &amp; RIDE"), while the PBF reader hands over already
+// decoded strings — so the XML path must decode them too, otherwise a name like
+// `&` would be stored in the MAP as the literal `&amp;` and diverge from PBF.
+// Use for any value that can carry free text (tag k/v, relation role); plain
+// ids/coords/refs/enum attributes never contain entities and keep using attr().
+fn attr_dec(e: &quick_xml::events::BytesStart, key: &str) -> Option<String> {
+    e.attributes()
+        .filter_map(|a| a.ok())
+        .find(|a| a.key.as_ref() == key)
+        .and_then(|a| a.unescape_value().ok().map(|c| c.into_owned()))
+}
+
 fn node_coords(e: &quick_xml::events::BytesStart<'_>) -> Option<(i64, i64, i64)> {
     let id = attr(e, "id")?;
     let la = attr(e, "lat")?;
@@ -1523,17 +1536,22 @@ fn stitch_ways(chains: &[Vec<i64>]) -> Vec<Vec<i64>> {
     rings
 }
 
-fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
-    use std::io::BufReader;
-    // Stream from disk (not fs::read) so multi-GB extracts don't need a full in-memory buffer.
-    let file = fs::File::open(path).expect("open osm");
-    let mut reader = quick_xml::Reader::from_reader(BufReader::new(file));
-    let mut nodes: HashMap<i64, (i64, i64)> = HashMap::new();
-    let mut pois: Vec<(i64, i64, u16, String, u8, u16)> = Vec::new();
-    let mut roads: Vec<Road> = Vec::new();
-    let mut waterways: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
-    let mut areas: Vec<(Vec<(i64, i64)>, u16)> = Vec::new();
-
+// Format-agnostic parse state shared by the OSM XML and PBF readers. Element
+// classification (POI / road / waterway / area) is decided here, so both input
+// formats run the exact same pipeline and produce byte-identical MAP/IDX output.
+// Element order in the emitted vectors follows input-file order, which is the
+// conventional nodes→ways→relations (id-sorted) layout both `.osm` and `.osm.pbf`
+// exports use — so the two paths stay consistent feature-for-feature.
+struct ParseCtx {
+    bw: i64,
+    bs: i64,
+    be: i64,
+    bn: i64,
+    nodes: HashMap<i64, (i64, i64)>,
+    pois: Vec<(i64, i64, u16, String, u8, u16)>,
+    roads: Vec<Road>,
+    waterways: Vec<(Vec<(i64, i64)>, u16)>,
+    areas: Vec<(Vec<(i64, i64)>, u16)>,
     // Multipolygon/boundary relation support: OSM area relations carry their tags on the
     // <relation>, not the member ways, and members are usually open boundary arcs (never
     // closed on their own -> the closed-way path below misses them entirely). We keep every
@@ -1541,11 +1559,196 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
     // area ways are deferred so a way also used as a relation member is emitted once (relation
     // wins). Interior rings (role="inner") are dropped: the single-ring area pipeline fills
     // donuts (the TravelMap cell has no interior-ring / hole representation).
-    let mut way_nodes: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut rel_member: HashSet<i64> = HashSet::new();
-    let mut standalone_areas: Vec<(i64, Vec<(i64, i64)>, u16)> = Vec::new();
+    way_nodes: HashMap<i64, Vec<i64>>,
+    rel_member: HashSet<i64>,
+    standalone_areas: Vec<(i64, Vec<(i64, i64)>, u16)>,
+}
 
-    let mut cur_node: Option<i64> = None;
+impl ParseCtx {
+    fn new(bw: i64, bs: i64, be: i64, bn: i64) -> ParseCtx {
+        ParseCtx {
+            bw,
+            bs,
+            be,
+            bn,
+            nodes: HashMap::new(),
+            pois: Vec::new(),
+            roads: Vec::new(),
+            waterways: Vec::new(),
+            areas: Vec::new(),
+            way_nodes: HashMap::new(),
+            rel_member: HashSet::new(),
+            standalone_areas: Vec::new(),
+        }
+    }
+
+    fn in_bbox(&self, lo: i64, la: i64) -> bool {
+        lo >= self.bw && lo <= self.be && la >= self.bs && la <= self.bn
+    }
+
+    // Node coordinate already known; emit a POI when the tags mark a point of interest
+    // (amenity/tourism/shop/place) and the node lies inside the target bbox.
+    fn maybe_poi(&mut self, lo: i64, la: i64, tags: &HashMap<String, String>) {
+        let is_poi = tags
+            .keys()
+            .any(|k| matches!(k.as_str(), "amenity" | "tourism" | "shop" | "place"));
+        if is_poi && self.in_bbox(lo, la) {
+            let name = tags.get("name").cloned().unwrap_or_default();
+            let cb = city_bits(tags);
+            self.pois.push((lo, la, poi_feat(tags), name, poi_rank(tags), cb));
+        }
+    }
+
+    fn node(&mut self, id: i64, lo: i64, la: i64, tags: &HashMap<String, String>) {
+        self.nodes.insert(id, (lo, la));
+        self.maybe_poi(lo, la, tags);
+    }
+
+    fn way(&mut self, id: Option<i64>, ids: Vec<i64>, tags: HashMap<String, String>) {
+        if let Some(w) = id {
+            self.way_nodes.insert(w, ids.clone());
+        }
+        let g = |k: &str| tags.get(k).map(|s| s.as_str());
+        let pts: Vec<(i64, i64)> = ids.iter().filter_map(|id| self.nodes.get(id).copied()).collect();
+        if !pts.is_empty() && pts.iter().any(|&(lo, la)| self.in_bbox(lo, la)) {
+            // Priority: highway > waterway > closed area. Clipping later drops any
+            // part that falls outside the region, so a shape only needs to overlap.
+            if let Some(hw) = g("highway") {
+                if pts.len() >= 2 {
+                    let toll = matches!(g("toll"), Some("yes") | Some("1"));
+                    let refn = g("ref").map(|s| s.to_string());
+                    let stname = g("name").map(|s| s.to_string());
+                    let mut w = roadinfo_w(hw, g("junction"), toll);
+                    // Drivable local streets -> the thin WHITE + dark-outline pen:
+                    // feature 0x35 with netclass forced to 4. Measured on-car
+                    // (trials/18-20): the pen is f(feature, netclass); netclass 5/6
+                    // force a THICK yellow/red pen regardless of the feature byte, while
+                    // netclass 4 is feature-driven, so 0x35 there renders white. netclass
+                    // 4 (not 7) is deliberate for LOD: the thin grey 0x21 lines carry no
+                    // netclass hint so the engine can only hide them once the L3 tile
+                    // unloads, which let them outlive the white streets on zoom-out.
+                    // Giving white netclass 4 (shown from the coarser tiers like tertiary)
+                    // keeps it visible no shorter than the thin lines -> correct ordering.
+                    // (service/track/path also use netclass 7 but keep feature 0x21, so
+                    // they remain thin grey and L3-only.)
+                    let local = matches!(
+                        hw.strip_suffix("_link").unwrap_or(hw),
+                        "residential" | "living_street" | "unclassified"
+                    );
+                    if local {
+                        w = (w & !7) | 4;
+                    }
+                    let fo = if local { Some(0x35) } else { None };
+                    self.roads.push((pts, w, refn, stname, fo));
+                }
+            } else if let Some(ww) = g("waterway") {
+                if pts.len() >= 2 {
+                    self.waterways.push((pts, watercode(ww)));
+                }
+            } else if ids.len() >= 4 && ids.first() == ids.last() {
+                if let Some(feat) = area_feat(&tags) {
+                    let mut ring = pts;
+                    ring.pop(); // drop the closing vertex -> open loop (Bosch convention)
+                    if ring.len() >= 3 {
+                        self.standalone_areas.push((id.unwrap_or(-1), ring, feat));
+                    }
+                }
+            }
+        }
+    }
+
+    // members: way-type relation members as (role, way_ref), in relation order.
+    fn relation(&mut self, members: Vec<(String, i64)>, tags: HashMap<String, String>) {
+        let rtype = tags.get("type").map(|s| s.as_str());
+        if !matches!(rtype, Some("multipolygon") | Some("boundary")) || members.is_empty() {
+            return;
+        }
+        // Only relations whose own tags map to a land-use area both emit a
+        // polygon and claim their member ways (suppressing those ways' standalone
+        // emission). A relation with no area mapping (e.g. administrative
+        // boundary) claims nothing, so a member way's own area tags still count.
+        if let Some(feat) = area_feat(&tags) {
+            for (_, w) in &members {
+                self.rel_member.insert(*w);
+            }
+            let chains: Vec<Vec<i64>> = members
+                .iter()
+                .filter(|(role, _)| role != "inner") // holes unsupported -> filled
+                .filter_map(|(_, w)| self.way_nodes.get(w).cloned())
+                .collect();
+            for ring_ids in stitch_ways(&chains) {
+                let ring: Vec<(i64, i64)> =
+                    ring_ids.iter().filter_map(|id| self.nodes.get(id).copied()).collect();
+                if ring.len() >= 3 && ring.iter().any(|&(lo, la)| self.in_bbox(lo, la)) {
+                    self.areas.push((ring, feat));
+                }
+            }
+        }
+    }
+
+    // Emit deferred standalone closed-area ways, skipping any a relation already owns.
+    fn finish(mut self) -> OsmData {
+        for (wid, ring, feat) in self.standalone_areas {
+            if !self.rel_member.contains(&wid) {
+                self.areas.push((ring, feat));
+            }
+        }
+        OsmData { pois: self.pois, roads: self.roads, waterways: self.waterways, areas: self.areas }
+    }
+}
+
+// Input container formats accepted by parse_input().
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputFormat {
+    OsmXml,
+    Pbf,
+}
+
+// Pick the parser by file name, falling back to sniffing the first byte: OSM XML
+// opens with '<' (after optional BOM/whitespace), a PBF starts with a 4-byte big-
+// endian BlobHeader length. An explicit .pbf extension always wins.
+fn detect_input_format(path: &str) -> InputFormat {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".pbf") {
+        return InputFormat::Pbf;
+    }
+    if let Ok(mut f) = fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = [0u8; 4];
+        if let Ok(n) = f.read(&mut buf) {
+            for &b in &buf[..n] {
+                match b {
+                    b'<' => return InputFormat::OsmXml,
+                    b' ' | b'\t' | b'\r' | b'\n' => continue,
+                    _ => return InputFormat::Pbf,
+                }
+            }
+        }
+    }
+    InputFormat::OsmXml
+}
+
+// Nanodegrees (PBF unit) -> degrees, reconstructed through the exact decimal so the
+// result equals the OSM XML string parse of the same coordinate and therefore the
+// same PAU integer via deg2pau (source coords are <= 7 decimals).
+fn nd_to_deg(nd: i64) -> f64 {
+    if nd < 0 {
+        return -nd_to_deg(-nd);
+    }
+    let whole = nd / 1_000_000_000;
+    let frac = nd % 1_000_000_000;
+    format!("{}.{:09}", whole, frac).parse::<f64>().unwrap_or_else(|_| nd as f64 / 1e9)
+}
+
+// OSM XML reader (streaming).
+fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
+    use std::io::BufReader;
+    // Stream from disk (not fs::read) so multi-GB extracts don't need a full in-memory buffer.
+    let file = fs::File::open(path).expect("open osm");
+    let mut reader = quick_xml::Reader::from_reader(BufReader::new(file));
+    let mut ctx = ParseCtx::new(bw, bs, be, bn);
+
+    let mut cur_node: Option<(i64, i64, i64)> = None;
     let mut cur_tags: HashMap<String, String> = HashMap::new();
     let mut cur_way_id: Option<i64> = None;
     let mut cur_way_ids: Option<Vec<i64>> = None;
@@ -1560,8 +1763,8 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
             Ok(Event::Start(e)) => match e.name().as_ref() {
                 "node" => {
                     if let Some((id, lo, la)) = node_coords(&e) {
-                        nodes.insert(id, (lo, la));
-                        cur_node = Some(id);
+                        ctx.nodes.insert(id, (lo, la));
+                        cur_node = Some((id, lo, la));
                         cur_tags.clear();
                     }
                 }
@@ -1580,7 +1783,7 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
             Ok(Event::Empty(e)) => match e.name().as_ref() {
                 "node" => {
                     if let Some((id, lo, la)) = node_coords(&e) {
-                        nodes.insert(id, (lo, la));
+                        ctx.nodes.insert(id, (lo, la));
                     }
                 }
                 "nd" => {
@@ -1595,19 +1798,19 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
                 "member" => {
                     if in_relation && attr(&e, "type") == Some("way") {
                         if let Some(r) = attr(&e, "ref").and_then(|s| s.parse::<i64>().ok()) {
-                            let role = attr(&e, "role").unwrap_or("").to_string();
+                            let role = attr_dec(&e, "role").unwrap_or_default();
                             cur_rel_members.push((role, r));
                         }
                     }
                 }
                 "tag" => {
-                    if let (Some(k), Some(v)) = (attr(&e, "k"), attr(&e, "v")) {
+                    if let (Some(k), Some(v)) = (attr_dec(&e, "k"), attr_dec(&e, "v")) {
                         if cur_node.is_some() {
-                            cur_tags.insert(k.to_string(), v.to_string());
+                            cur_tags.insert(k, v);
                         } else if cur_way_ids.is_some() {
-                            cur_way_tags.insert(k.to_string(), v.to_string());
+                            cur_way_tags.insert(k, v);
                         } else if in_relation {
-                            cur_rel_tags.insert(k.to_string(), v.to_string());
+                            cur_rel_tags.insert(k, v);
                         }
                     }
                 }
@@ -1615,116 +1818,22 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
                 "node" => {
-                    if let Some(nid) = cur_node.take() {
-                        let is_poi = cur_tags.keys().any(|k| {
-                            matches!(k.as_str(), "amenity" | "tourism" | "shop" | "place")
-                        });
-                        if is_poi {
-                                if let Some((lo, la)) = nodes.get(&nid) {
-                                if *lo >= bw && *lo <= be && *la >= bs && *la <= bn {
-                                    let name = cur_tags.get("name").cloned().unwrap_or_default();
-                                    let cb = city_bits(&cur_tags);
-                                    pois.push((*lo, *la, poi_feat(&cur_tags), name, poi_rank(&cur_tags), cb));
-                                }
-                            }
-                        }
+                    if let Some((_, lo, la)) = cur_node.take() {
+                        ctx.maybe_poi(lo, la, &cur_tags);
                         cur_tags.clear();
                     }
                 }
                 "way" => {
                     if let Some(ids) = cur_way_ids.take() {
-                        let wid = cur_way_id.take();
-                        if let Some(w) = wid {
-                            way_nodes.insert(w, ids.clone());
-                        }
                         let tags = std::mem::take(&mut cur_way_tags);
-                        let g = |k: &str| tags.get(k).map(|s| s.as_str());
-                        let pts: Vec<(i64, i64)> =
-                            ids.iter().filter_map(|id| nodes.get(id).copied()).collect();
-                        if !pts.is_empty()
-                            && pts
-                                .iter()
-                                .any(|&(lo, la)| lo >= bw && lo <= be && la >= bs && la <= bn)
-                        {
-                            // Priority: highway > waterway > closed area. Clipping later drops any
-                            // part that falls outside the region, so a shape only needs to overlap.
-                            if let Some(hw) = g("highway") {
-                                if pts.len() >= 2 {
-                                    let toll = matches!(g("toll"), Some("yes") | Some("1"));
-                                    let refn = g("ref").map(|s| s.to_string());
-                                    let stname = g("name").map(|s| s.to_string());
-                                    let mut w = roadinfo_w(hw, g("junction"), toll);
-                                    // Drivable local streets -> the thin WHITE + dark-outline pen:
-                                    // feature 0x35 with netclass forced to 4. Measured on-car
-                                    // (trials/18-20): the pen is f(feature, netclass); netclass 5/6
-                                    // force a THICK yellow/red pen regardless of the feature byte, while
-                                    // netclass 4 is feature-driven, so 0x35 there renders white. netclass
-                                    // 4 (not 7) is deliberate for LOD: the thin grey 0x21 lines carry no
-                                    // netclass hint so the engine can only hide them once the L3 tile
-                                    // unloads, which let them outlive the white streets on zoom-out.
-                                    // Giving white netclass 4 (shown from the coarser tiers like tertiary)
-                                    // keeps it visible no shorter than the thin lines -> correct ordering.
-                                    // (service/track/path also use netclass 7 but keep feature 0x21, so
-                                    // they remain thin grey and L3-only.)
-                                    let local = matches!(
-                                        hw.strip_suffix("_link").unwrap_or(hw),
-                                        "residential" | "living_street" | "unclassified"
-                                    );
-                                    if local {
-                                        w = (w & !7) | 4;
-                                    }
-                                    let fo = if local { Some(0x35) } else { None };
-                                    roads.push((pts, w, refn, stname, fo));
-                                }
-                            } else if let Some(ww) = g("waterway") {
-                                if pts.len() >= 2 {
-                                    waterways.push((pts, watercode(ww)));
-                                }
-                            } else if ids.len() >= 4 && ids.first() == ids.last() {
-                                if let Some(feat) = area_feat(&tags) {
-                                    let mut ring = pts;
-                                    ring.pop(); // drop the closing vertex -> open loop (Bosch convention)
-                                    if ring.len() >= 3 {
-                                        standalone_areas.push((wid.unwrap_or(-1), ring, feat));
-                                    }
-                                }
-                            }
-                        }
+                        ctx.way(cur_way_id.take(), ids, tags);
                     }
                 }
                 "relation" => {
                     in_relation = false;
                     let tags = std::mem::take(&mut cur_rel_tags);
                     let members = std::mem::take(&mut cur_rel_members);
-                    let rtype = tags.get("type").map(|s| s.as_str());
-                    if matches!(rtype, Some("multipolygon") | Some("boundary")) && !members.is_empty()
-                    {
-                        // Only relations whose own tags map to a land-use area both emit a
-                        // polygon and claim their member ways (suppressing those ways' standalone
-                        // emission). A relation with no area mapping (e.g. administrative
-                        // boundary) claims nothing, so a member way's own area tags still count.
-                        if let Some(feat) = area_feat(&tags) {
-                            for (_, w) in &members {
-                                rel_member.insert(*w);
-                            }
-                            let chains: Vec<Vec<i64>> = members
-                                .iter()
-                                .filter(|(role, _)| role != "inner") // holes unsupported -> filled
-                                .filter_map(|(_, w)| way_nodes.get(w).cloned())
-                                .collect();
-                            for ring_ids in stitch_ways(&chains) {
-                                let ring: Vec<(i64, i64)> =
-                                    ring_ids.iter().filter_map(|id| nodes.get(id).copied()).collect();
-                                if ring.len() >= 3
-                                    && ring
-                                        .iter()
-                                        .any(|&(lo, la)| lo >= bw && lo <= be && la >= bs && la <= bn)
-                                {
-                                    areas.push((ring, feat));
-                                }
-                            }
-                        }
-                    }
+                    ctx.relation(members, tags);
                 }
                 _ => {}
             },
@@ -1733,14 +1842,75 @@ fn parse_osm(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
         }
         buf.clear();
     }
-    // Emit deferred standalone closed-area ways, skipping any that a relation already owns.
-    for (wid, ring, feat) in standalone_areas {
-        if !rel_member.contains(&wid) {
-            areas.push((ring, feat));
-        }
-    }
-    OsmData { pois, roads, waterways, areas }
+    ctx.finish()
 }
+
+// OSM PBF (.osm.pbf) reader via pbf-craft. The PBF element model carries coordinates as
+// integer nanodegrees; they are converted to degrees with the exact-decimal nd_to_deg so
+// the PAU geometry matches the OSM XML path (same source -> same MAP/IDX). Nodes/ways/
+// relations are fed through the shared ParseCtx, in file order.
+fn parse_pbf(path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
+    use pbf_craft::models::{Element, ElementType, Tag as PbfTag};
+    use pbf_craft::readers::PbfReader;
+
+    fn tags_to_map(tags: &[PbfTag]) -> HashMap<String, String> {
+        let mut m = HashMap::with_capacity(tags.len());
+        for t in tags {
+            m.insert(t.key.clone(), t.value.clone());
+        }
+        m
+    }
+
+    let mut ctx = ParseCtx::new(bw, bs, be, bn);
+    let mut reader = PbfReader::from_path(path).unwrap_or_else(|e| panic!("open pbf {}: {}", path, e));
+    reader
+        .read(|_header, element| {
+            let Some(element) = element else { return };
+            match element {
+                Element::Node(n) => {
+                    if !n.visible {
+                        return;
+                    }
+                    let lo = deg2pau(nd_to_deg(n.longitude));
+                    let la = deg2pau(nd_to_deg(n.latitude));
+                    let tags = tags_to_map(&n.tags);
+                    ctx.node(n.id, lo, la, &tags);
+                }
+                Element::Way(w) => {
+                    if !w.visible {
+                        return;
+                    }
+                    let ids: Vec<i64> = w.way_nodes.iter().map(|wn| wn.id).collect();
+                    let tags = tags_to_map(&w.tags);
+                    ctx.way(Some(w.id), ids, tags);
+                }
+                Element::Relation(r) => {
+                    if !r.visible {
+                        return;
+                    }
+                    // Only way members drive geometry (same as the XML reader).
+                    let members: Vec<(String, i64)> = r
+                        .members
+                        .iter()
+                        .filter(|m| m.member_type == ElementType::Way)
+                        .map(|m| (m.role.clone(), m.member_id))
+                        .collect();
+                    let tags = tags_to_map(&r.tags);
+                    ctx.relation(members, tags);
+                }
+            }
+        })
+        .unwrap_or_else(|e| panic!("read pbf {}: {}", path, e));
+    ctx.finish()
+}
+
+fn parse_input(fmt: InputFormat, path: &str, bw: i64, bs: i64, be: i64, bn: i64) -> OsmData {
+    match fmt {
+        InputFormat::Pbf => parse_pbf(path, bw, bs, be, bn),
+        InputFormat::OsmXml => parse_osm(path, bw, bs, be, bn),
+    }
+}
+
 
 // ---- .MAP / .IDX emitters --------------------------------------------------
 // MAP header + info/partition/metadata region [0x00..binOff) is copied verbatim from the stock
@@ -2008,6 +2178,7 @@ fn main() {
     // lets --region=N6E1 appear in any position without being mistaken for the bbox.
     let mut region_arg: Option<String> = None;
     let mut bbox_arg: Option<String> = None;
+    let mut fmt_override: Option<InputFormat> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut it = argv.iter().skip(1);
     while let Some(a) = it.next() {
@@ -2023,6 +2194,10 @@ fn main() {
             if let Some(v) = it.next() {
                 bbox_arg = Some(v.clone());
             }
+        } else if a == "--pbf" {
+            fmt_override = Some(InputFormat::Pbf);
+        } else if a == "--osm" || a == "--xml" {
+            fmt_override = Some(InputFormat::OsmXml);
         } else if bbox_arg.is_none() && pos.len() >= 2 && a.contains(',') {
             bbox_arg = Some(a.clone()); // 3rd positional = bbox, legacy form
         } else {
@@ -2054,7 +2229,18 @@ fn main() {
     };
 
     let t0 = std::time::Instant::now();
-    let mut osm = parse_osm(&osm_in, bw, bs, be, bn);
+    // Input container: OSM XML or PBF. Autodetected (extension + magic byte) unless
+    // --pbf / --osm forces one. Both feed the identical classification pipeline.
+    let fmt = fmt_override.unwrap_or_else(|| detect_input_format(&osm_in));
+    eprintln!(
+        "reading {} as {}",
+        osm_in,
+        match fmt {
+            InputFormat::Pbf => "OSM PBF",
+            InputFormat::OsmXml => "OSM XML",
+        }
+    );
+    let mut osm = parse_input(fmt, &osm_in, bw, bs, be, bn);
 
     // ---- #06 isolation ladder: content-reduction modes (env OSM2MAP_MODE) ----
     // Each mode is a CUMULATIVE superset of the previous, so the first rung that reboots pins the

@@ -3,9 +3,10 @@ name = "osm2map"
 version = "1.0.0"
 edition = "2021"
 
-# quick-xml streams the OSM XML (nodes/ways). serde not needed yet.
+# quick-xml streams the OSM XML (nodes/ways). pbf-craft reads OSM PBF (.osm.pbf).
 [dependencies]
 quick-xml = { version = "0.42", default-features = false }
+pbf-craft = "1.0"
 
 [[bin]]
 name = "osm2map_rs"

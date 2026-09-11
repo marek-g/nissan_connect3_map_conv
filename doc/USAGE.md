@@ -3,24 +3,32 @@
 ## Build
 
 ```bash
-for p in map2osm_rs rnw_extract_rs rnw_join_rs rnw2osm_rs; do (cd $p && cargo build --release); done
+for p in map2osm_rs osm2map_rs rnw_extract_rs rnw_join_rs rnw2osm_rs; do (cd src/$p && cargo build --release); done
 ```
 
-## MAP → OSM XML
+Binaries land in the shared cargo target dir (`.../release/map2osm_rs`, `.../release/osm2map_rs`).
+
+## MAP → OSM (XML or PBF)
 
 Please note that current converter assumes that all files are uncompressed under the same name. The decompressor can be found here: https://github.com/sapphire-bt/lcn2kai-decompress
 
 ```bash
-map2osm_rs <IDX_file | MAP_dir> [-r REGIONS] [-l LEVELS] [-o OUT_DIR]
+map2osm_rs <IDX_file | MAP_dir> [-r REGIONS] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUT_DIR]
 
-# Poland, all detail levels:
+# Poland, all detail levels, OSM XML:
 map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
+
+# Same, but emit compact OSM PBF instead of XML:
+map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -f pbf -o /tmp/pl
 ```
 
 - `-r` — exact region codes, comma-separated (`N6E1` ≠ `N6E10`); omit = all 411 regions
 - `-l` — levels: L0 = whole-region outline, L1–L3 increasing detail (default `123`)
-- Output: `OUT_DIR/<REGION>_L<level>.osm` — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*` and decoded annotation payloads (`tm:surface`, `tm:elev`, `tm:water_class/type`, `tm:netclass`, `tm:xfree`, `tm:roadinfo`, `tm:city_display/size/admin/overlap` — see `TravelMap_format/02 - details/MAP_format.md` §8).
-- N6E2 L2 ≈ 560 MB in ~6 s. A full-world conversion is multi-GB — convert per region and/or gzip.
+- `-b W,S,E,N` — keep only tiles whose extent overlaps the box (degrees); a tile-level selection, **not** a geometry clip. Default `none` = whole region.
+- `-f xml|pbf` — output container (default `xml`). `pbf` requires `-o`; writes compact `.osm.pbf` (dense-node) files that open directly in JOSM/osmium and are ~8–15× smaller than the XML.
+- Output: `OUT_DIR/<REGION>_L<level>.osm` (or `.osm.pbf`) — POIs as `<node>`, lines as open `<way>`, polygons as closed `<way>`. Tags: `name`, `name:alt`, `ref`, plus original properties under `tm:*` and decoded annotation payloads (`tm:surface`, `tm:elev`, `tm:water_class/type`, `tm:netclass`, `tm:xfree`, `tm:roadinfo`, `tm:city_display/size/admin/overlap` — see `TravelMap_format/02 - details/MAP_format.md` §8).
+- Both containers carry the **same** objects, ids, versions, timestamps and tags — only the encoding differs. Coordinates agree to the PBF resolution grid (integer nanodegrees, ~1e-7° ≈ 10 cm); XML is written at `{:.8}`°.
+- N6E2 L2 ≈ 560 MB in ~6 s. A full-world conversion is multi-GB — convert per region and/or gzip; `-f pbf` is the compact alternative.
 
 ## 3. Road names from RNW (optional)
 
@@ -170,7 +178,31 @@ sudo apt install osmctools
 osmconvert ./malopolskie-260824.osm.pbf -o=malopolskie-260824.osm
 ```
 
-# OSM -> TravelMap conversion
+# OSM → TravelMap conversion
 
-Not implemented yet
+`osm2map_rs` writes the same `.IDX` / `.MAP` / `.TCI` layout back from OSM data. The
+input container — **OSM XML** or **OSM PBF** — is autodetected from the file extension
+and first byte; both feed one identical classification pipeline, so the emitted binary
+is byte-identical for the two encodings of the same map.
+
+```bash
+osm2map_rs <in.osm|in.osm.pbf> <OUT_DIR> [W,S,E,N] [--region=NAME] [--bbox=W,S,E,N] [--pbf|--osm]
+
+# Whole region from a PBF extract, writing region N6E2:
+osm2map_rs krakow.osm.pbf /tmp/out --region=N6E2
+
+# Only a sub-box of a large XML file (positional bbox = legacy form):
+osm2map_rs malopolskie.osm /tmp/out 19.6,49.95,20.15,50.30 --region=N6E2
+```
+
+- `<in.osm|in.osm.pbf>` — input; `.pbf` extension wins, otherwise sniffed (`<` → XML, else PBF).
+  Omit for `--region=N6E2` default input; use `--pbf` / `--osm` (`--xml`) to force a container.
+- `<OUT_DIR>` — where `<REGION>AA.IDX` + `N6E2102.*` (land) + `N6E210I.*` (hydro) are written.
+- `[W,S,E,N]` / `--bbox` — clip the input to a box (degrees); omit = the region's stock bounds.
+- `--region=NAME` (or `OSM2MAP_REGION`) — target region code whose stock `AA.IDX` header + bounds
+  seed the output (resinf catalog); must be a real stock region so W()/S()/E()/N() resolve.
+
+Output is verified consistent both ways: full `malopolskie` via `.osm` and via `.osm.pbf`
+produces byte-identical `IDX`/`MAP`/`TCI` (≈145 MB land MAP), and either output re-decodes
+through `map2osm_rs` (`-f xml` vs `-f pbf`) with zero element/tag differences.
 
