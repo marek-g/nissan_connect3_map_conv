@@ -1150,13 +1150,17 @@ fn distribute(
         }
     }
 
+    let area_th = min_area_diag(level) as f64;
+    let area_th2 = area_th * area_th;
     for (geom, feat) in areas {
         let (c0, c1, r0, r1) = cell_span(level, geom);
         for c in c0..=c1 {
             for r in r0..=r1 {
                 let rect = cell_rect(level, c, r);
                 let slice = clip_polygon(geom, rect);
-                if slice.len() >= 3 {
+                // Per-level area LOD: drop landuse smaller than the level threshold (dense
+                // buildings never reach the coarse tiles). L3 threshold 0 -> keep all.
+                if slice.len() >= 3 && bbox_diag2(&slice) >= area_th2 {
                     // Per-level LOD first, then tessellator-safe cap below 256 vertices.
                     let sim = simplify_ring(&slice, eps2);
                     let ring = decimate_ring(&sim);
@@ -1404,6 +1408,24 @@ fn max_poi_rank() -> [u8; 4] {
 const SIM_EPS_ON: [i64; 4] = [209715, 41943, 4194, 419];
 fn sim_eps(level: usize) -> i64 {
     if lod_on() { SIM_EPS_ON[level] } else { 1 }
+}
+
+// Per-level minimum AREA size (polygon bbox diagonal, PAU) that a tile keeps. Dense landuse
+// (buildings/blocks) otherwise floods the coarse L0/L1/L2 tiles past the hard 15-sub-block-per-
+// tile cap (a tile can hold at most 15 x 65535-word blocks). Coarser levels carry only large
+// areas (forests, lakes, big districts); L3 (street view) keeps EVERYTHING (threshold 0), so the
+// street-level look is unchanged. Defaults mirror tile_width/1024 (≈ SIM_EPS_ON). Override the
+// coarse three with OSM2MAP_MINAREA="t0,t1,t2" (PAU) to tune density without a rebuild.
+fn min_area_diag(level: usize) -> i64 {
+    let mut t = [SIM_EPS_ON[0], SIM_EPS_ON[1], SIM_EPS_ON[2], 0];
+    if let Some(s) = env::var("OSM2MAP_MINAREA").ok() {
+        for (i, part) in s.split(',').take(3).enumerate() {
+            if let Ok(v) = part.trim().parse::<i64>() {
+                t[i] = v;
+            }
+        }
+    }
+    t[level]
 }
 
 struct OsmData {
@@ -1707,16 +1729,20 @@ fn patch_bbox(d: &mut [u8], base: usize) {
 }
 
 // ---- sub-block packing -----------------------------------------------------
-// A block's length is stored in u16 (max 65535 words / 262KB). Dense tiles exceed that, so a
-// tile's features are packed into several sub-blocks and the tile slot becomes a multi-entry
-// (bit14) referencing each. Real N6E2 data does exactly this (max single block ~63726 words).
-const MAX_BLOCK_WORDS: u32 = 0xF800; // per-sub-block cap, below the u16 limit with margin
+// A block's length lives in a u16 word count, so a single block (and its IDX slot/sub-entry
+// length) MUST stay <= 65535 words; the in-block marker is written as `total_words & 0xFFFF`, so
+// exceeding it wraps the marker to a tiny blen and the strict renderer / tmcheck walks the
+// annotation+text region past the (wrapped) block -> SIGSEGV signature. The packing budget is set
+// just under 65536 (4-word header + feature costs). Feature cost estimates below MUST match what
+// build_block actually lays, word for word, or a group's real size can blow past this cap.
+const MAX_BLOCK_WORDS: u32 = 65500; // < 65535-word u16 limit, small margin for the 4-word header
 
 fn poi_cost(name: &str) -> u32 {
-    if name.is_empty() {
+    if !label_ok(name) {
         3
     } else {
-        3 + 1 + ((name.len() + 4 + 3) / 4) as u32 // cell + text ann word + record
+        // cell(3) + one 0x7A ann word(1) + the actual (possibly 2-variant) text record
+        3 + 1 + text_rec_words(name)
     }
 }
 
@@ -1745,9 +1771,9 @@ fn pack_and_build_blocks(
             Some((t, _, _)) => ann_words(t),
             None => 0,
         };
-        // 0x7A street-name: 1 annotation word + its text record, when a name is present.
+        // 0x7A street-name: 1 annotation word + its (possibly 2-variant) text record, when named.
         let nm_w = match lc.nm.as_deref() {
-            Some(s) if !s.is_empty() && s.len() <= 254 => 1 + ((s.len() + 4 + 3) / 4) as u32,
+            Some(s) if label_ok(s) => 1 + text_rec_words(s),
             _ => 0,
         };
         cost.push(3 + lc.pts.len() as u32 + aw + rn_words(lc.rn.as_deref()) + nm_w);
