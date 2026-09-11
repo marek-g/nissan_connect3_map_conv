@@ -333,7 +333,9 @@ fn text_rec_bytes(raw: &str) -> Vec<u8> {
     let up = raw.to_uppercase();
     let pl = up.as_bytes();
     let ab = ascii_fold(&up).into_bytes();
-    if pl == ab {
+    if text_variants_ascii() {
+        v.push(1); v.push(flag); v.push(ab.len() as u8); v.extend_from_slice(&ab); v.push(0);
+    } else if pl == ab {
         v.push(1); v.push(flag); v.push(pl.len() as u8); v.extend_from_slice(pl); v.push(0);
     } else {
         v.push(2); v.push(flag); v.push(pl.len() as u8); v.push(TXT_ASCII_FLAG); v.push(ab.len() as u8);
@@ -350,6 +352,37 @@ fn text_rec_words(raw: &str) -> u32 {
 // A label is emit-safe when non-empty and short enough that both variant length bytes fit in a u8.
 fn label_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= 250
+}
+
+// Per-label-class emit gates (default ON), for the on-car name-crash bisect: each trial differs from
+// the car-crashing #23 by exactly ONE label class so we can see which 0x7A/0x14 path the render
+// engine faults on. OSM2MAP_LABEL_STREET / _POI / _ROADNUM.
+fn label_street_on() -> bool { env_on("OSM2MAP_LABEL_STREET") }
+fn label_poi_on() -> bool { env_on("OSM2MAP_LABEL_POI") }
+fn label_roadnum_on() -> bool { env_on("OSM2MAP_LABEL_ROADNUM") }
+
+// Label variant shape (bisect for the diacritic/2-variant reboot hypothesis). OSM2MAP_TEXT_VARIANTS:
+//   "stock" (default) = pure-ASCII single a7 variant, or the stock 2-variant (a7 PL + c5 ASCII) pair;
+//   "ascii"           = ALWAYS a single variant whose payload is the ASCII-folded, uppercase string
+//                       (pure ASCII, no diacritics ever) — tests whether the a7 payload's raw UTF-8
+//                       diacritics (or the 2-variant record itself) are what reboot the label engine.
+fn text_variants_ascii() -> bool {
+    matches!(env::var("OSM2MAP_TEXT_VARIANTS").unwrap_or_else(|_| "stock".into()).as_str(),
+        "ascii" | "single" | "fold")
+}
+
+// A POI may carry a name (0x7A) only when its feature renders a label safely. Feature 0x0001 is the
+// Bosch SETTLEMENT marker: the POI label renderer resolves it to a city style and REQUIRES the 0x21
+// city annotation to be present (measured on stock N6E2: EVERY named feat-0x01 cell carries a 0x21;
+// stock has ZERO bare {7a} feat-0x01 cells). A bare 0x7A name on a feat-0x0001 POI with no 0x21 makes
+// the renderer dereference a missing style entry and HARD-FAULTS the head unit. Root cause of #22/#23
+// (bisected by #24b POI-off = boots vs #24a street-off / #24d roadnum-off = both still crash, i.e. the
+// fault is the POI-name class). Our poi_feat() falls through to 0x0001 for any named node with an
+// unmapped amenity/tourism/shop sub-value (and city_bits()==0 with no place=*) -> ~6.8k such POIs in
+// Krakow metro alone. Suppress the name for exactly that case (a feat-0x0001 marker with no 0x21);
+// real settlements ({21,7a}) and every categorised POI (stock emits bare {7a} for 0x05/0x06/0x07) stay.
+fn poi_can_name(feat: u16, city: u16, name: &str) -> bool {
+    label_ok(name) && !(feat == 0x0001 && city == 0)
 }
 
 // Generic boolean env switch; default ON unless set to 0/n/none/false/off. Used by the #09
@@ -487,16 +520,18 @@ fn build_block(
             w += ann_words(typ);
             line_nrec[i] += 1;
         }
-        if rn_words(lines[i].rn.as_deref()) != 0 {
+        if label_roadnum_on() && rn_words(lines[i].rn.as_deref()) != 0 {
             line_rn[i] = Some(w);
             w += 2; // 0x14 = 8 bytes
             line_nrec[i] += 1;
         }
-        if let Some(s) = lines[i].nm.as_deref() {
-            if label_ok(s) {
-                line_nm[i] = Some(w);
-                w += 1; // 0x7A = 4 bytes {size, type, u16 textRef}
-                line_nrec[i] += 1;
+        if label_street_on() {
+            if let Some(s) = lines[i].nm.as_deref() {
+                if label_ok(s) {
+                    line_nm[i] = Some(w);
+                    w += 1; // 0x7A = 4 bytes {size, type, u16 textRef}
+                    line_nrec[i] += 1;
+                }
             }
         }
     }
@@ -506,7 +541,7 @@ fn build_block(
     let mut city_word = vec![0u32; nq];
     let mut poi_nrec = vec![0u16; nq];
     for i in 0..nq {
-        let has_name = pois[i].3.map_or(false, label_ok);
+        let has_name = label_poi_on() && pois[i].3.map_or(false, |s| poi_can_name(pois[i].2, pois[i].4, s));
         let has_city = pois[i].4 != 0;
         if has_name {
             ann_word[i] = w;
@@ -674,7 +709,7 @@ fn build_block(
 
     for i in 0..nq {
         if let Some(s) = pois[i].3 {
-            if label_ok(s) {
+            if label_poi_on() && poi_can_name(pois[i].2, pois[i].4, s) {
                 let aw = (ann_word[i] as usize) * 4;
                 b[aw] = 4; // size
                 b[aw + 1] = 0x7A; // type = TEXT
