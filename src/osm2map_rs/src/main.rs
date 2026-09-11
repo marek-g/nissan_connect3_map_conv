@@ -1410,14 +1410,20 @@ fn sim_eps(level: usize) -> i64 {
     if lod_on() { SIM_EPS_ON[level] } else { 1 }
 }
 
-// Per-level minimum AREA size (polygon bbox diagonal, PAU) that a tile keeps. Dense landuse
-// (buildings/blocks) otherwise floods the coarse L0/L1/L2 tiles past the hard 15-sub-block-per-
-// tile cap (a tile can hold at most 15 x 65535-word blocks). Coarser levels carry only large
-// areas (forests, lakes, big districts); L3 (street view) keeps EVERYTHING (threshold 0), so the
-// street-level look is unchanged. Defaults mirror tile_width/1024 (≈ SIM_EPS_ON). Override the
-// coarse three with OSM2MAP_MINAREA="t0,t1,t2" (PAU) to tune density without a rebuild.
+// Per-level minimum AREA size (polygon bbox diagonal, PAU) that a tile keeps. Coarse landuse
+// fragments (grass/meadow/wood/residential patches) otherwise flood the L1/L2 tiles past the
+// stock-observed per-tile budget (stock N6E2 keeps <=5 sub-blocks/tile; the real cliff, not 15).
+// LOD-ON floors are MEASURED from stock N6E2 dense tiles (Krakow/Warszawa L0/L1/L2 smallest kept
+// poly ~820 / 510 / 85 m bbox-diag), decoupled from the sub-pixel RDP tolerance (SIM_EPS_ON).
+// L3 (street view) threshold 0 keeps everything, so the street-level look is unchanged. LOD-OFF
+// keeps the historical SIM_EPS values (the car-validated sparse path). Override the coarse three
+// with OSM2MAP_MINAREA="t0,t1,t2" (PAU) to tune density without a rebuild.
 fn min_area_diag(level: usize) -> i64 {
-    let mut t = [SIM_EPS_ON[0], SIM_EPS_ON[1], SIM_EPS_ON[2], 0];
+    let mut t = if lod_on() {
+        [88_000, 55_000, 9_000, 0]
+    } else {
+        [SIM_EPS_ON[0], SIM_EPS_ON[1], SIM_EPS_ON[2], 0]
+    };
     if let Some(s) = env::var("OSM2MAP_MINAREA").ok() {
         for (i, part) in s.split(',').take(3).enumerate() {
             if let Ok(v) = part.trim().parse::<i64>() {
@@ -2120,10 +2126,14 @@ fn main() {
         // areas are local detail, so they're only emitted at L1/L2 (not the whole-country L0).
         // OSM2MAP_ROADNUM=0 clears every `ref` (suppresses 0x14 + text); OSM2MAP_STREETNAMES=0 clears
         // every street `name` (suppresses the 0x7A line label + text).
+        // The feature-override (fo=0x35 white local) is a COLOUR choice, NOT an LOD exemption: those
+        // ways still carry their true netclass (4), so they MUST be gated by `w & 7` like every other
+        // road. Letting `fo.is_some()` bypass the gate is what flooded dense-city L1/L2 tiles (every
+        // local street appeared at every zoom -> thousands of lines/tile -> past the stock <=5 blk cap).
         let roads: Vec<Road> = osm
             .roads
             .iter()
-            .filter(|(_, w, _, _, fo)| fo.is_some() || (*w & 7) <= mnc as u16)
+            .filter(|(_, w, _, _, _)| (*w & 7) <= mnc as u16)
             .map(|(g, w, rn, nm, fo)| {
                 (
                     g.clone(),
