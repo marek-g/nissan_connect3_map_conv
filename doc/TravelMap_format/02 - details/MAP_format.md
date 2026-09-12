@@ -4,9 +4,9 @@ Complete documentation of the `.IDX` / `.MAP` / `MAPWORLD.MAP` file format, reve
 engineered from the `DAPIAPP.OUT` binary (Ghidra, project "Nissan Ghidra Project") and
 verified against the firmware data.
 
-Converter implementing this format: [`map2osm_rs/`](../../../src/map2osm_rs/) (OSM XML, Rust;
-build with `cargo build --release`). Road-name enrichment: `rnw_extract_rs` +
-`rnw_join_rs` (also OSM XML in/out).
+Converter implementing this format: [`map2osm/`](../../../src/map2osm/) (OSM XML, Rust;
+build with `cargo build --release`). Road-name enrichment: `rnw_extract` +
+`rnw_join` (also OSM XML in/out).
 
 ---
 
@@ -809,13 +809,13 @@ Interning on the write side: `u16AddText` / `u16DumpToMem` @ `0x008e0584`.
 ## 9. Converter — Usage
 
 ```
-map2osm_rs   <IDX_file | directory> [-r CODES] [-l LEVELS] [-b W,S,E,N|none] [-o OUT_DIR]
+map2osm   <IDX_file | directory> [-r CODES] [-l LEVELS] [-b W,S,E,N|none] [-o OUT_DIR]
 ```
 
 - `-r N6E1,N6E2` — exact region-code filter (when a directory is given); omit for all 411 regions.
 - `-l 0123` — levels to convert (default `123`; **L0 works** — whole-region outline level).
 - `-b W,S,E,N` — bounding box in decimal degrees (west,south,east,north); only tiles whose
-  extent overlaps the box are converted. Same syntax as `rnw2osm_rs`. `none` (default) = no filter.
+  extent overlaps the box are converted. Same syntax as `rnw2osm`. `none` (default) = no filter.
 - `-o DIR` — writes `DIR/<REGION>_L<level>.osm` (OSM XML; omit for stdout).
 
 Output (see https://wiki.openstreetmap.org/wiki/OSM_XML): POIs → `<node>` with tags,
@@ -863,17 +863,17 @@ Examples:
 
 ```
 # whole regions, all default levels
-map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
+map2osm .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
 
 # only tiles overlapping a bounding box (Krzeszowice), detail level
-map2osm_rs .../DATA/DATA/MAP -r N6E2 -l 3 -b 19.50,50.05,19.88,50.28 -o /tmp/krz
+map2osm .../DATA/DATA/MAP -r N6E2 -l 3 -b 19.50,50.05,19.88,50.28 -o /tmp/krz
 ```
 
 Performance: N6E2 L2 ≈ 560 MB of OSM XML in ~6 s. A full world conversion is multi-GB —
 use per-region files and/or gzip the output.
 
-Road-name enrichment pipeline: `rnw_extract_rs [CCP_DIR] RNW.jsonl`, then
-`rnw_join_rs RNW.jsonl <REGION>_L2.osm <REGION>_L2_rnw.osm` adds `name`/`name:alt` and
+Road-name enrichment pipeline: `rnw_extract [CCP_DIR] RNW.jsonl`, then
+`rnw_join RNW.jsonl <REGION>_L2.osm <REGION>_L2_rnw.osm` adds `name`/`name:alt` and
 `rn_class/rn_netclass/rn_link/rn_sec` tags to the road ways (OSM XML in and out).
 See `RNW_format.md` for the RNW format.
 
@@ -994,7 +994,7 @@ the file format is identical either way.
 contributes nothing) or omit it (worst case: harmless `0x307` logs). Do **not** copy a TCI from
 another profile/region: its `clusterOffset`s point at that file's own layout and would be wrong.
 
-`osm2map_rs::emit_tci` generates a structurally-valid, all-empty TCI (header + descriptive block +
+`osm2map::emit_tci` generates a structurally-valid, all-empty TCI (header + descriptive block +
 partition table + zeroed record arrays) byte-identical to the stock 10I prefix; it round-trips
 byte-exact through CPRNAV. Emit it only if you target a cluster-using profile or want the file
 present to avoid the `0x307` logs.

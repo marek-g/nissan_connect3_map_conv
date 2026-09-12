@@ -3,7 +3,7 @@
 // Python version; formatting uses native Rust conventions (plain float
 // display, raw UTF-8 in strings instead of \uXXXX escapes).
 //
-// Usage: rnw_extract_rs <CCP_DIR> <out.jsonl> [-b W,S,E,N|none]
+// Usage: rnw_extract <CCP_DIR> <out.jsonl> [-b W,S,E,N|none]
 //
 // Format notes: see rnw_extract.py in the parent directory.
 

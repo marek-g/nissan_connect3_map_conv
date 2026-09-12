@@ -1,14 +1,11 @@
 [package]
-name = "cprnav_compress"
+name = "rnw_join"
 version = "1.0.0"
 edition = "2021"
 
 [[bin]]
-name = "cprnav_compress_rs"
+name = "rnw_join"
 path = "src/main.rs"
-
-[dependencies]
-cprnav = { path = "../cprnav" }
 
 [profile.release]
 opt-level = 3

@@ -1,6 +1,6 @@
 // CPRNAV_2 decompressor — command-line front-end.
 //
-// All codec logic lives in the `cprnav` library (shared with cprnav_compress_rs);
+// All codec logic lives in the `cprnav` library (shared with cprnav_compress);
 // this binary only walks the given file/dir and does I/O.
 
 use std::env;
@@ -33,7 +33,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0].eq_ignore_ascii_case("-h") || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  cprnav_decompress_rs <file> [out]\n  cprnav_decompress_rs <dir>  [outdir]"
+            "Usage:\n  cprnav_decompress <file> [out]\n  cprnav_decompress <dir>  [outdir]"
         );
         exit(if args.is_empty() { 1 } else { 0 });
     }

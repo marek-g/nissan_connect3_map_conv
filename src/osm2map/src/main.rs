@@ -1,10 +1,10 @@
 // Bosch TravelMap (Nissan LCN2KAI) OSM -> MAP/IDX writer. Emits the DECOMPRESSED
-// .IDX/.MAP layout (the same layout map2osm_rs reads), to be compressed with
-// cprnav_compress_rs for deployment.
+// .IDX/.MAP layout (the same layout map2osm reads), to be compressed with
+// cprnav_compress for deployment.
 //
 // M2 milestone: parse a real OSM XML extract, tile its objects across levels 0-3
 // of a fixed region (N6E2), and emit a multi-level .IDX/.MAP that round-trips
-// through map2osm_rs. Semantics (feature codes / names) are minimal here; M3 refines.
+// through map2osm. Semantics (feature codes / names) are minimal here; M3 refines.
 
 use quick_xml::events::Event;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1132,7 +1132,7 @@ fn build_block(
     b
 }
 
-// Tile center (PAU) for tile K of `level` — mirrors map2osm_rs tile_extent+tile_box.
+// Tile center (PAU) for tile K of `level` — mirrors map2osm tile_extent+tile_box.
 fn tile_center(level: usize, k: i64) -> (i64, i64) {
     let w = E() - W();
     let h = N() - S();

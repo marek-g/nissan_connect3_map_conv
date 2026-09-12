@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 [[bin]]
-name = "cprnav_decompress_rs"
+name = "cprnav_decompress"
 path = "src/main.rs"
 
 [dependencies]

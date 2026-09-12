@@ -7,7 +7,7 @@
 //! [`compress`] round-trip byte-exactly through [`decompress`] and through the
 //! firmware.
 //!
-//! The two command-line front-ends (`cprnav_compress_rs`, `cprnav_decompress_rs`)
+//! The two command-line front-ends (`cprnav_compress`, `cprnav_decompress`)
 //! are thin wrappers over this crate; everything the format needs lives here so
 //! the tables, bit codecs and LZ77 are defined once.
 //!

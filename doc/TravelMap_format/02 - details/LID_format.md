@@ -153,7 +153,7 @@ These are the main POI payload files, one per cluster/tile. They are **CPRNAV_2-
 ```
 
 **Decompression — SOLVED.** A corrected decompressor is in the repo:
-`src/cprnav_decompress_rs/` (`cprnav_decompress_rs`), verified byte-exact against the firmware. The
+`src/cprnav_decompress/` (`cprnav_decompress`), verified byte-exact against the firmware. The
 reference tool `Firmware/tools/lcn2kai-decompress/DecompressAlgorithm.py` fails on every LID file because it
 hard-codes a 16-bit per-block header; that is the *only* difference from MAP/IDX files:
 
@@ -214,7 +214,7 @@ ServiceArea, Sporting, Entertainment, Business, PublicBuilding, CarRentalBrand, 
 ## 6. `LID2/3/4/5nnnn` — map-object files  **[DECOMPRESSED; object structs partially mapped]**
 
 `LID2` is always raw; `LID3/4/5` are mixed — some raw, some CPRNAV_2 (`unknown=64`). The compressed ones now
-decompress with the §5 tool (`cprnav_decompress_rs`); the raw ones start directly with the opening below.
+decompress with the §5 tool (`cprnav_decompress`); the raw ones start directly with the opening below.
 Common raw opening (POL example, `LID20002.DAT`):
 
 ```
@@ -229,7 +229,7 @@ payloads. These carry **map objects** serialized by the same `fm_tcl*` module as
 (`fm_tclLineData`), polygon objects (`fm_tclPolyData`) and point objects — larger records than a point POI
 (e.g. `text_id` sits at `+0x3a` for line/poly; `display_scale` at `+6`). Per-object field layouts are only
 partially mapped; the §5 point record is the reference. Compressed siblings are unpacked first with
-`cprnav_decompress_rs` (§5).
+`cprnav_decompress` (§5).
 
 ---
 
@@ -257,7 +257,7 @@ partially mapped; the §5 point record is the reference. Compressed siblings are
 - File organization (regions × families + special files).
 - `GLOB_POI.DAT` fully (SQLite FTS3 schema, PAU coords, `REGION_ID`, `CAT_ID`) — trivially writable.
 - **CPRNAV_2 decompression for both header widths** (`block_size = unknown×0x400`; 16-bit vs 32-bit
-  per-block sizes) → `src/cprnav_decompress_rs/` unpacks every compressed LID and MAP/IDX file.
+  per-block sizes) → `src/cprnav_decompress/` unpacks every compressed LID and MAP/IDX file.
 - Common raw-file container shape (copyright/date/named sections) and the `TPLID_EQUIVALENT_CHAR` table.
 - **LID content-block structure** (§5): block header (`fm_tclStartBlockAccess`, bounding box @+0x18, version
   @+5), POI sequences, the point-POI record (`fm_tclPOIData`: display_scale@+6, PAU lon/lat @+0x0c/+0x10,

@@ -53,10 +53,10 @@ fn pau_to_deg(v: i64) -> f64 {
     (v as f64) * 180.0 / (1i64 << 31) as f64
 }
 
-// PAU per degree of longitude/latitude (inverse of pau_to_deg); matches rnw2osm_rs.
+// PAU per degree of longitude/latitude (inverse of pau_to_deg); matches rnw2osm.
 const PAU: f64 = (1i64 << 31) as f64 / 180.0;
 
-// Bounding box in degrees, same `-b W,S,E,N` syntax as rnw2osm_rs (`none` = disabled).
+// Bounding box in degrees, same `-b W,S,E,N` syntax as rnw2osm (`none` = disabled).
 // Only tiles whose extent shares any area with the box are converted.
 struct BBox {
     west: f64,
@@ -1214,7 +1214,7 @@ enum OutFormat {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: map2osm_rs <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUTDIR]");
+        eprintln!("usage: map2osm <IDX file or dir> [-r NAME_FILTER] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUTDIR]");
         exit(1);
     }
     let src = &args[0];

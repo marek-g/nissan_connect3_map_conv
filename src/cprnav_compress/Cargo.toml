@@ -1,11 +1,14 @@
 [package]
-name = "rnw_extract"
+name = "cprnav_compress"
 version = "1.0.0"
 edition = "2021"
 
 [[bin]]
-name = "rnw_extract_rs"
+name = "cprnav_compress"
 path = "src/main.rs"
+
+[dependencies]
+cprnav = { path = "../cprnav" }
 
 [profile.release]
 opt-level = 3

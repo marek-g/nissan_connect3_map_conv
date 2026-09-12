@@ -3,23 +3,23 @@
 ## Build
 
 ```bash
-for p in map2osm_rs osm2map_rs rnw_extract_rs rnw_join_rs rnw2osm_rs; do (cd src/$p && cargo build --release); done
+for p in map2osm osm2map rnw_extract rnw_join rnw2osm; do (cd src/$p && cargo build --release); done
 ```
 
-Binaries land in the shared cargo target dir (`.../release/map2osm_rs`, `.../release/osm2map_rs`).
+Binaries land in the shared cargo target dir (`.../release/map2osm`, `.../release/osm2map`).
 
 ## MAP → OSM (XML or PBF)
 
 Please note that current converter assumes that all files are uncompressed under the same name. The decompressor can be found here: https://github.com/sapphire-bt/lcn2kai-decompress
 
 ```bash
-map2osm_rs <IDX_file | MAP_dir> [-r REGIONS] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUT_DIR]
+map2osm <IDX_file | MAP_dir> [-r REGIONS] [-l LEVELS] [-b W,S,E,N|none] [-f xml|pbf] [-o OUT_DIR]
 
 # Poland, all detail levels, OSM XML:
-map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
+map2osm .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -o /tmp/pl
 
 # Same, but emit compact OSM PBF instead of XML:
-map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -f pbf -o /tmp/pl
+map2osm .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -f pbf -o /tmp/pl
 ```
 
 - `-r` — exact region codes, comma-separated (`N6E1` ≠ `N6E10`); omit = all 411 regions
@@ -33,8 +33,8 @@ map2osm_rs .../DATA/DATA/MAP -r N6E1,N6E2 -l 123 -f pbf -o /tmp/pl
 ## 3. Road names from RNW (optional)
 
 ```bash
-rnw_extract_rs <CCP_dir> RNW.jsonl [-b W,S,E,N|none]   # ~70 s for all 8,257 files (whole EUR)
-rnw_join_rs    RNW.jsonl /tmp/pl/N6E2_L2.osm /tmp/pl/N6E2_L2_rnw.osm   # ~10 s
+rnw_extract <CCP_dir> RNW.jsonl [-b W,S,E,N|none]   # ~70 s for all 8,257 files (whole EUR)
+rnw_join    RNW.jsonl /tmp/pl/N6E2_L2.osm /tmp/pl/N6E2_L2_rnw.osm   # ~10 s
 ```
 
 Adds `name`/`name:alt` (to unnamed roads) and, to every matched road way
@@ -51,13 +51,13 @@ All other elements pass through unchanged.
 ## 3b. RNW → OSM XML (standalone, for visualization)
 
 ```bash
-rnw2osm_rs <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none] [-s METERS] [--no-stitch] [--no-snap] [--secondary] [--level N]
+rnw2osm <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none] [-s METERS] [--no-stitch] [--no-snap] [--secondary] [--level N]
 
 # Poland road network as one OSM file (~17 s, ~1.93M roads):
-rnw2osm_rs .../DATA/DATA/RNW/CCP/POL -o /tmp/pl_roads.osm
+rnw2osm .../DATA/DATA/RNW/CCP/POL -o /tmp/pl_roads.osm
 
 # Krzeszowice (near Kraków) with cluster outlines, ready for JOSM:
-rnw2osm_rs .../DATA/DATA/RNW/CCP/POL -b 19.50,50.05,19.88,50.28 --outlines -o /tmp/krzeszowice.osm
+rnw2osm .../DATA/DATA/RNW/CCP/POL -b 19.50,50.05,19.88,50.28 --outlines -o /tmp/krzeszowice.osm
 ```
 
 > **`-b` selects clusters *geometrically*:** a cluster is included when its outline footprint
@@ -180,19 +180,19 @@ osmconvert ./malopolskie-260824.osm.pbf -o=malopolskie-260824.osm
 
 # OSM → TravelMap conversion
 
-`osm2map_rs` writes the same `.IDX` / `.MAP` / `.TCI` layout back from OSM data. The
+`osm2map` writes the same `.IDX` / `.MAP` / `.TCI` layout back from OSM data. The
 input container — **OSM XML** or **OSM PBF** — is autodetected from the file extension
 and first byte; both feed one identical classification pipeline, so the emitted binary
 is byte-identical for the two encodings of the same map.
 
 ```bash
-osm2map_rs <in.osm|in.osm.pbf> <OUT_DIR> [W,S,E,N] [--region=NAME] [--bbox=W,S,E,N] [--pbf|--osm]
+osm2map <in.osm|in.osm.pbf> <OUT_DIR> [W,S,E,N] [--region=NAME] [--bbox=W,S,E,N] [--pbf|--osm]
 
 # Whole region from a PBF extract, writing region N6E2:
-osm2map_rs krakow.osm.pbf /tmp/out --region=N6E2
+osm2map krakow.osm.pbf /tmp/out --region=N6E2
 
 # Only a sub-box of a large XML file (positional bbox = legacy form):
-osm2map_rs malopolskie.osm /tmp/out 19.6,49.95,20.15,50.30 --region=N6E2
+osm2map malopolskie.osm /tmp/out 19.6,49.95,20.15,50.30 --region=N6E2
 ```
 
 - `<in.osm|in.osm.pbf>` — input; `.pbf` extension wins, otherwise sniffed (`<` → XML, else PBF).
@@ -204,23 +204,23 @@ osm2map_rs malopolskie.osm /tmp/out 19.6,49.95,20.15,50.30 --region=N6E2
 
 Output is verified consistent both ways: full `malopolskie` via `.osm` and via `.osm.pbf`
 produces byte-identical `IDX`/`MAP`/`TCI` (≈145 MB land MAP), and either output re-decodes
-through `map2osm_rs` (`-f xml` vs `-f pbf`) with zero element/tag differences.
+through `map2osm` (`-f xml` vs `-f pbf`) with zero element/tag differences.
 
 ## Region inventory (`--list-regions` and friends)
 
-`osm2map_rs` also enumerates the stock set (`STOCK_DIR`, default the unpacked `…/DATA/DATA/MAP`)
+`osm2map` also enumerates the stock set (`STOCK_DIR`, default the unpacked `…/DATA/DATA/MAP`)
 straight from the `*AA.IDX` headers — no OSM input needed. Each region's declared **profiles** are
 read from its `AA.IDX` L0 tile slot (single, or a `multi` slot's sub-entries = the shard set that
 region's signed resinf/RPI catalog declares).
 
 ```bash
-osm2map_rs --list-regions                       # table: name, bbox, dLon/dLat, #maps, MB, profiles
-osm2map_rs --region-of 19.9,50.1                # which region(s) contain a lon,lat (+ their profiles)
-osm2map_rs --emit-tsv    regions.tsv            # machine-readable per-region row (all 411)
-osm2map_rs --emit-config regions.json           # osmium `extract --config` JSON: per-region split
-osm2map_rs --emit-poly   regions.poly           # one multipolygon (single combined extract)
-osm2map_rs --emit-profiles land_profiles.tsv    # region -> chosen land profile map (regenerate)
-osm2map_rs --list-regions --stock-dir /path/to/MAP   # override the stock dir
+osm2map --list-regions                       # table: name, bbox, dLon/dLat, #maps, MB, profiles
+osm2map --region-of 19.9,50.1                # which region(s) contain a lon,lat (+ their profiles)
+osm2map --emit-tsv    regions.tsv            # machine-readable per-region row (all 411)
+osm2map --emit-config regions.json           # osmium `extract --config` JSON: per-region split
+osm2map --emit-poly   regions.poly           # one multipolygon (single combined extract)
+osm2map --emit-profiles land_profiles.tsv    # region -> chosen land profile map (regenerate)
+osm2map --list-regions --stock-dir /path/to/MAP   # override the stock dir
 ```
 
 - `--region-of LON,LAT` finds the target region code from a coordinate (no hand-deriving it from the
@@ -229,7 +229,7 @@ osm2map_rs --list-regions --stock-dir /path/to/MAP   # override the stock dir
   region is "covered" if it ships a shard beyond the universal `0x12` hydro stub — 22 regions in this
   stock set). It drives a **single-pass** split of a big extract into per-region inputs:
   ```bash
-  osm2map_rs --emit-config regions.json
+  osm2map --emit-config regions.json
   osmium extract -c regions.json europe.osm.pbf     # -> ./N6E1.osm.pbf, ./N6E2.osm.pbf, ...
   ```
   (`regions.json` may also carry a top-level `"directory"`; see `osmium help extract` → CONFIG FILE.)
@@ -253,7 +253,7 @@ per-region — there is no single global "layer ⇒ id" registry. Consequence fo
 emitted land profile must be an id the target region already declares, or the head unit finds no
 shard for it. The default `0x02` (car-validated on `N6E1`/`N6E2`) is therefore *not* universal.
 
-`osm2map_rs` now resolves this automatically per region (no env needed for the covered set). In
+`osm2map` now resolves this automatically per region (no env needed for the covered set). In
 `setup_region` the emitted land profile is chosen by precedence:
 
 1. `OSM2MAP_PROFILE=<id>` — manual override, always wins (one-off / experimentation).
@@ -270,7 +270,7 @@ into, so they correctly fail here.
 ### Should the converter emit multiple profiles? (analysis)
 
 **Why a region ships several shards.** Decoding the stock set (per-shard *feature-kind* histograms,
-via `map2osm_rs`) shows a profile is a **container / size-and-entitlement shard of the region's
+via `map2osm`) shows a profile is a **container / size-and-entitlement shard of the region's
 tiles — not a semantic layer**. In `N6E2` the roads, POI, areas and water all re-appear across the
 `0x02`, `0x2A`, `0x11`, `0x0E` shards; individual tiles land in whichever shard has room / matches
 the delivery, and the *kind* of a cell comes from the per-cell feature code at the cell header, not

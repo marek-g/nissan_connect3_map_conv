@@ -1,10 +1,10 @@
 [package]
-name = "rnw_join"
+name = "rnw_extract"
 version = "1.0.0"
 edition = "2021"
 
 [[bin]]
-name = "rnw_join_rs"
+name = "rnw_extract"
 path = "src/main.rs"
 
 [profile.release]

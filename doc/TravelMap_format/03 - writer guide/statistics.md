@@ -13,7 +13,7 @@ dataset. Companion to [`MAP_format.md`](../02%20-%20details/MAP_format.md) (form
 ## 0. How these numbers were produced
 
 1. Convert the full region, all levels, no bounding box:
-   `map2osm_rs <MAP>/N6E2AA.IDX -r N6E2 -l 123 -o <out>` → one `<REGION>_L<level>.osm` per level.
+   `map2osm <MAP>/N6E2AA.IDX -r N6E2 -l 123 -o <out>` → one `<REGION>_L<level>.osm` per level.
 2. Stream each `.osm` and tally every object by `tm:kind`, `tm:layer`, and the low byte of
    `tm:feature` (the category; the high byte is only display scale — see format §7).
 3. Cross-check category meanings against object names and the POI/landuse tables in format §7.
@@ -67,7 +67,7 @@ polygons are anonymous geometry (individual blocks/parcels) rather than named ar
 
 **Roads:** centrelines with road attributes appear in the `.MAP` at L1 and L2 only. At L3 the
 detailed street network is **not** in the `.MAP` — it lives in the separate `.RNW` files
-(`rnw2osm_rs` / `rnw_extract_rs` pipeline). The L3 `line` objects are the MAP-side references
+(`rnw2osm` / `rnw_extract` pipeline). The L3 `line` objects are the MAP-side references
 that carry no road class of their own.
 
 ---
@@ -130,7 +130,7 @@ directly in the `NISSAN Connect LCN3 V7 2022_2023` image:
 | **`GLOB_POI.DAT`** | SQLite **FTS3** (`GLOBAL_POIS`) | **full-text search** of named places | curated, global, multilingual (88 871 rows; 44 languages, 16 regions) | Connect UI “search a place” |
 | **`POI_MAPPING.DAT`** | SQLite | **taxonomy / config**, *not* instances | `idxCat` (hundreds of categories + brand chains: `AIRPORT=201`, `AMUSEMENTPARK=202`, `7ELEVEN`, `AMERICINN`…), icons, name templates (`neh_1_GenFullPoiNames`, `neh_ShortNameTable`) | label/icon rendering + search results |
 | `CCP/ELL/LID*` | binary | **localized display strings** per language (e.g. Finnish) | category/feature labels, no geometry | UI |
-| `CONNECT.DAT` | packed `CPRNAV_2` | per-region Connect service content | (unpack with `cprnav_decompress_rs`) | UI |
+| `CONNECT.DAT` | packed `CPRNAV_2` | per-region Connect service content | (unpack with `cprnav_decompress`) | UI |
 | **`.RNW`** | binary | **road network only — no POIs** | nodes/edges; the “poi” hits in the extractors are the word *point* | routing |
 
 ### The `GLOBAL_POIS` schema (the search index)

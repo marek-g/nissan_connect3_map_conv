@@ -1,4 +1,4 @@
-# OSM XML → MAP/IDX converter (`osm2map_rs`) — plan of action
+# OSM XML → MAP/IDX converter (`osm2map`) — plan of action
 
 Companion to [`writer_guide.md`](writer_guide.md) (byte-level how-to), [`MAP_format.md`](../02%20-%20details/MAP_format.md)
 (read-path reference) and [`signature.md`](signature.md) (what is / isn't signed). This document is the
@@ -6,9 +6,9 @@ Companion to [`writer_guide.md`](writer_guide.md) (byte-level how-to), [`MAP_for
 
 > **TL;DR.** Convert an internet OSM XML extract (e.g. `krzeszowice.osm`) into TravelMap `.IDX`/`.MAP`
 > files that **replace** an existing region's files in the car so the OSM roads / POIs / areas render.
-> Compression is already solved (`cprnav_compress_rs` / `cprnav_decompress_rs`, verified byte-exact).
-> The new work is one crate, `osm2map_rs`, that turns OSM into the **decompressed** `.IDX`/`.MAP` layout
-> (the same layout `map2osm_rs` reads), which we then compress for deployment.
+> Compression is already solved (`cprnav_compress` / `cprnav_decompress`, verified byte-exact).
+> The new work is one crate, `osm2map`, that turns OSM into the **decompressed** `.IDX`/`.MAP` layout
+> (the same layout `map2osm` reads), which we then compress for deployment.
 
 ---
 
@@ -73,10 +73,10 @@ The read path was executed end-to-end on the stock `N6E2` region and works:
 
 ```
 DATA/DATA/MAP/N6E2AA.IDX   (CPRNAV_2, magic "CPRNAV_2" @ 0x04)
-        │  cprnav_decompress_rs          (verified byte-exact)
+        │  cprnav_decompress          (verified byte-exact)
         ▼
 decompressed N6E2AA.IDX    (binOff@0=0x234, spare@2=32, BBox@4, partOff@0x14=126)
-        │  map2osm_rs  -l 1 -b 19.5,50.0,19.8,50.2
+        │  map2osm  -l 1 -b 19.5,50.0,19.8,50.2
         ▼
 N6E2_L1.osm                (6511 nodes, 760 ways for the Kraków box — correct geometry)
 ```
@@ -103,15 +103,15 @@ Decompressed `N6E210I.MAP` header (measured):
 
 ```
 krzeszowice.osm
-        │  osm2map_rs  (NEW — the only code we must write)
+        │  osm2map  (NEW — the only code we must write)
         ▼
-decompressed N6E2AA.IDX + N6E2<prof>.MAP     (same layout map2osm_rs reads above)
-        │  cprnav_compress_rs                (already built, mirrors the decompressor)
+decompressed N6E2AA.IDX + N6E2<prof>.MAP     (same layout map2osm reads above)
+        │  cprnav_compress                (already built, mirrors the decompressor)
         ▼
 DATA/DATA/MAP/N6E2AA.IDX + N6E2<prof>.MAP    (CPRNAV_2 — drop in place of the originals)
 ```
 
-So `osm2map_rs` only has to emit the **decompressed** layout. Compression, the coordinate model, and a
+So `osm2map` only has to emit the **decompressed** layout. Compression, the coordinate model, and a
 working reader for validation are all in hand.
 
 ---
@@ -201,8 +201,8 @@ absence for rendering.
 
 For every OSM primitive decide: **kind** (`poi` / `line` / `polygon`), **feature code** (u16: low byte =
 category, high byte = display scale), **state**, and **name**. The tables below are the **inverse** of the
-mappings already implemented and verified in `map2osm_rs` (`poi_osm`, `landuse_osm`, `add_semantic`,
-`ann_tags`), so a round-trip through `map2osm_rs` should recover the same categories.
+mappings already implemented and verified in `map2osm` (`poi_osm`, `landuse_osm`, `add_semantic`,
+`ann_tags`), so a round-trip through `map2osm` should recover the same categories.
 
 ### 4.1 POIs (OSM `<node>`) → list-2 cells
 
@@ -325,7 +325,7 @@ road-name labels, `OSM2MAP_ROADNUM=0` drops `0x14` refs.
 
 ### 4.5 `state` and feature high byte
 
-- `state` (u16, first cell word): `map2osm_rs` surfaces it as `tm:state` and the dataset uses a near-constant
+- `state` (u16, first cell word): `map2osm` surfaces it as `tm:state` and the dataset uses a near-constant
   value (profile marker). v1: **copy the dominant `state` value from a reference block of the same kind**
   (measure in M0/M1) or write a fixed constant; confirm the reader is indifferent.
 - Feature **high byte** = display scale / min-zoom. Set per the level-selection policy (§5). Calibrate in M4.
@@ -369,9 +369,9 @@ so LOD has never been validated in isolation; keep it off until re-tested on car
 
 ---
 
-## 7. Architecture — `src/osm2map_rs`
+## 7. Architecture — `src/osm2map`
 
-New crate mirroring `map2osm_rs` (deps: `quick-xml`, `serde`). Modules:
+New crate mirroring `map2osm` (deps: `quick-xml`, `serde`). Modules:
 
 - `osm.rs` — stream-parse the XML into an in-memory model (`Node{id,lat,lon,tags}`, `Way{ids,tags}`,
   `Relation`); resolve way node order; close multipolygon rings. Store coordinates as **i32 PAU ints** (not
@@ -385,13 +385,13 @@ New crate mirroring `map2osm_rs` (deps: `quick-xml`, `serde`). Modules:
 CLI (mirrors the sibling tools):
 
 ```
-osm2map_rs <in.osm> [OUTDIR] [-r NAME | --region=NAME] [--bbox W,S,E,N]
+osm2map <in.osm> [OUTDIR] [-r NAME | --region=NAME] [--bbox W,S,E,N]
    # env: OSM2MAP_REGION, STOCK_DIR, plus OSM2MAP_MODE/HYDRO/… feature switches
    # NAME's stock <NAME>AA.IDX (in STOCK_DIR) supplies bbox + IDX descriptive prefix.
    # levels L0..L3 always emitted. Legacy positional form `<in.osm> <OUTDIR> "W,S,E,N"` still works.
    → writes decompressed <NAME>AA.IDX + <NAME>1<prof>.MAP (+ .TCI) to OUTDIR (default /tmp/opencode/wt2)
 # then:
-cprnav_compress_rs <OUTDIR>/<NAME>AA.IDX  <deploy>/<NAME>AA.IDX   (per file)
+cprnav_compress <OUTDIR>/<NAME>AA.IDX  <deploy>/<NAME>AA.IDX   (per file)
 ```
 
 Memory: process per tile; never hold the whole region as formatted strings. The largest reference profile is
@@ -419,7 +419,7 @@ Memory: process per tile; never hold the whole region as formatted strings. The 
 
 Primary automated gate is a **round-trip**, exactly mirroring `writer_guide.md` §5:
 
-1. `osm2map_rs in.osm → decompressed .IDX/.MAP` → `map2osm_rs <outIDX> -l 0123 → OSM'`.
+1. `osm2map in.osm → decompressed .IDX/.MAP` → `map2osm <outIDX> -l 0123 → OSM'`.
    Compare `OSM'` to the input: object counts per kind, coordinate accuracy (within the `i16<<shift`
    quantization), and surviving tags/categories. Expect high fidelity on the mapped classes.
 2. **BBox containment:** every decoded point inside its tile extent (expect zero violations).
@@ -439,14 +439,14 @@ Primary automated gate is a **round-trip**, exactly mirroring `writer_guide.md` 
   on the head unit** (#09p); ✅ omitted TCI tolerated (empty/all-empty TCI emitted, `0x307` logs only).
   Remaining: (c) confirm `CONTENT.DAT` doesn't encode base sizes (signature.md §7.4).
 
-- **M1 — skeleton that round-trips.** `osm2map_rs` parses OSM and emits a **minimal** valid region (one tile,
-  one profile, a handful of points + one line) that `map2osm_rs` reads back without error. Proves the format.
+- **M1 — skeleton that round-trips.** `osm2map` parses OSM and emits a **minimal** valid region (one tile,
+  one profile, a handful of points + one line) that `map2osm` reads back without error. Proves the format.
 - **M2 — full tiling.** all three levels, point pool + delta encoding, cross-tile splitting; round-trip the
   Kraków box from `krzeszowice.osm` with correct geometry.
 - **M3 — semantics.** §4 mapping tables (POI/road/area/netclass) + names/text records; verify categories and
   names survive the round-trip.
 - **M4 — level policy.** implement + tune §5 selection; confirm the right objects appear at the right zoom.
-- **M5 — compression integration.** wire `cprnav_compress_rs`; assert compress/decompress byte-identity;
+- **M5 — compression integration.** wire `cprnav_compress`; assert compress/decompress byte-identity;
   produce deployable CPRNAV_2 files.
 - **M6 — full region.** convert all of `krzeszowice.osm` → N6E2; end-to-end round-trip; check size + runtime
   performance.
@@ -461,7 +461,7 @@ Primary automated gate is a **round-trip**, exactly mirroring `writer_guide.md` 
 | 1 | Does the runtime require the original **5-profile** set, or is a single profile fine? | M0: try single-profile region in the runtime; fall back to emitting all 5 (split objects across them) if needed. |
 | 2 | Is omitting `.TCI` tolerated for rendering? | M0: load without TCI; else emit a copied/minimal TCI per profile. |
 | 3 | Correct `state` value per object kind? | M0/M1: measure the dominant value from reference blocks; confirm reader indifference via round-trip. |
-| 4 | Feature **high byte** (display scale) exact semantics? | M4: calibrate against how `map2osm_rs`/renderer treat it; start with level index. |
+| 4 | Feature **high byte** (display scale) exact semantics? | M4: calibrate against how `map2osm`/renderer treat it; start with level index. |
 | 5 | Does `CONTENT.DAT` (signed) encode base file sizes? | signature.md §7.4 — if yes, keep output sizes stable or accept that region is out of reach for a signed swap. |
 | 6 | Text-record exact byte layout for multi-name records? | M3: reverse `read_text_record` precisely on a reference block before emitting names. |
 | 7 | Cross-tile way splitting correctness (shared boundary vertices). | M2: dedup points per tile; verify no gaps/dupes at edges in the round-trip. |
@@ -472,8 +472,8 @@ Primary automated gate is a **round-trip**, exactly mirroring `writer_guide.md` 
 ## 11. Reference artifacts
 
 - Verified decompressed N6E2 files: `/tmp/opencode/rt/` (`N6E2AA.IDX`, `N6E2{102,10E,10H,10I,11A}.MAP`).
-- `src/map2osm_rs/src/main.rs` — the reader; **inversion source** for all §4 tables.
-- `src/cprnav_compress_rs`, `src/cprnav_decompress_rs` — container codec (both verified).
+- `src/map2osm/src/main.rs` — the reader; **inversion source** for all §4 tables.
+- `src/cprnav_compress`, `src/cprnav_decompress` — container codec (both verified).
 - `doc/TravelMap_format/03 - writer guide/writer_guide.md` — byte-level write recipe + pitfall checklist.
 - `doc/TravelMap_format/02 - details/MAP_format.md` — full read-path format reference.
 - Input: `/home/marek/Ext/reverse_engineering/NissanMaps/OSM-map/krzeszowice.osm`.

@@ -4,10 +4,10 @@
 // into a single OSM XML file, so the road network can be loaded straight into
 // an editor (JOSM / QGIS / Vespucci) for visual inspection.
 //
-// This is the visualization counterpart of `rnw_extract_rs` (which emits JSONL).
+// This is the visualization counterpart of `rnw_extract` (which emits JSONL).
 // The cluster/onecell/zerocell parsing is reused verbatim from that tool; only
 // the output differs. Road geometry assembly, coordinate system (PAU), and the
-// display-class -> highway mapping follow RNW_format.md and rnw_join_rs.
+// display-class -> highway mapping follow RNW_format.md and rnw_join.
 //
 // Output objects:
 //   - every road (onecell) -> an open <way>; nodes are de-duplicated by exact
@@ -24,7 +24,7 @@
 // keys `rnw_file` / `rnw_cluster` / `rnw_oncell_index` (the onecell's index in its
 // cluster — the road's identity, since the format has no separate global road id).
 //
-// Usage: rnw2osm_rs <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none]
+// Usage: rnw2osm <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none]
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -35,13 +35,13 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 // ---------------------------------------------------------------------------
-// constants + byte readers (shared with rnw_extract_rs)
+// constants + byte readers (shared with rnw_extract)
 // ---------------------------------------------------------------------------
 
 const PAU: f64 = (1i64 << 31) as f64 / 180.0;
 const BLOCK: usize = 0x4000; // clusters are 16KB-aligned in a NAV file
 const TIMESTAMP: &str = "2021-03-31T00:00:00Z"; // dataset vintage (EUR 2021.Q1)
-const GENERATOR: &str = "rnw2osm_rs (Bosch RNW -> OSM XML visualizer)";
+const GENERATOR: &str = "rnw2osm (Bosch RNW -> OSM XML visualizer)";
 // Valid geographic range of this dataset (EUR 2021). Used as an origin sanity check to reject
 // false-positive cluster headers — random bytes at a 16KB boundary that pass the structural
 // checks but whose reference coordinate decodes to a garbage point far outside the real map.
@@ -74,7 +74,7 @@ fn s24(b0: u8, b1: u8, b2: u8) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// geographic sanity filter for the 16KB-aligned cluster scan (as rnw_extract_rs)
+// geographic sanity filter for the 16KB-aligned cluster scan (as rnw_extract)
 // ---------------------------------------------------------------------------
 
 struct BBox {
@@ -114,7 +114,7 @@ impl BBox {
 }
 
 // ---------------------------------------------------------------------------
-// OSM XML structures (mirrored from map2osm_rs)
+// OSM XML structures (mirrored from map2osm)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Clone)]
@@ -455,7 +455,7 @@ impl UnionFind {
 }
 
 // ---------------------------------------------------------------------------
-// display-class -> highway mapping (verbatim from rnw_join_rs; the runtime's own
+// display-class -> highway mapping (verbatim from rnw_join; the runtime's own
 // rendering hierarchy, enConvertRoadSubattrDisplayClass @0x00888b14)
 // ---------------------------------------------------------------------------
 
@@ -503,7 +503,7 @@ fn highway_tag(dc: i64, link: bool) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// RNW cluster parsing (reused from rnw_extract_rs)
+// RNW cluster parsing (reused from rnw_extract)
 // ---------------------------------------------------------------------------
 
 fn read_pts(cd: &[u8], off: usize, cnt: u16, ctype: u8) -> Option<Vec<(i32, i32)>> {
@@ -1165,7 +1165,7 @@ fn push_unique(v: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBu
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut bbox_spec = "-30,30,60,75".to_string(); // whole EUR dataset (as rnw_extract_rs)
+    let mut bbox_spec = "-30,30,60,75".to_string(); // whole EUR dataset (as rnw_extract)
     let mut outlines = false;
     let mut outp: Option<String> = None;
     let mut snap_m = 1.0f64; // node-snap radius in meters (0 = exact match only)
@@ -1824,9 +1824,9 @@ fn write_osm<W: Write>(w: &mut W, body: &str) -> io::Result<()> {
 
 fn usage() {
     eprintln!(
-        "rnw2osm_rs - convert Bosch RNW NAV*.DAT cluster files to OSM XML for visualization\n\
+        "rnw2osm - convert Bosch RNW NAV*.DAT cluster files to OSM XML for visualization\n\
          \n\
-            usage: rnw2osm_rs <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none]\n\
+            usage: rnw2osm <NAV*.DAT | dir>... [-o OUT.osm] [--outlines] [-b W,S,E,N|none]\n\
                     [-s M] [--no-stitch] [--no-snap] [--secondary] [--level N]\n\
            \n\
              one or more INPUTs, each a NAV*.DAT file or a directory to scan for them\n\

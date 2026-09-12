@@ -5,7 +5,7 @@ converter output (`MAP_format.md`) for region **N6E2**
 (18.00–36.00°E, 47.25–56.70°N: eastern Poland, Slovakia, NE Hungary, western
 Ukraine/Belarus, Baltic coast).
 
-Tooling: `rnw_extract_rs` (extractor) and `rnw_join_rs` (join onto MAP OSM XML) —
+Tooling: `rnw_extract` (extractor) and `rnw_join` (join onto MAP OSM XML) —
 zero-dependency Rust; build with `cargo build --release`.
 
 ## 1. File organization
@@ -130,7 +130,7 @@ in the cluster given by `ci2[cli]`. `bRelevantCrossingBetween` @0x0088c78c follo
 **first** and only falls back to a position/node-marker test (`bBordersObjectAtTo/From`)
 if the link does not resolve.
 
-`rnw2osm_rs` implements this: it indexes every parsed cluster by its outline origin
+`rnw2osm` implements this: it indexes every parsed cluster by its outline origin
 (lon,lat — a near-unique key; only ~16 degenerate/same-file collisions out of 5,784 POL
 clusters), resolves each onecell's overlap refs through `ci2[cli]` to the neighbour
 onecell, and union-finds the shared boundary node so the two ways share one OSM node.
@@ -140,7 +140,7 @@ This is what makes roads connect across cluster boundaries exactly as the app do
 the overlap link mainly closes the rarer >1 m cases and guarantees correctness where the
 two clusters' stored boundary node differs slightly. Note the same physical segment is
 stored in **both** adjacent clusters, so the OSM intentionally contains a duplicate way
-per boundary segment (the app dedups these at render time via the overlaps); `rnw2osm_rs`
+per boundary segment (the app dedups these at render time via the overlaps); `rnw2osm`
 emits both rather than masking either.
 
 ### 3c. Border markers & the cross-cluster merge order (converter fidelity)
@@ -162,7 +162,7 @@ Measured (Kraków, 23,268 zerocells): rim 1,946 (8.4%), cpx 1,124 (4.8%), annot-
 node-identity key: gating a merge on them alone leaves the OSM at ~31% in one component,
 whereas proximity-unifying every duplicated boundary junction reaches ~86%.
 
-`rnw2osm_rs` therefore unifies boundary nodes in that same order, adding proximity only as an
+`rnw2osm` therefore unifies boundary nodes in that same order, adding proximity only as an
 OSM-side necessity (OSM needs one shared `<node>` for roads to connect — something the runtime
 never expresses): **overlap links → border marker** (a marked node merges with its nearest
 *marked* twin) **→ proximity** (an unmarked node merges with any nearby twin). `-s` sets the
@@ -291,7 +291,7 @@ bounding box. The runtime always renders the **primary**:
 secondary, walks its overlap list (`+0x20`) and substitutes the first ref whose own
 `bIsSecundary` is clear (the primary twin), inverting direction if needed; a primary is
 used as-is. So a secondary is never drawn on its own — it is a coarser fallback that
-resolves to its primary. `rnw2osm_rs` mirrors this: by default it emits primaries only
+resolves to its primary. `rnw2osm` mirrors this: by default it emits primaries only
 (each road once, at full detail — the map the app actually shows); `--secondary` emits that
 coarser layer on its own instead, so the stored duplicates can be inspected in isolation.
 In Krzeszowice that is 9,649 primary vs 3,675 secondary onecells; no cluster is
@@ -315,7 +315,7 @@ The runtime classifies roads for rendering via
 (`rc` is the dominant axis; `nc` only subdivides `rc` 0/1.) Direction is confirmed
 by the data: **dc=2 is the only class carrying the freeway bit** (all freeway
 onecells are rc=0,nc=0) and its joined roads are motorway interchanges
-(`WĘZEŁ …`); dc=12/13 are ~84% of all POL onecells (local streets). `rnw_join_rs`
+(`WĘZEŁ …`); dc=12/13 are ~84% of all POL onecells (local streets). `rnw_join`
 maps display class → OSM `highway` monotonically, and appends `_link` for the major
 classes when `bIsLink` is set:
 
@@ -415,8 +415,8 @@ is a flag**, code = `type & 0x7fff`:
 ## 9. Extraction + join pipeline
 
 ```
-rnw_extract_rs [CCP_DIR] [OUT.jsonl] [-b W,S,E,N|none]
-rnw_join_rs    RNW.jsonl MAP_L2.osm OUT.osm # OSM XML in and out; ~10 s for N6E2 L2
+rnw_extract [CCP_DIR] [OUT.jsonl] [-b W,S,E,N|none]
+rnw_join    RNW.jsonl MAP_L2.osm OUT.osm # OSM XML in and out; ~10 s for N6E2 L2
 ```
 
 `-b` sets the geographic sanity filter (degrees) for the 16KB-aligned cluster scan.
@@ -431,7 +431,7 @@ Zero-dependency Rust (std only); build with `cargo build --release` in each
 project directory (binaries land in the shared cargo target dir
 `/home/marek/Ext/.cargo_cache/release/`).
 
-`rnw_join_rs` reads the OSM XML produced by `map2osm_rs`, enriches the road
+`rnw_join` reads the OSM XML produced by `map2osm`, enriches the road
 ways (`tm:layer == "road"`) with RNW names/attributes, and writes a new OSM
 XML file; all other elements pass through unchanged.
 
@@ -798,7 +798,7 @@ i.e. *per country → per road-area-type → speed limits*. So the AEX "extern a
  the fi_tcl leaf, and `c`/`d` are the on-road range in metres, *not* the status enum.
 
 **Unit cross-check (metres confirmed):** AEX entries are finer-grained than the topological roads
-`rnw_extract_rs` pulls from the same NAV clusters (~6–7× more, each ~6–10× shorter), so per-road lengths don't
+`rnw_extract` pulls from the same NAV clusters (~6–7× more, each ~6–10× shorter), so per-road lengths don't
 match 1:1 — but summing per cluster (which cancels the granularity) gives the same order of magnitude in both:
 
 | cluster | extracted roads total | AEX `Σ(c+d)` total | ratio AEX/ext |

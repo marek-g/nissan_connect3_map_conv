@@ -170,7 +170,7 @@ binOff  ┌ block 0  {marker, 3×(start,count), cells…, point pool…, annotat
 Steps:
 
 1. **Write the header.** Best: clone the stock file's whole `[0 .. binOff)` prefix as a template
-   (`osm2map_rs` ships `templates/map_header.bin` = 0x7bc, `templates/idx_header.bin` = 0x1f8) and
+   (`osm2map` ships `templates/map_header.bin` = 0x7bc, `templates/idx_header.bin` = 0x1f8) and
    patch only `fileSize`, BBox (and `@0x1e` profile). Keeping the stock prefix byte-identical is free
    insurance even though the geometry path (`vConvertMapData`) does not read this region — see §11. The
    invariants that **do** break rendering are: 4-byte container alignment, and every IDX slot landing on
@@ -223,7 +223,7 @@ slots to point at your new MAP blocks.
 ## 5. Validation
 
 1. **Round-trip through the converter.** Run
-   `map2osm_rs <yourIDX> -l 0123 -o /tmp/out` (see format reference §9). If it parses without
+   `map2osm <yourIDX> -l 0123 -o /tmp/out` (see format reference §9). If it parses without
    errors and emits geometry, the structural layout is right.
 2. **BBox containment.** Every decoded point must fall inside its tile's BBox (the converter can
    report out-of-bbox points; expect zero).
@@ -300,7 +300,7 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
    one 8-byte entry `{u32 fileOffset, u16 length, u16 fileId}` pointing at your cluster. Copy the
    string-table / metadata block from an existing `NAV_ROOT.DAT` if you want it to look stock.
 4. **Omit AEX** and leave `bRNWLoadAexData` unset.
-5. **Validate:** round-trip through `rnw_extract_rs` (it should re-emit your roads with correct
+5. **Validate:** round-trip through `rnw_extract` (it should re-emit your roads with correct
    geometry), spot-check coordinates, and — if you have a debug runtime — load it and confirm no
    errors.
 
@@ -321,7 +321,7 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
 
 ## 8. Converting FROM OSM XML — drop the closing vertex
 
-When the MAP/IDX writer reads polygons back from OSM XML (e.g. `map2osm_rs` output, or hand-edited
+When the MAP/IDX writer reads polygons back from OSM XML (e.g. `map2osm` output, or hand-edited
 OSM), remember the two formats disagree on how a ring is stored:
 
 - **OSM:** a closed way repeats its first node as the last `<nd>` — that repeated vertex is what makes
@@ -337,5 +337,5 @@ OSM way nodes:      A B C D A        (5 refs, closed)
 Bosch point list:   A B C D         (4 distinct vertices; count = 4)
 ```
 
-`map2osm_rs` does the reverse on export: it takes Bosch's open vertex list and appends the first
+`map2osm` does the reverse on export: it takes Bosch's open vertex list and appends the first
 vertex to close the ring, so polygons come out as valid OSM areas.

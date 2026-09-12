@@ -51,7 +51,7 @@ essential for validating a reverse-engineered format.
 
 ### 3. Decompression as a separate pre-step
 
-CPRNAV_2-compressed files (all LID; some MAP/IDX) are unpacked first by `cprnav_decompress_rs` so the
+CPRNAV_2-compressed files (all LID; some MAP/IDX) are unpacked first by `cprnav_decompress` so the
 decoders read plain bytes. Both per-block header widths are handled — 16-bit vs 32-bit, selected by
 `block_size = unknown × 0x400` (the difference the reference tool got wrong on LID).
 
@@ -64,11 +64,11 @@ open frontier.
 
 | Format | Decode | Extract / convert to OSM | Write (generate) |
 |--------|:------:|--------------------------|:----------------:|
-| **MAP / IDX** | ✅ | ✅ `map2osm_rs` → OSM XML (POIs, lines, polygons + decoded annotations) | ⚠️ guide written; not yet implemented |
-| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw_extract_rs` + `rnw_join_rs` → road names + class attributes onto OSM | ❌ |
+| **MAP / IDX** | ✅ | ✅ `map2osm` → OSM XML (POIs, lines, polygons + decoded annotations) | ⚠️ guide written; not yet implemented |
+| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw_extract` + `rnw_join` → road names + class attributes onto OSM | ❌ |
 | **LID** | ✅ structure (block header, POI records, text pool, categories); `GLOB_POI` = SQLite FTS3 | ⚠️ partial — point-POIs readable, no exporter yet | ❌ (byte-level gaps remain) |
 
-Tooling (`src/`, Rust): `map2osm_rs`, `rnw_extract_rs`, `rnw_join_rs`, `cprnav_decompress_rs`.
+Tooling (`src/`, Rust): `map2osm`, `rnw_extract`, `rnw_join`, `cprnav_decompress`.
 
 > For navigation alone the LID content layer is optional — the network loads and routes via
 > RNW→MAP without it. LID matters for POI search / landmark rendering.
@@ -96,7 +96,7 @@ for producing a map that actually routes.
 Generate `.IDX` tile tables + `.MAP` blocks (marker, 3-list cells, point pool, annotations, text) from
 OSM ways/nodes/relations. The [writer guide](TravelMap_format/03%20-%20writer%20guide/writer_guide.md)
 already separates byte-perfect fields from bypass-able ones; this turns that into a working generator, with
-`map2osm_rs` as the reference data model.
+`map2osm` as the reference data model.
 
 ### Phase 4: LID writer + compressor
 

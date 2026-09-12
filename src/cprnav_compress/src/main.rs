@@ -1,6 +1,6 @@
 // CPRNAV_2 compressor — command-line front-end.
 //
-// All codec logic lives in the `cprnav` library (shared with cprnav_decompress_rs);
+// All codec logic lives in the `cprnav` library (shared with cprnav_decompress);
 // this binary only parses arguments, guards against nesting, and does file I/O.
 
 use std::env;
@@ -24,8 +24,8 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0].eq_ignore_ascii_case("-h") || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  cprnav_compress_rs <file> [out] [--level N] [--block-kib K] [--table T]\n\n\
-             Compress a file into CPRNAV_2 (inverse of cprnav_decompress_rs).\n\
+            "Usage:\n  cprnav_compress <file> [out] [--level N] [--block-kib K] [--table T]\n\n\
+             Compress a file into CPRNAV_2 (inverse of cprnav_decompress).\n\
              Defaults: level=9 (best), block-kib=16 (0x4000-byte blocks), auto code-table.\n\
              --level N      1-9. 1-4 fast greedy; 5-9 optimal-parsing (best) + bigger window\n\
              --no-lz        disable LZ77 back refs (literal only)\n\
@@ -86,7 +86,7 @@ fn main() {
     if is_cprnav(&data) {
         eprintln!(
             "error: {} already looks like a CPRNAV_2 archive (version=5, magic at +4). \
-             Decompress it first (cprnav_decompress_rs) before compressing; the runtime cannot read nested files. \
+             Decompress it first (cprnav_decompress) before compressing; the runtime cannot read nested files. \
              Use --force to override.",
             input.display()
         );

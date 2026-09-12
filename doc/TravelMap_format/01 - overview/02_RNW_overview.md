@@ -308,7 +308,7 @@ Here is the subtle but important part. Because node numbers are only meaningful 
   (`RNW_format.md` §3c/§5). This too is non-positional.
 
 The runtime does **not** match the two copies by coordinate. (The two stored copies do differ by a few
-PAU, ~0.06–0.08 m, but that is not how the app identifies them.) `rnw2osm_rs` must emit one shared OSM
+PAU, ~0.06–0.08 m, but that is not how the app identifies them.) `rnw2osm` must emit one shared OSM
 `<node>` for roads to connect, so it performs that unification itself in the same order — links → marker
 → proximity — where the **proximity** step (`-s`, default 1.0 m) is an OSM-side necessity with no
 counterpart in the runtime. `--no-snap` drops it (marker + links only); `-s 0` drops both (links only).

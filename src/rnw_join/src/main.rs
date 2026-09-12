@@ -4,7 +4,7 @@
 // layout: one line per <node>, <way> with all <nd> on one line and all
 // <tag> on one line before </way>.
 //
-// Usage: rnw_join_rs <rnw_roads.jsonl> <map.osm> <out.osm>
+// Usage: rnw_join <rnw_roads.jsonl> <map.osm> <out.osm>
 //
 // A MAP road way is [fromNode] + shapePts + [toNode] of ONE or several chained
 // RNW onecells (MAP merges consecutive same-class segments). We collect all
@@ -688,7 +688,7 @@ fn emit_element(el: &OsmEl, tags_override: Option<&Vec<(String, String)>>, out: 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 4 {
-        eprintln!("usage: rnw_join_rs <rnw_roads.jsonl> <map.osm> <out.osm>");
+        eprintln!("usage: rnw_join <rnw_roads.jsonl> <map.osm> <out.osm>");
         exit(1);
     }
     let (roads, grid) = load_rnw(&args[1]);
