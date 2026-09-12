@@ -1,0 +1,1052 @@
+{
+ "stock_dir": "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/MAP",
+ "region_count": 24,
+ "land_region_count": 24,
+ "note": "regenerate only regions listed here (already referenced by signed MAPWORLD/root files)",
+ "regions": [
+  {
+   "region": "N3W2",
+   "bbox_pau": {
+    "w": 4026531840,
+    "s": 225485782,
+    "e": 4160749568,
+    "n": 338228673
+   },
+   "bbox_deg": {
+    "w": -22.5,
+    "s": 18.9,
+    "e": -11.25,
+    "n": 28.35
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "9": {
+     "code": "09",
+     "size": 1393896
+    },
+    "18": {
+     "code": "0I",
+     "size": 1005236
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N4W3",
+   "bbox_pau": {
+    "w": 3865470568,
+    "s": 338228673,
+    "e": 4008636144,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": -36.0,
+    "s": 28.35,
+    "e": -24.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 619700
+    },
+    "9": {
+     "code": "09",
+     "size": 319152
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N4W2",
+   "bbox_pau": {
+    "w": 4008636144,
+    "s": 338228673,
+    "e": 4151801720,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": -24.0,
+    "s": 28.35,
+    "e": -12.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "9": {
+     "code": "09",
+     "size": 2171468
+    },
+    "18": {
+     "code": "0I",
+     "size": 1681880
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N4W1",
+   "bbox_pau": {
+    "w": 4151801720,
+    "s": 338228673,
+    "e": 0,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": -12.0,
+    "s": 28.35,
+    "e": 0.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 2052580
+    },
+    "9": {
+     "code": "09",
+     "size": 11443136
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N4E1",
+   "bbox_pau": {
+    "w": 0,
+    "s": 338228673,
+    "e": 143165576,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": 0.0,
+    "s": 28.35,
+    "e": 12.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 1250540
+    },
+    "11": {
+     "code": "0B",
+     "size": 17840
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    11
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    11,
+    18
+   ]
+  },
+  {
+   "region": "N4E2",
+   "bbox_pau": {
+    "w": 143165576,
+    "s": 338228673,
+    "e": 286331152,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": 12.0,
+    "s": 28.35,
+    "e": 24.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "11": {
+     "code": "0B",
+     "size": 1815296
+    },
+    "3": {
+     "code": "03",
+     "size": 3194288
+    },
+    "131": {
+     "code": "43",
+     "size": 402216
+    },
+    "18": {
+     "code": "0I",
+     "size": 2951800
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    3,
+    11,
+    131
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    3,
+    11,
+    18,
+    131
+   ]
+  },
+  {
+   "region": "N4E3",
+   "bbox_pau": {
+    "w": 286331152,
+    "s": 338228673,
+    "e": 429496728,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": 24.0,
+    "s": 28.35,
+    "e": 36.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 5138896
+    },
+    "131": {
+     "code": "43",
+     "size": 2807204
+    },
+    "3": {
+     "code": "03",
+     "size": 4223392
+    },
+    "4": {
+     "code": "04",
+     "size": 11204500
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    3,
+    4,
+    131
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    3,
+    4,
+    18,
+    131
+   ]
+  },
+  {
+   "region": "N4E4",
+   "bbox_pau": {
+    "w": 429496728,
+    "s": 338228673,
+    "e": 572662304,
+    "n": 450971564
+   },
+   "bbox_deg": {
+    "w": 36.0,
+    "s": 28.35,
+    "e": 48.0,
+    "n": 37.8
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "4": {
+     "code": "04",
+     "size": 4781488
+    },
+    "18": {
+     "code": "0I",
+     "size": 97912
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    4
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    4,
+    18
+   ]
+  },
+  {
+   "region": "N5W3",
+   "bbox_pau": {
+    "w": 3758096386,
+    "s": 450971564,
+    "e": 3937053356,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": -45.0,
+    "s": 37.8,
+    "e": -30.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "9": {
+     "code": "09",
+     "size": 124700
+    },
+    "18": {
+     "code": "0I",
+     "size": 376192
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N5W2",
+   "bbox_pau": {
+    "w": 3937053356,
+    "s": 450971564,
+    "e": 4116010326,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": -30.0,
+    "s": 37.8,
+    "e": -15.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 707400
+    },
+    "9": {
+     "code": "09",
+     "size": 995560
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    18
+   ]
+  },
+  {
+   "region": "N5W1",
+   "bbox_pau": {
+    "w": 4116010326,
+    "s": 450971564,
+    "e": 0,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": -15.0,
+    "s": 37.8,
+    "e": 0.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "10": {
+     "code": "0A",
+     "size": 8022800
+    },
+    "9": {
+     "code": "09",
+     "size": 66289128
+    },
+    "18": {
+     "code": "0I",
+     "size": 2804952
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    9,
+    10
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    9,
+    10,
+    18
+   ]
+  },
+  {
+   "region": "N5E1",
+   "bbox_pau": {
+    "w": 0,
+    "s": 450971564,
+    "e": 178956970,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": 0.0,
+    "s": 37.8,
+    "e": 15.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 7714532
+    },
+    "8": {
+     "code": "08",
+     "size": 16764532
+    },
+    "10": {
+     "code": "0A",
+     "size": 36315544
+    },
+    "9": {
+     "code": "09",
+     "size": 16817768
+    },
+    "11": {
+     "code": "0B",
+     "size": 58627680
+    },
+    "22": {
+     "code": "0M",
+     "size": 15806208
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    8,
+    9,
+    10,
+    11,
+    22
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    8,
+    9,
+    10,
+    11,
+    18,
+    22
+   ]
+  },
+  {
+   "region": "N5E2",
+   "bbox_pau": {
+    "w": 178956970,
+    "s": 450971564,
+    "e": 357913940,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": 15.0,
+    "s": 37.8,
+    "e": 30.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "22": {
+     "code": "0M",
+     "size": 94345488
+    },
+    "14": {
+     "code": "0E",
+     "size": 5954972
+    },
+    "11": {
+     "code": "0B",
+     "size": 7041640
+    },
+    "3": {
+     "code": "03",
+     "size": 22176340
+    },
+    "4": {
+     "code": "04",
+     "size": 55350856
+    },
+    "42": {
+     "code": "1A",
+     "size": 46587004
+    },
+    "8": {
+     "code": "08",
+     "size": 2032416
+    },
+    "18": {
+     "code": "0I",
+     "size": 9909936
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    3,
+    4,
+    8,
+    11,
+    14,
+    22,
+    42
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    3,
+    4,
+    8,
+    11,
+    14,
+    18,
+    22,
+    42
+   ]
+  },
+  {
+   "region": "N5E3",
+   "bbox_pau": {
+    "w": 357913940,
+    "s": 450971564,
+    "e": 536870910,
+    "n": 563714455
+   },
+   "bbox_deg": {
+    "w": 30.0,
+    "s": 37.8,
+    "e": 45.0,
+    "n": 47.25
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "42": {
+     "code": "1A",
+     "size": 16952688
+    },
+    "18": {
+     "code": "0I",
+     "size": 2651136
+    },
+    "4": {
+     "code": "04",
+     "size": 36618792
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    4,
+    42
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    4,
+    18,
+    42
+   ]
+  },
+  {
+   "region": "N6W1",
+   "bbox_pau": {
+    "w": 4080218932,
+    "s": 563714455,
+    "e": 0,
+    "n": 676457346
+   },
+   "bbox_deg": {
+    "w": -18.0,
+    "s": 47.25,
+    "e": 0.0,
+    "n": 56.7
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 8301760
+    },
+    "10": {
+     "code": "0A",
+     "size": 8379256
+    },
+    "12": {
+     "code": "0C",
+     "size": 65162996
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    10,
+    12
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    10,
+    12,
+    18
+   ]
+  },
+  {
+   "region": "N6E1",
+   "bbox_pau": {
+    "w": 0,
+    "s": 563714455,
+    "e": 214748364,
+    "n": 676457346
+   },
+   "bbox_deg": {
+    "w": 0.0,
+    "s": 47.25,
+    "e": 18.0,
+    "n": 56.7
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "12": {
+     "code": "0C",
+     "size": 6498264
+    },
+    "13": {
+     "code": "0D",
+     "size": 12044876
+    },
+    "2": {
+     "code": "02",
+     "size": 16109084
+    },
+    "14": {
+     "code": "0E",
+     "size": 33763796
+    },
+    "7": {
+     "code": "07",
+     "size": 31103472
+    },
+    "10": {
+     "code": "0A",
+     "size": 38516256
+    },
+    "8": {
+     "code": "08",
+     "size": 20250320
+    },
+    "1": {
+     "code": "01",
+     "size": 106199600
+    },
+    "18": {
+     "code": "0I",
+     "size": 3289064
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    1,
+    2,
+    7,
+    8,
+    10,
+    12,
+    13,
+    14
+   ],
+   "has_profile_02": true,
+   "profile_ids": [
+    1,
+    2,
+    7,
+    8,
+    10,
+    12,
+    13,
+    14,
+    18
+   ]
+  },
+  {
+   "region": "N6E2",
+   "bbox_pau": {
+    "w": 214748364,
+    "s": 563714455,
+    "e": 429496728,
+    "n": 676457346
+   },
+   "bbox_deg": {
+    "w": 18.0,
+    "s": 47.25,
+    "e": 36.0,
+    "n": 56.7
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 1350408
+    },
+    "42": {
+     "code": "1A",
+     "size": 160304416
+    },
+    "17": {
+     "code": "0H",
+     "size": 23311472
+    },
+    "14": {
+     "code": "0E",
+     "size": 18071320
+    },
+    "2": {
+     "code": "02",
+     "size": 35423752
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    2,
+    14,
+    17,
+    42
+   ],
+   "has_profile_02": true,
+   "profile_ids": [
+    2,
+    14,
+    17,
+    18,
+    42
+   ]
+  },
+  {
+   "region": "N6E3",
+   "bbox_pau": {
+    "w": 429496728,
+    "s": 563714455,
+    "e": 644245092,
+    "n": 676457346
+   },
+   "bbox_deg": {
+    "w": 36.0,
+    "s": 47.25,
+    "e": 54.0,
+    "n": 56.7
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 341404
+    },
+    "42": {
+     "code": "1A",
+     "size": 32453932
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    42
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    18,
+    42
+   ]
+  },
+  {
+   "region": "N7W1",
+   "bbox_pau": {
+    "w": 3988183918,
+    "s": 676457346,
+    "e": 0,
+    "n": 789200237
+   },
+   "bbox_deg": {
+    "w": -25.7143,
+    "s": 56.7,
+    "e": 0.0,
+    "n": 66.15
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 9304112
+    },
+    "13": {
+     "code": "0D",
+     "size": 16866984
+    },
+    "12": {
+     "code": "0C",
+     "size": 3700964
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    12,
+    13
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    12,
+    13,
+    18
+   ]
+  },
+  {
+   "region": "N7E1",
+   "bbox_pau": {
+    "w": 0,
+    "s": 676457346,
+    "e": 306783378,
+    "n": 789200237
+   },
+   "bbox_deg": {
+    "w": 0.0,
+    "s": 56.7,
+    "e": 25.7143,
+    "n": 66.15
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "13": {
+     "code": "0D",
+     "size": 61253592
+    },
+    "18": {
+     "code": "0I",
+     "size": 19505524
+    },
+    "17": {
+     "code": "0H",
+     "size": 17281728
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    13,
+    17
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    13,
+    17,
+    18
+   ]
+  },
+  {
+   "region": "N7E2",
+   "bbox_pau": {
+    "w": 306783378,
+    "s": 676457346,
+    "e": 613566756,
+    "n": 789200237
+   },
+   "bbox_deg": {
+    "w": 25.7143,
+    "s": 56.7,
+    "e": 51.4286,
+    "n": 66.15
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "17": {
+     "code": "0H",
+     "size": 9074812
+    },
+    "18": {
+     "code": "0I",
+     "size": 3528740
+    },
+    "13": {
+     "code": "0D",
+     "size": 23881028
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    13,
+    17
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    13,
+    17,
+    18
+   ]
+  },
+  {
+   "region": "N8W1",
+   "bbox_pau": {
+    "w": 3988183918,
+    "s": 789200237,
+    "e": 0,
+    "n": 901943128
+   },
+   "bbox_deg": {
+    "w": -25.7143,
+    "s": 66.15,
+    "e": 0.0,
+    "n": 75.6
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 1122036
+    },
+    "13": {
+     "code": "0D",
+     "size": 572428
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    13
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    13,
+    18
+   ]
+  },
+  {
+   "region": "N8E1",
+   "bbox_pau": {
+    "w": 0,
+    "s": 789200237,
+    "e": 306783378,
+    "n": 901943128
+   },
+   "bbox_deg": {
+    "w": 0.0,
+    "s": 66.15,
+    "e": 25.7143,
+    "n": 75.6
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "13": {
+     "code": "0D",
+     "size": 9616776
+    },
+    "18": {
+     "code": "0I",
+     "size": 4813312
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    13
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    13,
+    18
+   ]
+  },
+  {
+   "region": "N8E2",
+   "bbox_pau": {
+    "w": 306783378,
+    "s": 789200237,
+    "e": 613566756,
+    "n": 901943128
+   },
+   "bbox_deg": {
+    "w": 25.7143,
+    "s": 66.15,
+    "e": 51.4286,
+    "n": 75.6
+   },
+   "part_off": 126,
+   "idx_prefix_len": 504,
+   "profiles": {
+    "18": {
+     "code": "0I",
+     "size": 4009028
+    },
+    "13": {
+     "code": "0D",
+     "size": 6281148
+    }
+   },
+   "has_land": true,
+   "land_profile_ids": [
+    13
+   ],
+   "has_profile_02": false,
+   "profile_ids": [
+    13,
+    18
+   ]
+  }
+ ]
+}

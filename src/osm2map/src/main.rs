@@ -456,7 +456,7 @@ fn pick_land_profile(ri: &RegionInfo) -> Option<u16> {
 }
 
 // CLI inventory modes: human table and/or TSV / osmium .poly emit and/or point lookup. Exits 0.
-fn run_inventory(stock_dir: &str, list: bool, tsv: Option<&str>, poly: Option<&str>, cfg: Option<&str>, profiles: Option<&str>, point: Option<(f64, f64)>) -> ! {
+fn run_inventory(stock_dir: &str, list: bool, tsv: Option<&str>, poly: Option<&str>, cfg: Option<&str>, geojson: Option<&str>, profiles: Option<&str>, point: Option<(f64, f64)>) -> ! {
     let inv = inventory_regions(stock_dir);
     if inv.is_empty() {
         eprintln!("error: no *AA.IDX found in STOCK_DIR '{}'", stock_dir);
@@ -548,6 +548,41 @@ fn run_inventory(stock_dir: &str, list: bool, tsv: Option<&str>, poly: Option<&s
             std::process::exit(2);
         }
         println!("wrote {} ({} region polygons)", path, inv.len());
+    }
+
+    if let Some(path) = geojson {
+        // GeoJSON FeatureCollection: one rectangle Polygon per region (lon,lat), the real bbox from
+        // the stock AA.IDX. Carries `name`/`label`/`text` so viewers (geojson.io, QGIS, MapLibre)
+        // draw the region code at the polygon centroid, plus SimpleStyle colours — covered regions
+        // (any shard beyond the universal 0x12 hydro stub) one colour, off-coverage stubs another.
+        let mut feats: Vec<String> = Vec::with_capacity(inv.len());
+        for r in &inv {
+            let (w, s, e, n) = region_degs(r);
+            let (cx, cy) = ((w + e) / 2.0, (s + n) / 2.0);
+            let tot: u64 = r.maps.iter().map(|(_, b)| b).sum();
+            let covered = r.profs.iter().any(|&p| p != HYDRO_PROF);
+            let (col, fop) = if covered { ("#e8663c", 0.28) } else { ("#9aa0a6", 0.06) };
+            let profs = r.profs.iter().map(|&p| format!("{:02X}", p)).collect::<Vec<_>>().join(" ");
+            feats.push(format!(
+                concat!(
+                    "    {{\"type\":\"Feature\",\"properties\":{{",
+                    "\"name\":\"{name}\",\"label\":\"{name}\",\"text\":\"{name}\",\"region\":\"{name}\",",
+                    "\"covered\":{cov},\"maps\":{maps},\"map_bytes\":{bytes},\"profiles\":\"{profs}\",",
+                    "\"west\":{w:.6},\"south\":{s:.6},\"east\":{e:.6},\"north\":{n:.6},\"lon\":{cx:.6},\"lat\":{cy:.6},",
+                    "\"stroke\":\"{col}\",\"stroke-width\":1,\"fill\":\"{col}\",\"fill-opacity\":{fop},\"marker-color\":\"{col}\"",
+                    "}},\"geometry\":{{\"type\":\"Polygon\",\"coordinates\":[[[{w:.6},{s:.6}],[{e:.6},{s:.6}],[{e:.6},{n:.6}],[{w:.6},{n:.6}],[{w:.6},{s:.6}]]]}}}}"
+                ),
+                name = r.name, cov = covered, maps = r.maps.len(), bytes = tot, profs = profs,
+                w = w, s = s, e = e, n = n, cx = cx, cy = cy, col = col, fop = fop,
+            ));
+        }
+        let out = format!("{{\n  \"type\": \"FeatureCollection\",\n  \"name\": \"travelmap_regions\",\n  \"features\": [\n{}\n  ]\n}}\n", feats.join(",\n"));
+        if let Err(err) = fs::write(path, out) {
+            eprintln!("error: write {}: {}", path, err);
+            std::process::exit(2);
+        }
+        let cov = inv.iter().filter(|r| r.profs.iter().any(|&p| p != HYDRO_PROF)).count();
+        println!("wrote {} ({} regions, {} covered)", path, inv.len(), cov);
     }
 
     if let Some(path) = cfg {
@@ -2573,6 +2608,7 @@ fn main() {
     let mut emit_tsv: Option<String> = None;
     let mut emit_poly: Option<String> = None;
     let mut emit_cfg: Option<String> = None;
+    let mut emit_geojson: Option<String> = None;
     let mut emit_profiles: Option<String> = None;
     let mut region_of: Option<(f64, f64)> = None;
     let mut stock_dir_flag: Option<String> = None;
@@ -2621,6 +2657,12 @@ fn main() {
             if let Some(v) = it.next() {
                 emit_cfg = Some(v.clone());
             }
+        } else if let Some(v) = a.strip_prefix("--emit-geojson=") {
+            emit_geojson = Some(v.to_string());
+        } else if a == "--emit-geojson" {
+            if let Some(v) = it.next() {
+                emit_geojson = Some(v.clone());
+            }
         } else if let Some(v) = a.strip_prefix("--emit-profiles=") {
             emit_profiles = Some(v.to_string());
         } else if a == "--emit-profiles" {
@@ -2645,11 +2687,11 @@ fn main() {
             pos.push(a.clone());
         }
     }
-    if list_regions || emit_tsv.is_some() || emit_poly.is_some() || emit_cfg.is_some() || emit_profiles.is_some() || region_of.is_some() {
+    if list_regions || emit_tsv.is_some() || emit_poly.is_some() || emit_cfg.is_some() || emit_geojson.is_some() || emit_profiles.is_some() || region_of.is_some() {
         let sd = stock_dir_flag
             .or_else(|| env::var("STOCK_DIR").ok())
             .unwrap_or_else(|| DEF_STOCK_DIR.to_string());
-        run_inventory(&sd, list_regions, emit_tsv.as_deref(), emit_poly.as_deref(), emit_cfg.as_deref(), emit_profiles.as_deref(), region_of);
+        run_inventory(&sd, list_regions, emit_tsv.as_deref(), emit_poly.as_deref(), emit_cfg.as_deref(), emit_geojson.as_deref(), emit_profiles.as_deref(), region_of);
     }
     region_arg = region_arg.or_else(|| env::var("OSM2MAP_REGION").ok());
     let osm_in = pos

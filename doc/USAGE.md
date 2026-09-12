@@ -219,6 +219,7 @@ osm2map --region-of 19.9,50.1                # which region(s) contain a lon,lat
 osm2map --emit-tsv    regions.tsv            # machine-readable per-region row (all 411)
 osm2map --emit-config regions.json           # osmium `extract --config` JSON: per-region split
 osm2map --emit-poly   regions.poly           # one multipolygon (single combined extract)
+osm2map --emit-geojson regions.geojson       # GeoJSON rectangles (viewer overlay + labels)
 osm2map --emit-profiles land_profiles.tsv    # region -> chosen land profile map (regenerate)
 osm2map --list-regions --stock-dir /path/to/MAP   # override the stock dir
 ```
@@ -236,6 +237,14 @@ osm2map --list-regions --stock-dir /path/to/MAP   # override the stock dir
 - `--emit-poly` writes every region as a rectangle polygon; use `osmium extract --polygon
   regions.poly -o all.osm.pbf` for one *combined* extract (a single region set, not a per-region
   split — for the split use `--emit-config`).
+- `--emit-geojson` writes a GeoJSON `FeatureCollection`: one lon/lat rectangle per region (all 411),
+  each with `name`/`label`/`text` = the `<REGION>` file prefix plus `covered`, `maps`, `map_bytes`,
+  `profiles`, the bbox and SimpleStyle colours (covered vs off-coverage stub). Import it into any
+  viewer (geojson.io, QGIS, MapLibre) to see which MAP region covers which part of the world. GeoJSON
+  itself carries only the label *text* — font size/position are set by the viewer (it labels polygons
+  at the centroid from `name`). A ready-made overlay with **big centred labels** ships at
+  `gen/regions_map.html` (self-contained MapLibre page, opens by double-click, covered regions drawn
+  bold + labelled; click a region for its `N<..>1XX.MAP` shards).
 - Per-region `MAP` shard sizes and the profile → size map are shown so you can size memory and pick
   the emit profile before running a conversion.
 
