@@ -206,3 +206,101 @@ Output is verified consistent both ways: full `malopolskie` via `.osm` and via `
 produces byte-identical `IDX`/`MAP`/`TCI` (≈145 MB land MAP), and either output re-decodes
 through `map2osm_rs` (`-f xml` vs `-f pbf`) with zero element/tag differences.
 
+## Region inventory (`--list-regions` and friends)
+
+`osm2map_rs` also enumerates the stock set (`STOCK_DIR`, default the unpacked `…/DATA/DATA/MAP`)
+straight from the `*AA.IDX` headers — no OSM input needed. Each region's declared **profiles** are
+read from its `AA.IDX` L0 tile slot (single, or a `multi` slot's sub-entries = the shard set that
+region's signed resinf/RPI catalog declares).
+
+```bash
+osm2map_rs --list-regions                       # table: name, bbox, dLon/dLat, #maps, MB, profiles
+osm2map_rs --region-of 19.9,50.1                # which region(s) contain a lon,lat (+ their profiles)
+osm2map_rs --emit-tsv    regions.tsv            # machine-readable per-region row (all 411)
+osm2map_rs --emit-config regions.json           # osmium `extract --config` JSON: per-region split
+osm2map_rs --emit-poly   regions.poly           # one multipolygon (single combined extract)
+osm2map_rs --emit-profiles land_profiles.tsv    # region -> chosen land profile map (regenerate)
+osm2map_rs --list-regions --stock-dir /path/to/MAP   # override the stock dir
+```
+
+- `--region-of LON,LAT` finds the target region code from a coordinate (no hand-deriving it from the
+  grid).
+- `--emit-config` writes an **osmium extract config** (JSON) with one job per *covered* region (a
+  region is "covered" if it ships a shard beyond the universal `0x12` hydro stub — 22 regions in this
+  stock set). It drives a **single-pass** split of a big extract into per-region inputs:
+  ```bash
+  osm2map_rs --emit-config regions.json
+  osmium extract -c regions.json europe.osm.pbf     # -> ./N6E1.osm.pbf, ./N6E2.osm.pbf, ...
+  ```
+  (`regions.json` may also carry a top-level `"directory"`; see `osmium help extract` → CONFIG FILE.)
+- `--emit-poly` writes every region as a rectangle polygon; use `osmium extract --polygon
+  regions.poly -o all.osm.pbf` for one *combined* extract (a single region set, not a per-region
+  split — for the split use `--emit-config`).
+- Per-region `MAP` shard sizes and the profile → size map are shown so you can size memory and pick
+  the emit profile before running a conversion.
+
+
+### Profiles differ per region — why
+
+A region's data is split into **profile shards** (`regProf` low byte), each a `<REGION>1XX.MAP`
+file, and each region carries a *different set* of them: the shipped stock here has 9 shards for
+`N6E1`, 3 for `N7E2`, and only the universal hydro `0x12` (`10I`) for the ~387 off-coverage stub
+regions. The `0x12` hydro slot is the one id present in **all** 411 regions; every other id is
+region-specific, and the *same* logical layer can carry a *different numeric id* per region (the
+dominant base shard is `0x01` in `N6E1`, `0x2A` in `N6E2`, `0x16` in `N5E2`). That is because the
+profile ids live in the region's **signed resinf/RPI metadata catalog**, which Bosch authors
+per-region — there is no single global "layer ⇒ id" registry. Consequence for the writer: the
+emitted land profile must be an id the target region already declares, or the head unit finds no
+shard for it. The default `0x02` (car-validated on `N6E1`/`N6E2`) is therefore *not* universal.
+
+`osm2map_rs` now resolves this automatically per region (no env needed for the covered set). In
+`setup_region` the emitted land profile is chosen by precedence:
+
+1. `OSM2MAP_PROFILE=<id>` — manual override, always wins (one-off / experimentation).
+2. the **curated land-profile map** (`--profiles <path>` / `OSM2MAP_PROFILES=<path>`, else the map
+   embedded from `templates/land_profiles.tsv`) — the 22 covered regions, `0x02` where the region
+   declares it, otherwise its largest declared shard. `--emit-profiles` regenerates this map.
+3. fallback auto-pick for a region absent from the map: `0x02` if declared, else largest declared
+   shard (`--list-regions` shows the sizes).
+
+Whatever is chosen is then checked against the region's declared set; if it isn't declared the run
+aborts with the region's profile list. Off-coverage stubs (only `0x12`) have no land shard to emit
+into, so they correctly fail here.
+
+### Should the converter emit multiple profiles? (analysis)
+
+**Why a region ships several shards.** Decoding the stock set (per-shard *feature-kind* histograms,
+via `map2osm_rs`) shows a profile is a **container / size-and-entitlement shard of the region's
+tiles — not a semantic layer**. In `N6E2` the roads, POI, areas and water all re-appear across the
+`0x02`, `0x2A`, `0x11`, `0x0E` shards; individual tiles land in whichever shard has room / matches
+the delivery, and the *kind* of a cell comes from the per-cell feature code at the cell header, not
+from the profile id (`MAP_format` §11: the profile field at `MAP+0x1e` is not read by the runtime
+header ctor). Ghidra confirms the read-side model in `DAPIAPP.OUT` (ARM:LE:32):
+
+- `dap_map_tclRegProfList` = a `vector<RegProfListDesc>` (each record 4×u16, field0 = `regProf`,
+  built by `bStoreRegProfListDesc`) plus a parallel `vector<RegProfListIdxFileIDList>`; the id
+  controller creates a shard on demand with `bCreateRegionProfileWithIdxId` (`0x008db808`) /
+  `bAddIdxId2RegionProfile` (`0x008da664`) and indexes it by `regProf`.
+- tile lookup is **offset based**: `dap_map_tclMapFileOffset` (2×u32 = file,offset). A tile carries
+  its own regProf + offset, so the loader jumps straight to a tile in the right shard — it never
+  needs the whole region, and it does not care which regProf a shard *was*, only that an entry with
+  the tile's regProf exists in the RPI.
+
+So the region's shard split is a *packaging* decision (Bosch authors the RPI catalog per region),
+and content is **not** bound to a particular id.
+
+**What the converter must guarantee.** Only that the regProf it stamps on its tiles is an id the
+target region's signed RPI/`AA.IDX` **declares** — i.e. the id-controller can resolve it. Any single
+declared id renders identically, because each emitted cell carries its own feature code. That is why
+the whole `N6E2` region converts correctly into the single `0x02` shard and byte-matches stock on the
+`AA.IDX`/`TCI`.
+
+**Recommendation.** Keep emitting **one land shard per region** (the auto-picked declared id). It is
+functionally complete and validated. Multi-shard emission would only add value for very large
+regions where the device's per-shard paging or an exact RPI replication matters — and doing it
+faithfully would require reproducing Bosch's per-tile→shard offset assignment byte-for-byte (the RPI
+is signed, so the converter cannot author new profile ids anyway). For re-authoring existing
+coverage, one declared shard per region is the correct and sufficient target.
+
+
+

@@ -203,6 +203,43 @@ fn setup_region(region_arg: Option<String>, bbox_given: bool) {
             "[region {}] stock {} bbox W{:.2} S{:.2} E{:.2} N{:.2}  (IDX prefix {} B)",
             name, stock_path, d2(w), d2(s), d2(e), d2(n), plen
         );
+        // Resolve the emitted land profile. Precedence: OSM2MAP_PROFILE (env) > the curated map
+        // (--profiles / OSM2MAP_PROFILES, else embedded) > 0x02-if-declared > largest declared shard.
+        // Whatever is chosen must be a profile the region declares (its signed RPI / the L0 slot),
+        // else the id-controller finds no shard. --list-regions shows each region's declared ids.
+        if let Some(ri) = parse_region_idx(&stock_dir, &name) {
+            let pmap = load_land_profiles();
+            let mut src = "OSM2MAP_PROFILE";
+            if LAND_P.get().is_none() {
+                match pmap.get(&name.to_ascii_uppercase()) {
+                    Some(&p) => {
+                        LAND_P.set(p).ok();
+                        src = "profiles-map";
+                    }
+                    None => match pick_land_profile(&ri) {
+                        Some(p) => {
+                            LAND_P.set(p).ok();
+                            src = "auto";
+                        }
+                        None => src = "default",
+                    },
+                }
+            }
+            let lp = land_prof();
+            eprintln!(
+                "[region {}] land profile 0x{:02X} (file 1{}) via {}",
+                name, lp, prof_file_code(lp), src
+            );
+            if !ri.profs.contains(&(lp & 0xFF)) {
+                eprintln!(
+                    "error: emitted land profile 0x{:02X} (file 1{}) is NOT declared by region '{}'.\n\
+                     '{}' declares [{}]. Re-run with OSM2MAP_PROFILE=<id> set to one of those\n\
+                     (see `--list-regions`).",
+                    lp, prof_file_code(lp), name, name, prof_tags(&ri.profs)
+                );
+                std::process::exit(2);
+            }
+        }
     } else if name != DEF_REGION {
         eprintln!(
             "error: region '{}' has no stock IDX at {} — cannot resolve its resinf catalog / bbox.\n\
@@ -218,6 +255,358 @@ fn setup_region(region_arg: Option<String>, bbox_given: bool) {
     }
 }
 
+// ---- Region inventory (enumerated from the stock *AA.IDX files) ------------
+//
+// Every region ships <REGION>AA.IDX whose 32 B header carries its bbox (west/south/east/north, PAU)
+// and partOff; a 4-entry partition table at partOff*4 points at the per-level tile tables. The L0
+// tile (whole region) is either a single {regProf,len,off} slot or, when the region's data is split
+// across several MAP shards, a `multi` slot {0x4000,count,ptr} -> `count` real slots. The profile
+// low byte of each such slot is one product shard that region's signed resinf/RPI catalog declares,
+// and maps to a <REGION>1<base32(low)>.MAP file. Different regions ship different shard sets (N6E1:
+// 9, N7E2: 3, off-coverage stubs: only the 0x12 hydro slot), and the SAME logical layer can carry a
+// different numeric id per region — hence the land profile is a per-region parameter
+// (OSM2MAP_PROFILE), not a constant. --list-regions / --emit-tsv / --emit-poly / --region-of read
+// all stock IDX to enumerate name + bbox + declared profiles (+ on-disk MAP shard sizes).
+const B32DIGITS: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+
+fn prof_file_code(prof_low: u16) -> String {
+    let v = (prof_low & 0xFF) as usize;
+    [B32DIGITS[v / 32], B32DIGITS[v % 32]].iter().map(|&c| c as char).collect()
+}
+fn prof_of_file_code(cc: &[u8]) -> Option<u16> {
+    let hi = B32DIGITS.iter().position(|&d| d == cc[0])?;
+    let lo = B32DIGITS.iter().position(|&d| d == cc[1])?;
+    Some((hi * 32 + lo) as u16)
+}
+
+struct RegionInfo {
+    name: String,
+    w: i64,
+    s: i64,
+    e: i64,
+    n: i64,
+    profs: Vec<u16>,       // declared profile low bytes (sorted, unique)
+    maps: Vec<(u16, u64)>, // on-disk <REGION>1XX.MAP: (profile low byte, size bytes), sorted
+}
+
+fn region_degs(ri: &RegionInfo) -> (f64, f64, f64, f64) {
+    (ri.w as f64 / PAU, ri.s as f64 / PAU, ri.e as f64 / PAU, ri.n as f64 / PAU)
+}
+
+// Parse one <name>AA.IDX in stock_dir: bbox (PAU) + declared profiles from the L0 slot (+ multi
+// sub-slots) + on-disk MAP shard sizes. None if the IDX is missing or too short to trust.
+fn parse_region_idx(stock_dir: &str, name: &str) -> Option<RegionInfo> {
+    let path = format!("{}/{}AA.IDX", stock_dir, name);
+    let d = fs::read(&path).ok()?;
+    if d.len() < 0x84 {
+        return None;
+    }
+    let g32 = |o: usize| i32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as i64;
+    let (w, s, e, n) = (g32(4), g32(8), g32(12), g32(16));
+    let part_off = usize::from(u16::from_le_bytes([d[0x14], d[0x15]])) * 4;
+    if part_off + 12 > d.len() {
+        return None;
+    }
+    // L0 partition entry {u32 level, u32 tileCount, u32 sectionOffset}: take sectionOffset.
+    let l0_off = u32::from_le_bytes([
+        d[part_off + 8],
+        d[part_off + 9],
+        d[part_off + 10],
+        d[part_off + 11],
+    ]) as usize;
+    if l0_off + 8 > d.len() {
+        return None;
+    }
+    let reg_prof = u16::from_le_bytes([d[l0_off], d[l0_off + 1]]);
+    let mut profs: Vec<u16> = Vec::new();
+    if reg_prof & 0x4000 != 0 {
+        // multi slot: `count` real 8-byte slots at ptr; skip empty markers (bit15).
+        let count = usize::from(u16::from_le_bytes([d[l0_off + 2], d[l0_off + 3]]));
+        let ptr = u32::from_le_bytes([
+            d[l0_off + 4],
+            d[l0_off + 5],
+            d[l0_off + 6],
+            d[l0_off + 7],
+        ]) as usize;
+        for k in 0..count {
+            let o = ptr.checked_add(k * 8)?;
+            if o + 8 > d.len() {
+                break;
+            }
+            let sp = u16::from_le_bytes([d[o], d[o + 1]]);
+            if sp & 0x8000 == 0 {
+                profs.push(sp & 0xFF);
+            }
+        }
+    } else if reg_prof & 0x8000 == 0 {
+        profs.push(reg_prof & 0xFF);
+    }
+    profs.sort_unstable();
+    profs.dedup();
+
+    // On-disk MAP shards <name>1XX.MAP (exact length + the '1' byte guards N6E1 vs N6E10).
+    let mut maps: Vec<(u16, u64)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(stock_dir) {
+        for ent in rd.flatten() {
+            let fnm = ent.file_name().to_string_lossy().to_string();
+            if fnm.len() == name.len() + 7
+                && fnm.ends_with(".MAP")
+                && fnm.starts_with(name)
+                && &fnm[name.len()..name.len() + 1] == "1"
+            {
+                let cc = &fnm.as_bytes()[name.len() + 1..name.len() + 3];
+                if let Some(low) = prof_of_file_code(cc) {
+                    if let Ok(md) = ent.path().metadata() {
+                        maps.push((low, md.len()));
+                    }
+                }
+            }
+        }
+    }
+    maps.sort_unstable();
+    Some(RegionInfo { name: name.to_string(), w, s, e, n, profs, maps })
+}
+
+// Enumerate every region in stock_dir (all *AA.IDX), sorted by name.
+fn inventory_regions(stock_dir: &str) -> Vec<RegionInfo> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(rd) = fs::read_dir(stock_dir) {
+        for ent in rd.flatten() {
+            if let Some(stem) = ent.file_name().to_string_lossy().strip_suffix("AA.IDX") {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.iter().filter_map(|nm| parse_region_idx(stock_dir, nm)).collect()
+}
+
+fn parse_lonlat(s: &str) -> Option<(f64, f64)> {
+    let mut it = s.split(',');
+    let lon = it.next()?.trim().parse::<f64>().ok()?;
+    let lat = it.next()?.trim().parse::<f64>().ok()?;
+    Some((lon, lat))
+}
+
+fn prof_tags(profs: &[u16]) -> String {
+    profs.iter().map(|&p| format!("0x{:02X}(1{})", p, prof_file_code(p))).collect::<Vec<_>>().join(" ")
+}
+
+// Curated per-region LAND profile map (templates/land_profiles.tsv): region code -> regProf low byte
+// to emit into. The emit profile only has to be one the region DECLARES in its signed RPI / AA.IDX:
+// the id-controller (dap_map_tclRegProfList) looks tiles up by regProf, and each cell carries its own
+// feature code, so ANY declared id renders the same (a profile is a container, not a content type).
+// The shipped map pins the two car-validated regions (N6E1/N6E2) at 0x02 and defaults every other
+// covered region to its largest declared shard. Override: OSM2MAP_PROFILE (one region) or
+// --profiles / OSM2MAP_PROFILES=<path> (an alternate map).
+const LAND_PROFILES_TSV: &str = include_str!("../templates/land_profiles.tsv");
+
+fn parse_land_profiles(tsv: &str) -> HashMap<String, u16> {
+    let mut m = HashMap::new();
+    for line in tsv.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let mut it = l.split(['\t', ' ']).filter(|s| !s.is_empty());
+        let name = match it.next() {
+            Some(n) => n,
+            None => continue,
+        };
+        let p = match it.next() {
+            Some(p) => p.trim().to_ascii_uppercase(),
+            None => continue,
+        };
+        let hex: &str = p.strip_prefix("0X").unwrap_or_else(|| p.as_str());
+        if let Ok(v) = u16::from_str_radix(hex, 16) {
+            m.insert(name.to_ascii_uppercase(), v);
+        }
+    }
+    m
+}
+
+// The active land-profile map: --profiles/OSM2MAP_PROFILES file if set, else the embedded TSV.
+fn load_land_profiles() -> HashMap<String, u16> {
+    match env::var("OSM2MAP_PROFILES") {
+        Ok(path) => match fs::read_to_string(&path) {
+            Ok(s) => parse_land_profiles(&s),
+            Err(e) => {
+                eprintln!("error: read OSM2MAP_PROFILES '{}': {}", path, e);
+                std::process::exit(2)
+            }
+        },
+        Err(_) => parse_land_profiles(LAND_PROFILES_TSV),
+    }
+}
+
+// Land profile for a region when not overridden: 0x02 if declared (Bosch land convention, validated
+// on N6E1/N6E2), else the declared shard with the largest on-disk MAP (dominant/base product).
+// None if the region declares nothing but the hydro overlay (an off-coverage stub).
+fn pick_land_profile(ri: &RegionInfo) -> Option<u16> {
+    let cand: Vec<u16> = ri.profs.iter().copied().filter(|&p| p != HYDRO_PROF).collect();
+    if cand.is_empty() {
+        return None;
+    }
+    if cand.contains(&LAND_PROF) {
+        return Some(LAND_PROF);
+    }
+    cand.iter()
+        .max_by_key(|&p| ri.maps.iter().find(|(l, _)| *l == *p).map(|(_, b)| *b).unwrap_or(0))
+        .copied()
+}
+
+// CLI inventory modes: human table and/or TSV / osmium .poly emit and/or point lookup. Exits 0.
+fn run_inventory(stock_dir: &str, list: bool, tsv: Option<&str>, poly: Option<&str>, cfg: Option<&str>, profiles: Option<&str>, point: Option<(f64, f64)>) -> ! {
+    let inv = inventory_regions(stock_dir);
+    if inv.is_empty() {
+        eprintln!("error: no *AA.IDX found in STOCK_DIR '{}'", stock_dir);
+        std::process::exit(2);
+    }
+
+    if let Some((lon, lat)) = point {
+        let (lo, la) = (deg2pau(lon), deg2pau(lat));
+        let hits: Vec<&RegionInfo> =
+            inv.iter().filter(|r| lo >= r.w && lo <= r.e && la >= r.s && la <= r.n).collect();
+        if hits.is_empty() {
+            println!("no stock region contains ({:.5}, {:.5})", lon, lat);
+        }
+        for r in &hits {
+            let (w, s, e, n) = region_degs(r);
+            println!(
+                "{}  bbox W{:.2} S{:.2} E{:.2} N{:.2}  profiles [{}]",
+                r.name, w, s, e, n,
+                prof_tags(&r.profs)
+            );
+        }
+        std::process::exit(0);
+    }
+
+    if list {
+        println!(
+            "region  west     south    east     north    dLon  dLat  #maps tot_MB  declared profiles (regProf low -> MAP file size MB)"
+        );
+        for r in &inv {
+            let (w, s, e, n) = region_degs(r);
+            let tot: u64 = r.maps.iter().map(|(_, b)| b).sum();
+            let pl: Vec<String> = r
+                .profs
+                .iter()
+                .map(|&p| {
+                    let mb = r.maps.iter().find(|(lo, _)| *lo == p).map(|(_, b)| *b).unwrap_or(0);
+                    format!("0x{:02X}/1{}={:.1}", p, prof_file_code(p), mb as f64 / 1e6)
+                })
+                .collect();
+            println!(
+                "{:<6} {:7.2} {:7.2} {:7.2} {:7.2} {:5.2} {:5.2}  {:>2}  {:>7.1}  [{}]",
+                r.name, w, s, e, n, e - w, n - s, r.maps.len(), tot as f64 / 1e6, pl.join(" ")
+            );
+        }
+        let mut freq: std::collections::BTreeMap<u16, usize> = Default::default();
+        for r in &inv {
+            for &p in &r.profs {
+                *freq.entry(p).or_insert(0) += 1;
+            }
+        }
+        println!("\ndeclared profile -> #regions (of {}):", inv.len());
+        for (p, c) in freq {
+            println!("  0x{:02X} (1{})  {}", p, prof_file_code(p), c);
+        }
+    }
+
+    if let Some(path) = tsv {
+        let mut out = String::new();
+        out.push_str("region\twest\tsouth\teast\tnorth\tprofiles\tmaps\tmap_bytes\n");
+        for r in &inv {
+            let (w, s, e, n) = region_degs(r);
+            let tot: u64 = r.maps.iter().map(|(_, b)| b).sum();
+            let pl: Vec<String> = r.profs.iter().map(|&p| format!("{:02X}", p)).collect();
+            out.push_str(&format!(
+                "{}\t{:.7}\t{:.7}\t{:.7}\t{:.7}\t{}\t{}\t{}\n",
+                r.name, w, s, e, n, pl.join(","), r.maps.len(), tot
+            ));
+        }
+        if let Err(err) = fs::write(path, out) {
+            eprintln!("error: write {}: {}", path, err);
+            std::process::exit(2);
+        }
+        println!("wrote {} ({} regions)", path, inv.len());
+    }
+
+    if let Some(path) = poly {
+        // osmium --polygon input: one named rectangle per region (title -> split output file stem).
+        let mut out = String::new();
+        for r in &inv {
+            let (w, s, e, n) = region_degs(r);
+            out.push_str(&format!("{}_0\n", r.name));
+            for (x, y) in [(w, s), (e, s), (e, n), (w, n), (w, s)] {
+                out.push_str(&format!("{:.6} {:.6}\n", x, y));
+            }
+            out.push_str("END\nEND\n");
+        }
+        if let Err(err) = fs::write(path, out) {
+            eprintln!("error: write {}: {}", path, err);
+            std::process::exit(2);
+        }
+        println!("wrote {} ({} region polygons)", path, inv.len());
+    }
+
+    if let Some(path) = cfg {
+        // osmium extract --config (JSON): one extract job per region -> a single-pass per-region
+        // split of a big extract:  osmium extract -c <path> europe.osm.pbf
+        // Only regions that ship a shard beyond the universal 0x12 hydro stub are covered; the
+        // off-coverage stubs (only 0x12) are skipped so the split config stays lean.
+        let jobs: Vec<&RegionInfo> = inv.iter().filter(|r| r.profs.iter().any(|&p| p != HYDRO_PROF)).collect();
+        let jobs: Vec<&RegionInfo> = if jobs.is_empty() { inv.iter().collect() } else { jobs };
+        let mut out = String::from("{\n  \"extracts\": [\n");
+        let njobs = jobs.len();
+        for (i, r) in jobs.iter().enumerate() {
+            let (w, s, e, n) = region_degs(r);
+            let profs = r
+                .profs
+                .iter()
+                .map(|&p| format!("0x{:02X}(1{})", p, prof_file_code(p)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!(
+                "    {{ \"output\": \"{}.osm.pbf\", \"bbox\": [{:.7}, {:.7}, {:.7}, {:.7}], \"description\": \"{} profiles: {}\" }}{}",
+                r.name, w, s, e, n, r.name, profs,
+                if i + 1 < njobs { "," } else { "" }
+            ));
+            out.push('\n');
+        }
+        out.push_str("  ]\n}\n");
+        if let Err(err) = fs::write(path, out) {
+            eprintln!("error: write {}: {}", path, err);
+            std::process::exit(2);
+        }
+        println!("wrote {} ({} covered extracts); split with: osmium extract -c {} <in.osm.pbf>", path, njobs, path);
+    }
+
+    if let Some(path) = profiles {
+        // Re-generate the per-region LAND profile map (region -> auto-picked declared profile).
+        let mut out = String::new();
+        out.push_str("# region\tprofile\tmap_bytes\tdeclared\n");
+        let mut n = 0usize;
+        for r in &inv {
+            if let Some(p) = pick_land_profile(r) {
+                let sz = r.maps.iter().find(|(l, _)| *l == p).map(|(_, b)| *b).unwrap_or(0);
+                out.push_str(&format!(
+                    "{}\t0x{:02X}\t{}\t{}\n",
+                    r.name, p, sz,
+                    r.profs.iter().map(|&c| format!("{:02X}", c)).collect::<Vec<_>>().join(",")
+                ));
+                n += 1;
+            }
+        }
+        if let Err(err) = fs::write(path, out) {
+            eprintln!("error: write {}: {}", path, err);
+            std::process::exit(2);
+        }
+        println!("wrote {} ({} region land profiles)", path, n);
+    }
+
+    std::process::exit(0);
+}
 
 fn put_u16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -2179,6 +2568,14 @@ fn main() {
     let mut region_arg: Option<String> = None;
     let mut bbox_arg: Option<String> = None;
     let mut fmt_override: Option<InputFormat> = None;
+    // Inventory modes (read the stock *AA.IDX set and exit; no conversion).
+    let mut list_regions = false;
+    let mut emit_tsv: Option<String> = None;
+    let mut emit_poly: Option<String> = None;
+    let mut emit_cfg: Option<String> = None;
+    let mut emit_profiles: Option<String> = None;
+    let mut region_of: Option<(f64, f64)> = None;
+    let mut stock_dir_flag: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut it = argv.iter().skip(1);
     while let Some(a) = it.next() {
@@ -2198,11 +2595,61 @@ fn main() {
             fmt_override = Some(InputFormat::Pbf);
         } else if a == "--osm" || a == "--xml" {
             fmt_override = Some(InputFormat::OsmXml);
+        } else if a == "--list-regions" {
+            list_regions = true;
+        } else if let Some(v) = a.strip_prefix("--stock-dir=") {
+            stock_dir_flag = Some(v.to_string());
+        } else if a == "--stock-dir" {
+            if let Some(v) = it.next() {
+                stock_dir_flag = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--emit-tsv=") {
+            emit_tsv = Some(v.to_string());
+        } else if a == "--emit-tsv" {
+            if let Some(v) = it.next() {
+                emit_tsv = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--emit-poly=") {
+            emit_poly = Some(v.to_string());
+        } else if a == "--emit-poly" {
+            if let Some(v) = it.next() {
+                emit_poly = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--emit-config=") {
+            emit_cfg = Some(v.to_string());
+        } else if a == "--emit-config" {
+            if let Some(v) = it.next() {
+                emit_cfg = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--emit-profiles=") {
+            emit_profiles = Some(v.to_string());
+        } else if a == "--emit-profiles" {
+            if let Some(v) = it.next() {
+                emit_profiles = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--profiles=") {
+            env::set_var("OSM2MAP_PROFILES", v);
+        } else if a == "--profiles" {
+            if let Some(v) = it.next() {
+                env::set_var("OSM2MAP_PROFILES", v);
+            }
+        } else if let Some(v) = a.strip_prefix("--region-of=") {
+            region_of = parse_lonlat(v);
+        } else if a == "--region-of" {
+            if let Some(v) = it.next() {
+                region_of = parse_lonlat(v);
+            }
         } else if bbox_arg.is_none() && pos.len() >= 2 && a.contains(',') {
             bbox_arg = Some(a.clone()); // 3rd positional = bbox, legacy form
         } else {
             pos.push(a.clone());
         }
+    }
+    if list_regions || emit_tsv.is_some() || emit_poly.is_some() || emit_cfg.is_some() || emit_profiles.is_some() || region_of.is_some() {
+        let sd = stock_dir_flag
+            .or_else(|| env::var("STOCK_DIR").ok())
+            .unwrap_or_else(|| DEF_STOCK_DIR.to_string());
+        run_inventory(&sd, list_regions, emit_tsv.as_deref(), emit_poly.as_deref(), emit_cfg.as_deref(), emit_profiles.as_deref(), region_of);
     }
     region_arg = region_arg.or_else(|| env::var("OSM2MAP_REGION").ok());
     let osm_in = pos
