@@ -1,0 +1,16 @@
+[package]
+name = "cprnav"
+version = "1.0.0"
+edition = "2021"
+description = "Universal Bosch TravelMap CPRNAV_2 codec: compress + decompress (Nissan LCN2KAI)."
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "cprnav"
+path = "src/lib.rs"
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
