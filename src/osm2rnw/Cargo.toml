@@ -1,0 +1,13 @@
+[package]
+name = "osm2rnw"
+version = "0.1.0"
+edition = "2021"
+
+# OSM PBF/XML road network -> Bosch TravelMap RNW (NAVnnnnn.DAT clusters).
+[dependencies]
+quick-xml = { version = "0.42", default-features = false }
+pbf-craft = "1.0"
+
+[[bin]]
+name = "osm2rnw"
+path = "src/main.rs"

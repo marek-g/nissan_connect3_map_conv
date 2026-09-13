@@ -63,6 +63,15 @@ The relationship is one-directional, just like `.IDX`→`.MAP`: **`NAV_ROOT.DAT`
 into the right `NAVnnnnn.DAT` file to read *what* is there. You never need a data file without its
 root index, and the root index alone contains no roads — just pointers.
 
+> **Where the cluster locator actually is.** It is tempting to think `NAV_ROOT.DAT` is the "roads around
+> here → which file" index, but it is not. `NAV_ROOT.DAT` is a **region-metadata** file (a small structure
+> header, region-profile outline records, and a blob of shared text like timezone/compass labels); it has no
+> coordinate-to-cluster index. The runtime turns a GPS position into a cluster through a **`.tci` tile index
+> that lives in the `.MAP` folder** (`data/data/map/*.tci`, e.g. `N6E211A.TCI`) — a 4-level tile grid whose
+> leaves point straight at a `NAVnnnnn.DAT` byte range. So the `.RNW` and `.MAP` trees are *coupled*: a
+> hand-built road network is only found by the car if the matching `.tci` tile entries exist too (authoring
+> them = ROADMAP Phase 2b; the geometry itself is verifiable offline with `rnw2osm` regardless).
+
 ### How `.RNW` differs from `.MAP` (and how they fit together)
 
 This is the single most important idea, so it gets its own short table:
@@ -457,8 +466,9 @@ concept above:
    **descriptor list**, and pulls out the **intersections**, the **roads**, and the **positions**.
 5. It pairs each node with its position (same index) and applies `reference + offset × 2^shift` to get
    real coordinates — now every junction has a place on Earth, and every road knows its two end-junctions.
-6. Where two loaded clusters meet, it **stitches** them by matching the shared border junctions at
-   their identical positions (4.11), so the graph is continuous.
+6. Where two loaded clusters meet, it **stitches** them by resolving the shared border junctions — via
+   the explicit overlap links, falling back to the border-marker test (4.11) — **not** by comparing
+   coordinates, so the graph is continuous.
 7. It searches the combined graph for the best path from start to finish, weighing roads by their
    class rank (4.10). The result is an ordered list of roads: *junction A → B → C → … → destination*.
 8. It reads each chosen road's name from the **text section** for turn-by-turn instructions ("turn onto
@@ -578,8 +588,11 @@ network, which is why it can be switched off without breaking navigation.
   starts (a fixed-order table of `{offset, count}` pairs).
 - **Neighbour list** — pointers to adjacent clusters (file, offset, length, reference point), used to
   stitch the network across cluster boundaries.
-- **Stitching by position** — how two clusters join at a shared border: the same junction appears in
-  both at the same coordinates, so they are matched by position, not by ID.
+- **Stitching across boundaries** — how two clusters join at a shared border: the runtime resolves the
+  duplicated junction with an **explicit overlap link**, falling back to a **border-marker test**; it does
+  *not* match by coordinate (`rnw2osm`'s proximity snap is an OSM-side only, 4.11). A *generated* file
+  (`osm2rnw`) keeps the duplicates at *identical* coordinates and flags each as a border junction, which the
+  marker test stitches.
 - **Annotation** — a small `{size, type, payload}` attribute attached to a road or cluster (name ref,
   road number, …).
 - **Text record** — a stored string (possibly multi-language); shared strings are stored once and

@@ -195,6 +195,10 @@ itself"* (MAP_format.md §, 01_MAP_overview.md). It is also CPRNAV_2-compressed 
 string. v1: **omit** (or emit a copy of a reference TCI) and confirm in M0 that the runtime tolerates its
 absence for rendering.
 
+> **Resolved (later):** `osm2map` does **not** emit `.TCI` at all. The TCI's leaf records point at RNW
+> clusters (it is the tile→cluster locator used by routing/FastMap), so its generation belongs to
+> **`osm2rnw`**, not the MAP writer. See ROADMAP Phase 2b and the writer-guide cluster-locator section.
+
 ---
 
 ## 4. OSM → MAP object model (the core new logic)

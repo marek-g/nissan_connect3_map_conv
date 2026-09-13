@@ -990,14 +990,14 @@ of 10I's data flows through the `.IDX` path. Profile 11A, by contrast, carries a
 the file format is identical either way.
 
 **Consequence for swapping:** to replace routes/objects you only swap `<REGION>AA.IDX` +
-`<REGION>1XX.MAP`. The TCI is **not required** — leave the stock `.TCI` in place (empty for 10I,
-contributes nothing) or omit it (worst case: harmless `0x307` logs). Do **not** copy a TCI from
-another profile/region: its `clusterOffset`s point at that file's own layout and would be wrong.
+`<REGION>1XX.MAP`. The TCI is **not required** for MAP rendering — leave the stock `.TCI` in place
+(empty for 10I, contributes nothing to drawing). Do **not** copy a TCI from another
+profile/region: its `clusterOffset`s point at that file's own layout and would be wrong.
 
-`osm2map::emit_tci` generates a structurally-valid, all-empty TCI (header + descriptive block +
-partition table + zeroed record arrays) byte-identical to the stock 10I prefix; it round-trips
-byte-exact through CPRNAV. Emit it only if you target a cluster-using profile or want the file
-present to avoid the `0x307` logs.
+The `.TCI` is **not a MAP artifact**: its leaf records point at RNW clusters, so it is the
+tile→cluster *locator* consumed by routing and the FastMap render path. Generation therefore
+lives in **`osm2rnw`**, not `osm2map` (which writes only `.IDX`/`.MAP` and no longer emits any
+`.TCI`). See the writer-guide cluster-locator section and ROADMAP Phase 2b.
 
 ### Still not fully pinned (all avoidable for a minimal working file)
 

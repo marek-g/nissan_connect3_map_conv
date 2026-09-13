@@ -108,7 +108,7 @@ static REGION_NAME: OnceLock<String> = OnceLock::new();
 fn region() -> &'static str {
     REGION_NAME.get().map(String::as_str).unwrap_or(DEF_REGION)
 }
-// profile id -> MAP/TCI file base name: <REGION> + "1" + base32(low byte as 2 chars).
+// profile id -> MAP file base name: <REGION> + "1" + base32(low byte as 2 chars).
 fn prof_file(prof: u16) -> String {
     const B32: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
     let v = (prof & 0xFF) as usize;
@@ -2539,62 +2539,6 @@ fn emit_idx(path: &Path, slots: &[Vec<Option<Vec<(u16, u16, u32)>>>; 4]) {
     fs::write(path, &d).expect("write IDX");
 }
 
-// ---- TCI (TILE_CLUSTER_INDEX) emission -------------------------------------
-// Per-MAP-file sub-index. Layout reverse-engineered from DAPIAPP.OUT (dap_map_tclTCIHeader /
-// TCIPartition / u16LoadPartitionTable / u16LoadClusterIndexTile) and confirmed against the
-// stock N6E2 10I/11A .TCI files:
-//   [0x00] header (20B): u16 f0=0, u16 f1=92, u32 filesize, u16 partOff=0x84, u16 partCnt=4,
-//                        u16 f5=122, u16 f6=16, u16 f7=12, u16 f8=106  (format constants)
-//   [0x14] descriptive block (112B): copyright/version/"TILE_CLUSTER_INDEX"/"TPNAV2" metadata
-//   [0x84] partition table: 4 x {u32 level, u32 tileCount, u32 sectionOffset}
-//   [0xb4] per-level tile records: tileCount x {u16 primCl, u16 cl, u32 clusterOffset}
-// The runtime (dap_map_tclIdController::u16GenerateTileIds) resolves a region's tiles via the
-// .IDX path; the TCI is only consulted for "cluster" tiles and, if the file is absent, logs
-// 0x307 "Could not read tci file" and skips them. For profile 10I the stock TCI's cluster pool
-// is entirely empty (no geometry), so a structurally-valid all-empty TCI matches what Bosch
-// ships: every tile record is zeroed and no cluster data follows.
-fn emit_tci(path: &Path, tilecnt: &[usize; 4]) {
-    const DESCRIPTIVE_BLOCK: [u8; 112] = [
-        0x43, 0x6f, 0x70, 0x79, 0x72, 0x69, 0x67, 0x68, 0x74, 0x20, 0x52, 0x6f, // "Copyright Ro"
-        0x62, 0x65, 0x72, 0x74, 0x2d, 0x42, 0x6f, 0x73, 0x63, 0x68, 0x2d, 0x47, // "bert-Bosch-G"
-        0x6d, 0x62, 0x48, 0x20, 0x20, 0x32, 0x30, 0x30, 0x33, 0x00, 0x31, 0x42, // "mbH  2003\01B"
-        0x39, 0x2e, 0x30, 0x33, 0x2e, 0x31, 0x38, 0x3a, 0x31, 0x33, 0x3a, 0x30, // "9.03.18:13:0"
-        0x39, 0x00, 0x54, 0x49, 0x4c, 0x45, 0x5f, 0x43, 0x4c, 0x55, 0x53, 0x54, // "9\0TILE_CLUST"
-        0x45, 0x52, 0x5f, 0x49, 0x4e, 0x44, 0x45, 0x58, 0x00, 0x00, 0x00, 0x00, // "ER_INDEX\0\0\0"
-        0x14, 0x00, 0x36, 0x00, 0x00, 0x00, 0x46, 0x00, 0x03, 0x00, 0x01, 0x00, // (20,54,0,70,3,1)
-        0x00, 0x00, 0x31, 0x42, 0x39, 0x2e, 0x30, 0x33, 0x2e, 0x31, 0x38, 0x3a, // \0\0"1B9.03.18:"
-        0x31, 0x31, 0x3a, 0x31, 0x34, 0x00, 0x54, 0x50, 0x4e, 0x41, 0x56, 0x32, // "11:14\0TPNAV2"
-        0x00, 0x00, 0x00, 0x00,
-    ];
-    let prefix = 20 + 112 + 4 * 12; // header + descriptive + partition table = 180
-    let rec_total: u32 = tilecnt.iter().map(|&c| c as u32).sum::<u32>() * 8;
-    let filesize = (prefix as u32) + rec_total;
-    let mut d = vec![0u8; filesize as usize]; // record arrays start zeroed (empty records)
-
-    // header
-    d[0..2].copy_from_slice(&0u16.to_le_bytes());
-    d[2..4].copy_from_slice(&92u16.to_le_bytes());
-    d[4..8].copy_from_slice(&filesize.to_le_bytes());
-    d[8..10].copy_from_slice(&0x84u16.to_le_bytes()); // partOff
-    d[10..12].copy_from_slice(&4u16.to_le_bytes()); // partCnt
-    d[12..14].copy_from_slice(&122u16.to_le_bytes());
-    d[14..16].copy_from_slice(&16u16.to_le_bytes());
-    d[16..18].copy_from_slice(&12u16.to_le_bytes());
-    d[18..20].copy_from_slice(&106u16.to_le_bytes());
-    // descriptive block (verbatim stock metadata)
-    d[0x14..0x84].copy_from_slice(&DESCRIPTIVE_BLOCK);
-    // partition table: sectionOffset[L] = 180 + sum(tilecnt[0..L]) * 8
-    let mut off = prefix as u32;
-    for (lvl, &cnt) in tilecnt.iter().enumerate() {
-        let p = 0x84 + lvl * 12;
-        d[p..p + 4].copy_from_slice(&(lvl as u32).to_le_bytes());
-        d[p + 4..p + 8].copy_from_slice(&(cnt as u32).to_le_bytes());
-        d[p + 8..p + 12].copy_from_slice(&off.to_le_bytes());
-        off += cnt as u32 * 8;
-    }
-    fs::write(path, &d).expect("write TCI");
-}
-
 fn main() {
     let argv: Vec<String> = env::args().collect();
     // Robust parse: options --region=NAME / --bbox=W,S,E,N (anywhere) + positional
@@ -2734,7 +2678,7 @@ fn main() {
     // ---- #06 isolation ladder: content-reduction modes (env OSM2MAP_MODE) ----
     // Each mode is a CUMULATIVE superset of the previous, so the first rung that reboots pins the
     // single mechanism it introduced. full == the #07 build (known to reboot => positive control).
-    //   empty      : no features; all slots 0x8000. Tests generated headers/IDX/TCI/container only.
+    //   empty      : no features; all slots 0x8000. Tests generated headers/IDX/container only.
     //   roads      : + road polylines into land `02` (line cells + feat 0x30..0x33/0x21 per class + annot 0x11 on road tiers). Single profile.
     //   land       : + land-use polygons (polygon cells + area feats; water polygons stripped). Still `02` only.
     //   poi_noname : + POI point cells + POI feats, names STRIPPED (no text annotation).
@@ -3001,11 +2945,9 @@ fn main() {
     emit_map(Path::new(&format!("{}/{}.MAP", outdir, land_file)), &map_land, land_prof());
     emit_map(Path::new(&format!("{}/{}.MAP", outdir, hydro_file)), &map_hydro, HYDRO_PROF);
     emit_idx(Path::new(&idx_path), &slots);
-    emit_tci(Path::new(&format!("{}/{}.TCI", outdir, land_file)), &TILECNT);
-    emit_tci(Path::new(&format!("{}/{}.TCI", outdir, hydro_file)), &TILECNT);
 
     eprintln!(
-        "wrote {} + land {}.MAP/.TCI ({} B) + hydro {}.MAP/.TCI ({} B), {}s total",
+        "wrote {} + land {}.MAP ({} B) + hydro {}.MAP ({} B), {}s total",
         idx_path,
         land_file,
         map_land.len(),

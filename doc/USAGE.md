@@ -10,7 +10,7 @@ sudo apt install osmctools osmium-tool
 # Build the converter
 
 ```bash
-for p in map2osm osm2map rnw_extract rnw_join rnw2osm cprnav_compress cprnav_decompress; do (cd src/$p && cargo build --release); done
+for p in map2osm osm2map rnw2osm osm2rnw rnw_extract rnw_join cprnav_compress cprnav_decompress; do (cd src/$p && cargo build --release); done
 ```
 
 Binaries land in the shared cargo target dir (`.../release/map2osm`, `.../release/osm2map`).
@@ -55,7 +55,7 @@ osmconvert ./malopolskie-260824.osm.pbf -o=malopolskie-260824.osm
 
 # OSM → TravelMap conversion
 
-`osm2map` writes the same `.IDX` / `.MAP` / `.TCI` layout back from OSM data. The
+`osm2map` writes the `.IDX` / `.MAP` layout back from OSM data. The
 input container — **OSM XML** or **OSM PBF** — is autodetected from the file extension
 and first byte; both feed one identical classification pipeline, so the emitted binary
 is byte-identical for the two encodings of the same map.
@@ -315,7 +315,34 @@ proximity** (`RNW_format.md` §3c):
    the box across all parsed clusters, and how many of their clusters would be outline-selected,
    then exit. Handy for checking how much data a region actually holds before converting it.
 
-## 4. Verify / load
+## 3c. OSM → RNW (`osm2rnw`) — writing the road network back
+
+`osm2rnw` is the write-side counterpart of `rnw2osm`: it reads an OSM file (PBF or XML) and emits
+`NAVnnnnn.DAT` clusters whose byte layout is the exact inverse of `rnw2osm`'s cluster reader, so the
+output round-trips. Drivable `highway=*` ways only.
+
+```bash
+osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N] [--target-oc N] [--bbox W,S,E,N]
+
+# Krzeszowice roads -> RNW clusters, then verify by reading them back:
+osm2rnw krzeszowice.osm.pbf -o /tmp/rt
+rnw2osm /tmp/rt/POL -b 19.5739,50.1172,19.6829,50.1761 -o /tmp/roundtrip.osm
+```
+
+- `<in>` — OSM PBF or XML (sniffed by extension / first byte); drivable `highway=*` ways are kept.
+- `-o OUTDIR` (default `<REGION>_RNW_out`) — writes `OUTDIR/<REGION>/NAV<file-id>.DAT`.
+- `--region NAME` (default `POL`) / `--file-id N` (default `20001`) — folder + `NAVnnnnn.DAT` name.
+- `--target-oc N` — segments per cluster (default 700, hard cap 1024 — the DCR ref is 10-bit).
+- `--bbox W,S,E,N` — clip to a box (degrees); omit = the input's own extent.
+
+The quadtree splits the network into clusters; every way is cut at every vertex into straight onecells,
+and each shared junction is duplicated at identical coordinates in the clusters that touch it, flagged as
+a border node so the reader stitches it. Verify with `rnw2osm` (default, and `--no-snap` to confirm the
+border markers alone reconnect): the road count, geometry, street names and `highway=*` classes should all
+come back unchanged. The emitted clusters are byte-faithful; making the car *find* them (`.tci` cluster
+locator) is still open — see ROADMAP Phase 2b.
+
+
 
 ```bash
 osmium cat file.osm -f pbf -o file.pbf        # validity check

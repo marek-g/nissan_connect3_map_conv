@@ -59,16 +59,18 @@ decoders read plain bytes. Both per-block header widths are handled — 16-bit v
 
 ## Current Status
 
-The **read direction** (TravelMap → OSM) works for all three layers; the **write direction** is the
-open frontier.
+The **read direction** (TravelMap → OSM) works for all three layers. The **write direction** is now
+demonstrated for MAP/IDX (`osm2map`, byte-matches stock on `AA.IDX`) and, newly, **RNW**
+(`osm2rnw`, round-trips through `rnw2osm` with faithful geometry / connectivity / names / classes).
 
 | Format | Decode | Extract / convert to OSM | Write (generate) |
 |--------|:------:|--------------------------|:----------------:|
-| **MAP / IDX** | ✅ | ✅ `map2osm` → OSM XML (POIs, lines, polygons + decoded annotations) | ⚠️ guide written; not yet implemented |
-| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw_extract` + `rnw_join` → road names + class attributes onto OSM | ❌ |
+| **MAP / IDX** | ✅ | ✅ `map2osm` → OSM XML (POIs, lines, polygons + decoded annotations) | ✅ `osm2map` → `.IDX`/`.MAP` (byte-matches stock; re-decodes clean) |
+| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw2osm` → road graph as OSM (class → `highway`, names, oneway/tunnel/bridge/roundabout) | ✅ `osm2rnw` → `NAVnnnnn.DAT` clusters (round-trip validated); ⚠️ car-boot locator open (Phase 2b) |
 | **LID** | ✅ structure (block header, POI records, text pool, categories); `GLOB_POI` = SQLite FTS3 | ⚠️ partial — point-POIs readable, no exporter yet | ❌ (byte-level gaps remain) |
 
-Tooling (`src/`, Rust): `map2osm`, `rnw_extract`, `rnw_join`, `cprnav_decompress`.
+Tooling (`src/`, Rust): `map2osm`, `osm2map`, `rnw2osm`, `osm2rnw`, `cprnav_compress`, `cprnav_decompress`.
+(`rnw_extract` / `rnw_join` are the older name-annotation path, superseded by the standalone `rnw2osm`.)
 
 > For navigation alone the LID content layer is optional — the network loads and routes via
 > RNW→MAP without it. LID matters for POI search / landmark rendering.
@@ -86,10 +88,29 @@ Close the record-level gaps listed in `LID_format.md` §9 (exact header field of
 framing, text-pool resolution, line/polygon layouts), then emit an OSM/CSV POI export from unpacked LID
 cross-referenced with `GLOB_POI`.
 
-### Phase 2: RNW writer
+### Phase 2: RNW writer — `osm2rnw`
 
-Generate `.RNW` clusters + the `NAV_ROOT.DAT` index from a road graph (OSM ways/nodes). Highest value
-for producing a map that actually routes.
+Generate `.RNW` clusters (`NAVnnnnn.DAT`) from a road graph (OSM ways/nodes). **Implemented and validated
+for geometry:** a quadtree splits the network into clusters (≤ 1024 onecells each — the DCR/overlap ref
+packs the onecell index in 10 bits), each way is broken at every vertex into straight onecells, and every
+shared vertex is duplicated at *identical* PAU across its clusters with a **border (rim) marker** on each
+copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, street names and
+`highway=*` classes all preserved, cross-cluster junctions stitching via the marker even under
+`--no-snap`. Design rationale + layout: `writer_guide.md` §7. Two items remain:
+
+- **2a — explicit overlap links (ci2).** `osm2rnw` currently relies on the border-marker stitch (the
+  runtime's documented fallback). Stock data *also* writes ci2 overlap records naming the neighbour
+  onecell. Emitting those needs a second serialisation pass (owner writes the neighbour's
+  file-offset/fileId/origin into its ci2 records once all cluster offsets are fixed). This makes output
+  byte-faithful to stock on the cross-cluster link path; validate with `rnw2osm … overlaps=N>0`.
+- **2b — the cluster locator (`.tci`).** Mechanism **resolved** by Ghidra: the runtime finds a position's
+  cluster through a per-tile `.tci` under `data/data/map/` (a `.tci` = 4-level tile index → `{u32 fileOffset,
+  u16 fileId, u16 length}` → `NAV%05u.DAT`), **not** `NAV_ROOT.DAT` (which is region metadata). Tile grid =
+  `TILECNT=[1,25,2500,250000]`, same as MAP; filename `N/S+ring,E/W+segment,profile.tci`. Full layout + algorithm
+  in `writer_guide.md` §7 "Cluster locator". Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH`
+  memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`. **Remaining:** wire `osm2rnw` to emit
+  the `.tci` (regenerate, or author clusters in place under the stock `fileId`/`fileOffset`/`length` so the
+  stock `.tci` still resolves) + on-device validation.
 
 ### Phase 3: MAP / IDX writer
 

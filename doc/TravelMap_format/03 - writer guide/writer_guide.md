@@ -267,9 +267,11 @@ slots to point at your new MAP blocks.
 
 ## 7. Writing `.RNW` (NAV/AEX) — the road network
 
-The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) +
-`NAVnnnnn.DAT` (clusters) + optional `AEX/AEXnnnnn.DAT`. Full field reference is in
-`RNW_format.md` §11; this is the practical bypass summary.
+The RNW is far larger than MAP/IDX. A region is `NAVnnnnn.DAT` (clusters) + `NAV_ROOT.DAT` (a *region
+metadata* file: structure header, region profile outlines, annotation/text blob — **not** the position
+index) + optional `AEX/AEXnnnnn.DAT`. The thing that actually makes a cluster *findable* lives outside
+the RNW tree, in the MAP folder — see the "Cluster locator" section below. Field reference is in
+`RNW_format.md`; this is the practical bypass summary.
 
 ### What has to be byte-perfect vs. what you can fake
 
@@ -283,28 +285,82 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
 | header `A` (u16@0), `C` (u32@4) | no — reader skips | write `0` or copy from a reference cluster |
 | onecell `x` (u32@+4) | no — read but unused | write `0`/copy |
 | listFlags bits 1,6,7,9,10 (skip descriptors) | no — payload ignored | emit `0,0` when the bit is set |
-| zerocell `f1` | mostly — node type | `0` for a simple node |
-| ci1/ci2 neighbour lists | only if multi-cluster | leave **empty** to avoid cross-cluster patching |
-| TCI tile partitioning | only if you want the real tiling | one tile + one entry is enough to be loadable |
+| zerocell `f1` (border/rim marker) | **yes, for stitched multi-cluster** | set bit 1 on every duplicated boundary node |
+| onecell `offf` | **yes — must be nonzero** | `listFlags=0` → point offf at a valid 4-byte region or the reader **skips the onecell** |
+| cluster **16 KB alignment** | **yes (multi-cluster)** | `rnw2osm` finds clusters on a 0x4000 step; pad each cluster blob to a 16 KB boundary and keep cluster_id ≠ 0 |
+| ci2 overlap *links* | no — recommended (byte-faithful) | `osm2rnw` emits them by default (cluster listFlags bit3 + onecell bit4 + ci2 records); `--no-overlaps` falls back to border-marker-only. Validated: `rnw2osm … overlaps=N/N` |
+| cluster **header flags byte @0x02** bit 0x80 | **must stay CLEAR** | bit 0x80 ⇒ "patched, patchId=flags&7" and the runtime memcpy's `data/connect/rnw/<prof>/<region>/NAV____<id>.PTH` over the cluster → corruption. osm2rnw uses flags=0x0001 (bit0 coordmode), never 0x80 |
+| cluster locator (the `.tci` in `data/data/map/`) | **required for in-car load** | see "Cluster locator" below — this (not `NAV_ROOT`) is how a lon/lat finds a cluster. Authoring it for a hand-built region = ROADMAP Phase 2b |
 | AEX files | no — config-gated (`bRNWLoadAexData`) | omit entirely |
 
-### Minimal viable RNW recipe
+### Implemented: `osm2rnw`
 
-1. **One cluster, one file.** Put every node (zerocell), road (onecell) and the position list for
-   your area into a single cluster in one `NAVnnnnn.DAT`. Set its ci1/ci2 lists empty so no
-   cross-cluster `u16PatchCluster` fixup is triggered.
-2. **Write the cluster** per §2/§3 of `RNW_format.md`: header (skip `A`,`C`; set `B`), outline,
-   `listFlags`+`annOffset`, then the descriptor sequence in bit order, then each list's items at
-   its `off`. Keep all offsets cluster-relative and 4-byte aligned.
-3. **Write a minimal `NAV_ROOT.DAT`:** a short numeric header + a TCI with **one tile** holding
-   one 8-byte entry `{u32 fileOffset, u16 length, u16 fileId}` pointing at your cluster. Copy the
-   string-table / metadata block from an existing `NAV_ROOT.DAT` if you want it to look stock.
-4. **Omit AEX** and leave `bRNWLoadAexData` unset.
-5. **Validate:** round-trip through `rnw_extract` (it should re-emit your roads with correct
-   geometry), spot-check coordinates, and — if you have a debug runtime — load it and confirm no
-   errors.
+`src/osm2rnw` is a working writer that inverts `rnw2osm`'s `parse_cluster` byte-for-byte. It reads OSM
+(PBF or XML), keeps drivable `highway=*` ways, and emits multi-cluster `NAVnnnnn.DAT`. Validated by
+round-trip: `osm2rnw in.osm.pbf -o out/` then `rnw2osm out/<REGION> -b … -o rt.osm` reproduces the road
+count, geometry, connectivity, street names and `highway=*` classes. Recipe / decisions:
 
-### RNW-specific pitfalls
+1. **Many clusters, not one.** Split by a quadtree on segment midpoints, **capped at 1024 onecells**
+   (10-bit DCR ref) — the tool targets 700. A single >1024-onecell cluster is unaddressable and also
+   overflows the u16 cluster-relative offsets.
+2. **Every way → straight onecells at every vertex.** No inline shape (rel-delta shape is the one part
+   easy to get wrong); geometry comes entirely from the two endpoint nodes, which is exact.
+3. **Shared vertex duplicated at identical PAU + border marker.** A vertex used by >1 cluster is stored
+   once per cluster at the *same* decoded coordinate and its zerocell gets `f1` bit 1 (rim). The reader
+   stitches these via the border-marker test — this alone reconnects the graph (validated under
+   `rnw2osm --no-snap`). Explicit ci2 overlap *links* are the byte-faithful upgrade (Phase 2a) but not
+   needed for the offline round-trip.
+4. **Pad every cluster to 16 KB**, cluster_id ≠ 0, so `rnw2osm`'s cluster scan finds each blob.
+5. **Names**: onecell bit 0 → a `{annOff, cnt=1}` annot → `{u16 size=6, u16 type=0x3C, u16 textOff}` →
+   text record `{u8 nVar=1, u8 flag=0xA7, u8 len, bytes}`; the `0xA7` flag is required or the renderer
+   drops the name. Class → `highway` inverts `display_class` exactly (see §6a).
+6. **Validate**: `rnw2osm out/<REGION> [--no-snap] -b W,S,E,N -o rt.osm`; compare `highway`/`name`
+   histograms vs the input (expect drivable-name parity, no invented names). **Car-boot** load is still
+   gated on the `.tci` locator (Phase 2b), independent of the cluster bytes being correct here.
+
+### Cluster locator: how the car finds a cluster (`.tci`) — RESOLVED
+
+Reverse-engineered from `DAPIAPP.OUT` (call chain `u16SendUniqueIdList` @0x84a2f8 →
+`u16GenerateTileIds`/`u16CalcTileId` @0x8cbe0c → `TCICache::u16GetClusterId` @0x8df958 →
+`u16LoadClusterIndexTile` @0x8df4a0 → `ClusterLoad::u16LoadCluster` @0x90add4). **The position→cluster
+index is a per-tile `.tci` file in `data/data/map/`, NOT `NAV_ROOT.DAT`.** (`NAV_ROOT`'s 0x2014-byte header
+holds a *root-cluster/outline* list + annotations; its multi-MB body is admin-area/global-file data; no
+runtime reader parses a coordinate index out of it.)
+
+**Algorithm** (a lon/lat → cluster):
+```
+for each map level L=0..3:
+    idxLon = (lon - LLlon) / extLon[L];  idxLat = (lat - LLlat) / extLat[L]   # integer div, PAU
+    tileId[L] = Σ_{levels<l} tileCount  +  abs(idxLat*heightCount[L] + idxLon) # TILECNT=[1,25,2500,250000]
+(ring,segment) = tile grid → .tci FILE  "%c%d%c%d%s.tci" = N/S+ring, E/W+segment, 3-char profile-code
+                                        (e.g. "N6E211A": ring=6, seg=2, profile "11A")  @0x8e12a0
+section = tileId/125;  TCITile entry @ partition.offsetList[L] + tileId*8   # 125 tiles / 1000-B section
+  TCITile = { u16 nPrimClusters, u16 nAllClusters, u32 clusterListFileOffset }
+clusterRefs @ clusterListFileOffset = nAllClusters × TCIClusterId
+  TCIClusterId = { u32 fileOffset, u16 fileId, u16 length }     # into data/rnw/<PROF>/<REGION>/NAV%05u.DAT
+load `length` bytes at `fileOffset` in NAV%05u(fileId).DAT  →  that cluster
+```
+The `.tci` header (0x14 B): u16@0,@2; u32@4=filesize; **u16@0x08=partitionTableFileOffset**;
+**u16@0x0A=partitionCount (==4)**; rest unused by the reader. Partition table = 4 × `TCIPartition` (0xC B):
+`u8 mapLevel, pad×3, u32 maxTileIdx (=TILECNT[L]), u32 offsetListFileOffset`. Confirmed against stock
+`N6E210I.TCI` (partitions: lvl 0/1/2/3 → maxIdx 1/25/2500/250000). `fileId→NAV%05u.DAT` confirmed
+(`vFileId2Name` @0x90a16c). NOTE: the ASCII magic "TILE_CLUSTER_INDEX" is a knitter signature the runtime
+never checks. The per-level `extLon/extLat/LL` (a `WorldTilePartition` table) are the SAME tile geometry
+MAP uses (`osm2map` already encodes `SHIFTS=[13,10,7,4]`, `TILECNT=[1,25,2500,250000]`).
+
+**Consequence for a hand-built region.** Correct cluster bytes are necessary but NOT sufficient to boot:
+the car finds a cluster only through a `.tci` tile entry. Two paths to bootability:
+- **Regenerate `.tci`** for every map tile your region touches: write one `TCIClusterId`
+  `{clusterFileOffset, file_id, clusterLength}` per cluster into the correct tile of the correct
+  region-profile shard, plus the header/partition/offset-list tables. (Needs the exact `WorldTilePartition`
+  extents + the region-profile→shard selection; a still-open sub-step. ROADMAP Phase 2b.)
+- **Or reuse stock addressing**: if you re-author clusters *in place* — same `fileId`s, same 16 KB-aligned
+  `fileOffset`s, same `length` as the clusters the stock `.tci` already references — the stock `.tci` keeps
+  pointing correctly and no `.tci` editing is needed. Cleanest for replacing an existing region's coverage.
+`osm2rnw` currently emits clusters at fresh offsets under one `--file-id`; wiring it to a `.tci` (either
+path) is the remaining in-car step. The geometry itself is verifiable offline via `rnw2osm` regardless.
+
+
 
 - [ ] Every relative coordinate is `ref + (delta << shift)`; get the cluster `ref`/`shift` right or
       all geometry shifts together.
@@ -316,6 +372,11 @@ The RNW is far larger than MAP/IDX: a region is `NAV_ROOT.DAT` (root TCI index) 
       the absolute (bit-5) shape read and renders roads "połamana" (see `RNW_format.md` §6 note).
 - [ ] Descriptor bits are walked in strict order 0–10; a missing `listFlags` bit shifts every later
       descriptor and corrupts the parse.
+- [ ] Cluster header **flags byte @0x02 bit 0x80 must be clear** — else the loader memcpy-patches a
+      `NAV____<flags&7>.PTH` from `data/connect/rnw/...` over the cluster (`u16PatchCluster` @0x90ab30),
+      corrupting regenerated data. Also remove/neutralise stale `data/connect/rnw/**/*.PTH` for the region.
+- [ ] The car finds the cluster via a `data/data/map/*.tci` tile entry, not `NAV_ROOT` — without a matching
+      `.tci` (or reused stock cluster addressing) the data is correct but never loaded. See "Cluster locator".
 
 ---
 
