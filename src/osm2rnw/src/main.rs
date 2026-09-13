@@ -278,7 +278,8 @@ fn main() {
     let mut no_overlaps = false;
     let mut want_tci = false;
     let mut map_idx_dir = String::new();
-    let mut region_ident: u16 = 0x42a;
+    let mut region_ident: u16 = 0x402; // placeholder; always derived from --region below unless overridden
+    let mut region_ident_set = false;
     let mut tci_file = String::new();
     let mut tci_prof: u16 = 0x1a;
 
@@ -332,7 +333,12 @@ fn main() {
             }
             "--region-ident" => {
                 region_ident = parse_hex_or_dec(&args[i + 1]);
+                region_ident_set = true;
                 i += 2;
+            }
+            "--list-region-ids" => {
+                print_region_ident_table();
+                return;
             }
             "--tci-file" => {
                 tci_file = args[i + 1].clone();
@@ -356,6 +362,22 @@ fn main() {
         usage();
         exit(1);
     };
+
+    // Derive regionIdent from the region code (RNW folder) unless overridden. Unknown code ->
+    // require an explicit --region-ident (a wrong value routes to the wrong region on-device).
+    if !region_ident_set {
+        match region_ident_for(&region) {
+            Some(v) => region_ident = v,
+            None => {
+                eprintln!(
+                    "error: no baked regionIdent for region '{}' in the RNW table; pass an\n\
+                     \t   explicit --region-ident N, or check codes with --list-region-ids.",
+                    region
+                );
+                exit(1);
+            }
+        }
+    }
 
     let mut net = Network::new();
     if inp.to_ascii_lowercase().ends_with(".pbf") {
@@ -670,6 +692,62 @@ fn parse_hex_or_dec(s: &str) -> u16 {
         u16::from_str_radix(h, 16).unwrap_or(0)
     } else {
         t.parse().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RNW routing-region ident table: region code (RNW folder under DATA/DATA/RNW/CCP/)
+// -> the 14-bit regionIdent packed into every .tci clusterRef fileOffset low word.
+// regionIdent = (profile<<10)|codeId; every shipped region uses profile 1 (CCP), so
+// all values are 0x400|codeId. Derived from the stock data, not guessed:
+//   * primary: each region's regionIdent repeats ~1e3 times in its own NAV_ROOT.DAT but
+//     ~1 elsewhere -> NAV_ROOT histogram with owner-vs-foreign margin (>=8x) — cross-checked
+//     against the constant regionIdent inside that region's stock .TCI cluster-index shards;
+//   * BNL/MLC are small/overlay regions with no dominant NAV_ROOT signal; they are the two
+//     values left over from the confirmed 17-value set {1,2,3,4,6,7,8,9,10,11,12,13,14,17,18,
+//     22,42} once the other 15 are pinned, so BNL=0x404 (huge dense Benelux .TCI shards) and
+//     MLC=0x40a (tiny counters). GRC=0x406 is NAV_ROOT-clean (83% share) though no stock .TCI
+//     surfaced it. Poland's road-network region is POL (0x402): rnw2osm on CCP/POL yields ~5888 roads
+//     near Krakow (krzeszowice) while CCP/EEU yields 0, and stock shard N6E2102.TCI references those
+//     clusters with a uniform regionIdent 0x402. EEU (0x42a) is a separate aggregate region sharing the
+//     same MAP grid (shard N6E211A.TCI) and does NOT carry Poland's roads.
+// Confidence in the codeId column: high except BNL/MLC (elimination) — override with
+// --region-ident when targeting a region whose stock value is not yet verified on-device.
+const REGION_IDENT: &[(&str, u16)] = &[
+    ("DEU", 0x401), // 1   Germany
+    ("POL", 0x402), // 2   Poland          (road network lives in CCP/POL; shard N6E2102 -> 0x402)
+    ("FRM", 0x403), // 3   France
+    ("BNL", 0x404), // 4   Benelux        (by elimination)
+    ("GRC", 0x406), // 6   Greece
+    ("TUR", 0x407), // 7   Turkey
+    ("ACL", 0x408), // 8   Austria/Aachen
+    ("IBE", 0x409), // 9   Great Britain
+    ("MLC", 0x40a), // 10  (small overlay region) (by elimination)
+    ("ISV", 0x40b), // 11  Switzerland
+    ("GBI", 0x40c), // 12  Great Britain/Ireland
+    ("SCA", 0x40d), // 13  Scandinavia
+    ("CHS", 0x40e), // 14  (central/eastern)
+    ("ELL", 0x411), // 17
+    ("INT", 0x412), // 18
+    ("EAD", 0x416), // 22
+    ("EEU", 0x42a), // 42  Eastern Europe  (a SEPARATE aggregate region; NOT where Poland's roads sit)
+];
+
+// region code -> regionIdent (case-insensitive, matches the RNW folder name).
+fn region_ident_for(code: &str) -> Option<u16> {
+    let up = code.trim().to_ascii_uppercase();
+    REGION_IDENT.iter().find(|(k, _)| *k == up).map(|(_, v)| *v)
+}
+
+fn print_region_ident_table() {
+    println!("RNW regionIdent table (region code -> regionIdent, profile 1 / CCP):");
+    for (k, v) in REGION_IDENT {
+        println!(
+            "  {:<4} 0x{:04x}  (codeId {})",
+            k,
+            v,
+            v & 0x3ff
+        );
     }
 }
 // Read a *AA.IDX (step-1 osm2map output or a stock MAP dir) for the region tile grid.
@@ -1161,15 +1239,16 @@ fn usage() {
          usage: osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N]\n\
          \t\t [--target-oc N] [--bbox W,S,E,N] [--no-overlaps] [--tci --map-idx DIR [--region-ident N] [--tci-prof HEX|--tci-file NAME]]\n\
          \t-o             output dir (default <REGION>_RNW_out): <out>/<REGION>/NAV<file_id>.DAT\n\
-         \t--region       region folder (default POL)\n\
-         \t--file-id      NAV file id (default 20001)\n\
-         \t--target-oc    segments/cluster <=1024 (default 700)\n\
-         \t--bbox         only roads inside W,S,E,N degrees (default: input extent)\n\
-         \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
-         \t--tci          also emit the tile->cluster locator <out>/MAP/<shard>.TCI\n\
-         \t--map-idx      DIR with the step-1 osm2map <REGION>AA.IDX (source of the region tile grid)\n\
-         \t--region-ident region ident packed into ref fileOffset low bits (default 0x42a)\n\
-         \t--tci-prof     shard profile code for the .tci file name (default 0x1a -> region1..)\n\
+          \t--region       RNW region folder (default POL); drives the regionIdent unless overridden\n\
+          \t--file-id      NAV file id (default 20001)\n\
+          \t--target-oc    segments/cluster <=1024 (default 700)\n\
+          \t--bbox         only roads inside W,S,E,N degrees (default: input extent)\n\
+          \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
+          \t--tci          also emit the tile->cluster locator <out>/MAP/<shard>.TCI\n\
+          \t--map-idx      DIR with the step-1 osm2map <REGION>AA.IDX (source of the region tile grid)\n\
+          \t--region-ident override the ref regionIdent (default: derived from --region via baked table)\n\
+          \t--list-region-ids  print the RNW region-code -> regionIdent table and exit\n\
+          \t--tci-prof     shard profile code for the .tci file name (default 0x1a -> region1..)\n\
          \t--tci-file     explicit .tci shard base name (overrides <mapregion>1<code>)\n\
          validate: rnw2osm <out>/<REGION> -b W,S,E,N -o roundtrip.osm"
     );

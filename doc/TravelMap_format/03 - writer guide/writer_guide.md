@@ -343,7 +343,9 @@ load `length` bytes at `fileOffset` in NAV%05u(fileId).DAT  →  that cluster
 IMPORTANT packing detail (found in `rnw_tclIDBase`): `TCIClusterId.fileOffset` is *packed*. The cluster's
 byte offset lives in bits 14–31 (`u32GetClusterFileOffset = w & 0xffffc000`), so clusters are **16 KB
 aligned**; the **low 14 bits (`w & 0x3fff`) carry the region ident** (`u16GetRegionIdent`) used to pick the
-`<REGION>` folder. i.e. `ref.fileOffset = (clusterByteOffset & 0xffffc000) | regionIdent`. `fileId` is
+`<REGION>` folder. i.e. `ref.fileOffset = (clusterByteOffset & 0xffffc000) | regionIdent`. `regionIdent`
+itself is `(profile<<10)|codeId` (`u16GetProfile` = bits 10–13, `u16GetCodeId` = bits 0–9); every shipped RNW
+region uses profile 1 (`CCP`), so all values are `0x400|codeId`. `fileId` is
 literally the `%05u` of the NAV filename (`vFileId2Name` = `sprintf("NAV%05u.DAT", fileId)`, @0x90a7dc).
 The reader loads a block sized for `nAll` refs but pushes only the first `nPrim` to the queue, so write
 `nPrim = nAll = refs.len()`. Routing always queries the **finest** level (`this[0x3b0]==3`), with no
@@ -363,11 +365,23 @@ the car finds a cluster only through a `.tci` tile entry. Ownership of the `.tci
 indexes (RNW clusters), so **`osm2map` no longer emits any `.tci`** (it writes only `.IDX`/`.MAP`) and
 **`osm2rnw` generates it** — pass `--tci --map-idx <step-1 MAP out>`. The tile grid (region bbox +
 `SHIFTS`/`TILECNT`) is read from that step-1 `<REGION>AA.IDX`, guaranteeing `osm2rnw`'s tile indices match
-`osm2map`/the runtime exactly (not from the OSM data extent). `--region-ident` (the region code packed
-into ref bits 0–13, e.g. `0x42a`) and the shard name/profile (`--tci-file` / `--tci-prof`, default
-`<mapregion>1<base32(prof)>`) are the region-specific inputs. Validated offline: 52-cluster krzeszowice →
-`.tci` with `nPrim==nAll`, every cluster at all 4 levels, all refs in-bounds with correct `regionIdent`,
-and geometry self-consistent.
+`osm2map`/the runtime exactly (not from the OSM data extent). The `regionIdent` packed into ref bits 0–13 is
+now **derived from `--region`** via a baked table (`REGION_IDENT` in the source, mirrored in
+`doc/region_ident.tsv`, dumped by `--list-region-ids`); `--region-ident` only overrides it, and the shard
+name/profile (`--tci-file` / `--tci-prof`, default `<mapregion>1<base32(prof)>`) remain region-specific
+inputs. **Region-code table (how it was extracted):** the authoritative `codeId→country` map is a
+deserialized region-metadata table (`dap_tclRegProfToString`, built by `u16InterpreteRegionMetaDataJob`, fed
+from resinf), with no plaintext list on disk; but the numbers are recoverable from the data directly — a
+region's `regionIdent` repeats ~1e3× in its own `RNW/CCP/<code>/NAV_ROOT.DAT` vs ~1 elsewhere, cross-checked
+against the constant `regionIdent` in that region's stock `.TCI` shards. That yields the 17-value table
+(`{1,2,3,4,6,7,8,9,10,11,12,13,14,17,18,22,42}`, all profile 1); BNL/MLC are by elimination. **Geography:**
+a region folder holds the roads of its own geography, so the target's folder is chosen by where its clusters
+actually are. Poland/Krakow (krzeszowice) is region `POL` (`0x402`, shard `N6E2102.TCI` — uniform `0x402`):
+`rnw2osm` on `CCP/POL` yields ~5888 roads near Krakow while `CCP/EEU` yields 0. `EEU` (`0x42a`, shard
+`N6E211A.TCI`) is the separate eastern-Europe aggregate (HU/UA/BY) on the same `N6E2` MAP grid. So Poland
+swap targets use `--region POL`. Validated offline: 52-cluster krzeszowice → `.tci` with `nPrim==nAll`, every
+cluster at all 4 levels, all refs in-bounds with `regionIdent` `0x402` (now derived, not hardcoded), geometry
+self-consistent.
 
 The alternative remains: **reuse stock addressing** — re-author clusters *in place* (same `fileId`s, same
 16 KB-aligned `fileOffset`s, same `length` as the stock `.tci` already references) so the stock `.tci` keeps

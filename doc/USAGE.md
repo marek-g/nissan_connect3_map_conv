@@ -323,25 +323,30 @@ output round-trips. Drivable `highway=*` ways only.
 
 ```bash
 osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N] [--target-oc N] [--bbox W,S,E,N] \
-        [--tci --map-idx DIR [--region-ident N] [--tci-prof HEX|--tci-file NAME]]
+        [--tci --map-idx DIR [--region-ident N] [--tci-prof HEX|--tci-file NAME]] [--list-region-ids]
 
-# Krzeszowice roads -> RNW clusters, then verify by reading them back:
+# Krzeszowice roads -> RNW clusters (Poland's road-network region is POL -> regionIdent 0x402):
 osm2rnw krzeszowice.osm.pbf -o /tmp/rt
 rnw2osm /tmp/rt/POL -b 19.5739,50.1172,19.6829,50.1761 -o /tmp/roundtrip.osm
 
 # Also emit the cluster locator .tci so the car can FIND the clusters (run AFTER osm2map, step 1):
-osm2rnw krzeszowice.osm.pbf -o /tmp/rt --tci --map-idx /tmp/mapout --region-ident 0x42a
+# regionIdent 0x402 is DERIVED from --region POL automatically (--region-ident only to override)
+osm2rnw krzeszowice.osm.pbf -o /tmp/rt --tci --map-idx /tmp/mapout --region POL
 ```
 
 - `<in>` — OSM PBF or XML (sniffed by extension / first byte); drivable `highway=*` ways are kept.
 - `-o OUTDIR` (default `<REGION>_RNW_out`) — writes `OUTDIR/<REGION>/NAV<file-id>.DAT`.
-- `--region NAME` (default `POL`) / `--file-id N` (default `20001`) — folder + `NAVnnnnn.DAT` name.
+- `--region NAME` (default `POL`) / `--file-id N` (default `20001`) — RNW region folder + `NAVnnnnn.DAT` name.
+  The region code also selects the `.tci` `regionIdent` (see below): `--region POL` → `0x402`, the region
+  whose road clusters sit under `CCP/POL` (krzeszowice/Krakow). `EEU` (`0x42a`) is a different region (HU/UA/BY).
 - `--target-oc N` — segments per cluster (default 700, hard cap 1024 — the DCR ref is 10-bit).
 - `--bbox W,S,E,N` — clip to a box (degrees); omit = the input's own extent.
 - `--tci --map-idx DIR` — also emit `OUTDIR/MAP/<shard>.TCI` (the tile→cluster locator); the tile grid
   comes from the step-1 `osm2map` `<REGION>AA.IDX` in `DIR`, so it matches the runtime exactly.
-- `--region-ident N` (default `0x42a`) — region code packed into each ref's low 14 bits (picks the `<REGION>`
-  folder). `--tci-prof HEX` / `--tci-file NAME` — the shard file name (default `<mapregion>1<base32(prof)>`).
+- `--region-ident N` — region code packed into each ref's low 14 bits. **Default: derived from `--region`**
+  via a baked table (`REGION_IDENT` in the source / `doc/region_ident.tsv`, dumped by `--list-region-ids`);
+  pass this only to override. `--tci-prof HEX` / `--tci-file NAME` — the shard file name (default
+  `<mapregion>1<base32(prof)>`; for POL land use `--tci-prof 0x02` → shard `N6E2102`).
 
 The quadtree splits the network into clusters; every way is cut at every vertex into straight onecells,
 and each shared junction is duplicated at identical coordinates in the clusters that touch it, flagged as

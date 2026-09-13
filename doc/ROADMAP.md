@@ -110,10 +110,14 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   packs the region ident in bits 0–13 (`u16GetRegionIdent`) and the 16 KB-aligned cluster offset in bits 14+;
   the reader reads `nPrim` refs (write `nPrim==nAll`); routing queries the finest level only, so each cluster
   is registered in every finest-level tile its bbox overlaps. `osm2map` no longer emits `.tci`; `osm2rnw`
-  reads the tile grid from step-1 `<REGION>AA.IDX` (`--map-idx`). Offline-validated (krzeszowice: 52 clusters,
-  `nPrim==nAll`, refs in-bounds, correct region ident). **Remaining:** on-device boot validation; confirm
-  `--region-ident` / shard profile for the exact target region. Patches: cluster flags byte bit 0x80 triggers
-  a `NAV____n.PTH` memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`.
+  reads the tile grid from step-1 `<REGION>AA.IDX` (`--map-idx`). The `regionIdent` is now **derived from
+  `--region`** via a baked 17-row table (`REGION_IDENT` / `doc/region_ident.tsv` / `--list-region-ids`),
+  extracted from the data (regionIdent frequency in each region's own `NAV_ROOT.DAT`, cross-checked against
+  its stock `.TCI`); Poland's road region is `POL` (`0x402`, shard `N6E2102.TCI`; `EEU`/`0x42a` is the
+  separate HU/UA/BY aggregate on the same grid — not Poland). Offline-validated (krzeszowice:
+  52 clusters, `nPrim==nAll`, refs in-bounds, derived ident `0x402`). **Remaining:** on-device boot validation;
+  verify the table's low-confidence rows (BNL/MLC) against an untested region. Patches: cluster flags byte bit
+  0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`.
 
 ### Phase 3: MAP / IDX writer
 
