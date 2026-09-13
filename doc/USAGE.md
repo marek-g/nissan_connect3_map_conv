@@ -78,7 +78,7 @@ osm2map malopolskie.osm /tmp/out 19.6,49.95,20.15,50.30 --region=N6E2
   seed the output (resinf catalog); must be a real stock region so W()/S()/E()/N() resolve.
 
 Output is verified consistent both ways: full `malopolskie` via `.osm` and via `.osm.pbf`
-produces byte-identical `IDX`/`MAP`/`TCI` (≈145 MB land MAP), and either output re-decodes
+produces byte-identical `IDX`/`MAP` (≈145 MB land MAP), and either output re-decodes
 through `map2osm` (`-f xml` vs `-f pbf`) with zero element/tag differences.
 
 ## Region inventory (`--list-regions` and friends)
@@ -177,7 +177,7 @@ and content is **not** bound to a particular id.
 target region's signed RPI/`AA.IDX` **declares** — i.e. the id-controller can resolve it. Any single
 declared id renders identically, because each emitted cell carries its own feature code. That is why
 the whole `N6E2` region converts correctly into the single `0x02` shard and byte-matches stock on the
-`AA.IDX`/`TCI`.
+`AA.IDX`.
 
 **Recommendation.** Keep emitting **one land shard per region** (the auto-picked declared id). It is
 functionally complete and validated. Multi-shard emission would only add value for very large
@@ -322,11 +322,15 @@ proximity** (`RNW_format.md` §3c):
 output round-trips. Drivable `highway=*` ways only.
 
 ```bash
-osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N] [--target-oc N] [--bbox W,S,E,N]
+osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N] [--target-oc N] [--bbox W,S,E,N] \
+        [--tci --map-idx DIR [--region-ident N] [--tci-prof HEX|--tci-file NAME]]
 
 # Krzeszowice roads -> RNW clusters, then verify by reading them back:
 osm2rnw krzeszowice.osm.pbf -o /tmp/rt
 rnw2osm /tmp/rt/POL -b 19.5739,50.1172,19.6829,50.1761 -o /tmp/roundtrip.osm
+
+# Also emit the cluster locator .tci so the car can FIND the clusters (run AFTER osm2map, step 1):
+osm2rnw krzeszowice.osm.pbf -o /tmp/rt --tci --map-idx /tmp/mapout --region-ident 0x42a
 ```
 
 - `<in>` — OSM PBF or XML (sniffed by extension / first byte); drivable `highway=*` ways are kept.
@@ -334,13 +338,19 @@ rnw2osm /tmp/rt/POL -b 19.5739,50.1172,19.6829,50.1761 -o /tmp/roundtrip.osm
 - `--region NAME` (default `POL`) / `--file-id N` (default `20001`) — folder + `NAVnnnnn.DAT` name.
 - `--target-oc N` — segments per cluster (default 700, hard cap 1024 — the DCR ref is 10-bit).
 - `--bbox W,S,E,N` — clip to a box (degrees); omit = the input's own extent.
+- `--tci --map-idx DIR` — also emit `OUTDIR/MAP/<shard>.TCI` (the tile→cluster locator); the tile grid
+  comes from the step-1 `osm2map` `<REGION>AA.IDX` in `DIR`, so it matches the runtime exactly.
+- `--region-ident N` (default `0x42a`) — region code packed into each ref's low 14 bits (picks the `<REGION>`
+  folder). `--tci-prof HEX` / `--tci-file NAME` — the shard file name (default `<mapregion>1<base32(prof)>`).
 
 The quadtree splits the network into clusters; every way is cut at every vertex into straight onecells,
 and each shared junction is duplicated at identical coordinates in the clusters that touch it, flagged as
 a border node so the reader stitches it. Verify with `rnw2osm` (default, and `--no-snap` to confirm the
 border markers alone reconnect): the road count, geometry, street names and `highway=*` classes should all
-come back unchanged. The emitted clusters are byte-faithful; making the car *find* them (`.tci` cluster
-locator) is still open — see ROADMAP Phase 2b.
+come back unchanged. The emitted clusters are byte-faithful. With `--tci` the `.tci` cluster locator is
+also produced (clusters 16 KB-aligned; refs `{(offset&~0x3fff)|regionIdent, file-id, length}`, `nPrim==nAll`,
+each cluster in every finest-level tile it overlaps), so the car can boot the region — see `writer_guide.md`
+§7 "Cluster locator". `osm2map` no longer emits any `.tci`; the only unverified step is an in-car boot.
 
 
 

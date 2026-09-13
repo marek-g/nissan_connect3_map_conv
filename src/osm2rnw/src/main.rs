@@ -28,6 +28,19 @@ const PAU: f64 = (1i64 << 31) as f64 / 180.0;
 const BLOCK: usize = 0x4000; // 16KB cluster alignment (rnw2osm scans on this)
 const MAX_OC: usize = 1024; // 10-bit onecell index in DCR/overlap refs
 const NAME_STR_FLAG: u8 = 0xA7; // required by the renderer
+// Bosch `.tci` descriptive block (bytes 0x14..0x84), verbatim from stock N6E211A.TCI.
+const TCI_DESCRIPTOR: [u8; 112] = [
+    67, 111, 112, 121, 114, 105, 103, 104, 116, 32, 82, 111,
+    98, 101, 114, 116, 45, 66, 111, 115, 99, 104, 45, 71,
+    109, 98, 72, 32, 32, 50, 48, 48, 51, 0, 49, 66,
+    54, 46, 49, 50, 46, 49, 49, 58, 49, 56, 58, 50,
+    48, 0, 84, 73, 76, 69, 95, 67, 76, 85, 83, 84,
+    69, 82, 95, 73, 78, 68, 69, 88, 0, 0, 0, 0,
+    20, 0, 54, 0, 0, 0, 70, 0, 3, 0, 1, 0,
+    0, 0, 49, 66, 54, 46, 49, 50, 46, 49, 49, 58,
+    48, 54, 58, 50, 50, 0, 84, 80, 78, 65, 86, 50,
+    0, 0, 0, 0,
+];
 
 fn deg2pau(d: f64) -> i64 {
     (d * PAU) as i64
@@ -263,6 +276,11 @@ fn main() {
     let mut target_oc: usize = 700;
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
     let mut no_overlaps = false;
+    let mut want_tci = false;
+    let mut map_idx_dir = String::new();
+    let mut region_ident: u16 = 0x42a;
+    let mut tci_file = String::new();
+    let mut tci_prof: u16 = 0x1a;
 
     let mut i = 0;
     while i < args.len() {
@@ -299,6 +317,30 @@ fn main() {
             "--no-overlaps" => {
                 no_overlaps = true;
                 i += 1;
+            }
+            "--tci" => {
+                want_tci = true;
+                i += 1;
+            }
+            "--map-idx" => {
+                map_idx_dir = args[i + 1].clone();
+                i += 2;
+            }
+            s if s.starts_with("--map-idx=") => {
+                map_idx_dir = s[10..].to_string();
+                i += 1;
+            }
+            "--region-ident" => {
+                region_ident = parse_hex_or_dec(&args[i + 1]);
+                i += 2;
+            }
+            "--tci-file" => {
+                tci_file = args[i + 1].clone();
+                i += 2;
+            }
+            "--tci-prof" => {
+                tci_prof = parse_hex_or_dec(&args[i + 1]);
+                i += 2;
             }
             "--help" | "-h" => {
                 usage();
@@ -393,7 +435,7 @@ fn main() {
     let outp = outp.unwrap_or_else(|| format!("{}_RNW_out", region));
     fs::create_dir_all(Path::new(&outp).join(&region)).expect("mkdir");
     let nav_path = Path::new(&outp).join(&region).join(format!("NAV{:05}.DAT", file_id));
-    write_nav(&blobs, &segs, &gnodes, file_id, &nav_path);
+    let cluster_loc = write_nav(&blobs, &segs, &gnodes, file_id, &nav_path);
 
     let (w, s, e, n) = bbox_pau;
     eprintln!("wrote {} ({} clusters, {} segments)", nav_path.display(), blobs.len(), segs.len());
@@ -401,14 +443,269 @@ fn main() {
         "validate: rnw2osm {outp}/{region} -b {:.4},{:.4},{:.4},{:.4} -o roundtrip.osm",
         w as f64 / PAU, s as f64 / PAU, e as f64 / PAU, n as f64 / PAU
     );
-    eprintln!(
-        "NOTE (car load): the runtime locates clusters via a per-tile `.tci` cluster-index under \n\
-        \t  data/data/map/ (NOT NAV_ROOT.DAT). To boot this region you must also emit matching\n\
-        \t  `.tci` entries (tile -> {{u32 fileOffset,u16 fileId={file_id},u16 length}}) into the\n\
-        \t  shard for each map tile this box falls in. See writer_guide.md §7 / ROADMAP Phase 2b.\n\
-        \t  Cluster header flags byte must keep bit 0x80 CLEAR (else a stale NAV____n.PTH patch is\n\
-        \t  memcpy'd over the cluster) — osm2rnw sets flags=0x0001, so patches are not triggered."
-    );
+
+    if want_tci {
+        // Tile grid (region bbox + per-level partition) MUST match osm2map/runtime exactly, so it is
+        // read from the step-1 MAP output (a *AA.IDX), NOT from the OSM data extent.
+        let (ridx, reg_bbox, _shifts, tilecnt) = match read_map_idx(&map_idx_dir) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "error: --tci needs the region tile grid; give --map-idx DIR containing the step-1\n\
+                     \t  osm2map <REGION>AA.IDX (or a stock MAP dir). Looked in: '{}'",
+                    if map_idx_dir.is_empty() { "<unset>" } else { &map_idx_dir }
+                );
+                exit(2);
+            }
+        };
+        let file_name = if !tci_file.is_empty() {
+            tci_file.clone()
+        } else {
+            format!("{}1{}", ridx, prof_file_code(tci_prof))
+        };
+        let map_out = Path::new(&outp).join("MAP");
+        fs::create_dir_all(&map_out).expect("mkdir MAP");
+        let tci_path = map_out.join(format!("{file_name}.TCI"));
+        let (refs, tiles) =
+            emit_tci(&tci_path, &blobs, &cluster_loc, reg_bbox, &tilecnt, file_id, region_ident);
+        eprintln!(
+            "wrote {} ({} tile-refs across {} non-empty tiles; region {} ident 0x{:x}, shard {})",
+            tci_path.display(),
+            refs,
+            tiles,
+            ridx,
+            region_ident,
+            file_name
+        );
+    } else {
+        eprintln!(
+            "NOTE (car load): clusters are located at runtime via a per-tile `.tci` cluster-index\n\
+            \t  under data/data/map/. Pass --tci --map-idx <step1 MAP out> to emit a matching\n\
+            \t  `.tci` (tile -> {{u32 (clusterOffset&~0x3fff)|regionIdent, u16 fileId={file_id}, u16 length}}).\n\
+            \t  Cluster header flags byte keeps bit 0x80 CLEAR (osm2rnw flags=0x0001), so stale\n\
+            \t  NAV____n.PTH patches are not applied over the clusters."
+        );
+    }
+}
+
+// ---- .tci (TILE_CLUSTER_INDEX) generation -----------------------------------
+// Layout reverse-engineered from DAPIAPP.OUT (dap_map_tclTCICache::u16LoadClusterIndexTile /
+// u16LoadClusterIdListAndStoreInQ / rnw_tclClusterLoad::u16LoadCluster) and confirmed against stock
+// N6E211A.TCI:
+//   [0x00] 20B header: u16 f0=0, u16 f1=92, u32 filesize, u16 partOff=0x84, u16 partCnt=4,
+//                      u16 122,16,12,106
+//   [0x14] 112B descriptive block (verbatim Bosch metadata; identical across shards)
+//   [0x84] 4 x TCIPartition(12B) {u8 level, u8 pad[3], u32 maxTile, u32 offsetListOff}
+//   [0xb4] per-level tile tables, flat, TCITile(8B) {u16 nPrim,u16 nAll,u32 clusterListOff}
+//          indexed at offsetListOff[level] + tileId*8, tileId = region-relative Morton cell index.
+//   then the cluster-refs pool: TCIClusterId(8B) {u32 fileOffset, u16 fileId, u16 length} per ref.
+// Semantics (routing queries the FINEST level only): u16LoadClusterIdListAndStoreInQ loads a block of
+// nAll refs but pushes the first nPrim to the queue, so we write nPrim=nAll=refs.len(). The cluster's
+// fileOffset field packs (aligned byte offset & 0xffffc000) | regionIdent (low 14 bits). A cluster is
+// registered in EVERY tile (at every level) its bbox overlaps, so a query for any interior point
+// resolves it.
+fn emit_tci(
+    path: &Path,
+    blobs: &[ClusterBlob],
+    cluster_loc: &[(u32, usize)],
+    reg_bbox: (i64, i64, i64, i64),
+    tilecnt: &[usize; 4],
+    file_id: u16,
+    region_ident: u16,
+) -> (usize, usize) {
+    const PREFIX: usize = 20 + 112 + 4 * 12; // header + descriptive + partition table = 0xb4
+    let (wr, sr, er, nr) = reg_bbox;
+    let ws = er - wr; // region width  (PAU)
+    let hs = nr - sr; // region height (PAU)
+
+    // (level, tileId) -> list of cluster indices overlapping that tile.
+    let mut tile_index: [Vec<Vec<usize>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for lvl in 0..4usize {
+        tile_index[lvl] = vec![Vec::new(); tilecnt[lvl]];
+    }
+    for (ci, cb) in blobs.iter().enumerate() {
+        let (w, s, e, n) = cluster_bbox(cb);
+        for lvl in 0..4usize {
+            let g = grid_size(lvl) as i64;
+            let c0 = col_of(w, wr, ws, g);
+            let c1 = col_of(e, wr, ws, g);
+            let r0 = col_of(s, sr, hs, g);
+            let r1 = col_of(n, sr, hs, g);
+            for col in c0..=c1 {
+                for row in r0..=r1 {
+                    let k = cell_to_k(lvl, col, row);
+                    if (k as usize) < tilecnt[lvl] {
+                        tile_index[lvl][k as usize].push(ci);
+                    }
+                }
+            }
+        }
+    }
+
+    // Assign pool offsets: build the refs pool per non-empty tile, recording each tile's TCITile.
+    let mut pool: Vec<u8> = Vec::new();
+    let mut recs: [Vec<(u16, u32)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()]; // tileId -> (n, poolOff)
+    let mut total_refs = 0usize;
+    let mut non_empty = 0usize;
+    for lvl in 0..4usize {
+        for list in tile_index[lvl].iter() {
+            if list.is_empty() {
+                recs[lvl].push((0, 0));
+                continue;
+            }
+            let off = pool.len() as u32;
+            for &ci in list {
+                let (foff, len) = cluster_loc[ci];
+                pool.extend_from_slice(&(foff & 0xffff_c000 | region_ident as u32).to_le_bytes());
+                pool.extend_from_slice(&file_id.to_le_bytes());
+                pool.extend_from_slice(&(len as u16).to_le_bytes());
+            }
+            recs[lvl].push((list.len() as u16, off));
+            total_refs += list.len();
+            non_empty += 1;
+        }
+    }
+
+    // Offset-list file offsets (contiguous per level, 8B/tile).
+    let mut list_off = [0u32; 4];
+    let mut off = PREFIX as u32;
+    for lvl in 0..4usize {
+        list_off[lvl] = off;
+        off += (tilecnt[lvl] as u32) * 8;
+    }
+    let tables_end = off as usize;
+    let filesize = tables_end + pool.len();
+
+    let mut d = vec![0u8; filesize];
+    // header
+    d[0..2].copy_from_slice(&0u16.to_le_bytes());
+    d[2..4].copy_from_slice(&92u16.to_le_bytes());
+    d[4..8].copy_from_slice(&(filesize as u32).to_le_bytes());
+    d[8..10].copy_from_slice(&0x84u16.to_le_bytes());
+    d[10..12].copy_from_slice(&4u16.to_le_bytes());
+    d[12..14].copy_from_slice(&122u16.to_le_bytes());
+    d[14..16].copy_from_slice(&16u16.to_le_bytes());
+    d[16..18].copy_from_slice(&12u16.to_le_bytes());
+    d[18..20].copy_from_slice(&106u16.to_le_bytes());
+    // descriptive block (verbatim stock)
+    d[0x14..0x84].copy_from_slice(&TCI_DESCRIPTOR);
+    // partition table
+    for lvl in 0..4usize {
+        let p = 0x84 + lvl * 12;
+        d[p] = lvl as u8;
+        d[p + 4..p + 8].copy_from_slice(&(tilecnt[lvl] as u32).to_le_bytes());
+        d[p + 8..p + 12].copy_from_slice(&list_off[lvl].to_le_bytes());
+    }
+    // tile tables
+    for lvl in 0..4usize {
+        let base = list_off[lvl] as usize;
+        for (k, &(cnt, pool_off)) in recs[lvl].iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let so = base + k * 8;
+            d[so..so + 2].copy_from_slice(&cnt.to_le_bytes()); // nPrim
+            d[so + 2..so + 4].copy_from_slice(&cnt.to_le_bytes()); // nAll
+            let clo = tables_end as u32 + pool_off; // reader only follows this when nAll>0
+            d[so + 4..so + 8].copy_from_slice(&clo.to_le_bytes());
+        }
+    }
+    // refs pool
+    d[tables_end..].copy_from_slice(&pool);
+    fs::write(path, &d).expect("write TCI");
+    (total_refs, non_empty)
+}
+
+// ---- tile-grid helpers (mirror osm2map, validated byte-exact against runtime) ----
+fn grid_size(level: usize) -> usize {
+    [1, 5, 50, 500][level]
+}
+// (col,row) -> tile index K (Morton-style interleave), inverse of osm2map tile_center.
+fn cell_to_k(level: usize, col: i64, row: i64) -> i64 {
+    match level {
+        0 => 0,
+        1 => row * 5 + col,
+        2 => {
+            let p = 5 * (row / 10) + (col / 10);
+            let t = 10 * (row % 10) + (col % 10);
+            p * 100 + t
+        }
+        _ => {
+            let p = 5 * (row / 100) + (col / 100);
+            let s = 10 * ((row / 10) % 10) + ((col / 10) % 10);
+            let t = 10 * (row % 10) + (col % 10);
+            p * 10000 + s * 100 + t
+        }
+    }
+}
+// osm2map cell_rect maps col in [0,G) to x in [W + ws*col/G, W + ws*(col+1)/G). Inverse:
+fn col_of(x: i64, origin: i64, span: i64, g: i64) -> i64 {
+    if span <= 0 {
+        return 0;
+    }
+    let mut c = ((x - origin) as i128 * g as i128 / span as i128) as i64;
+    if c < 0 {
+        c = 0;
+    }
+    if c >= g {
+        c = g - 1;
+    }
+    c
+}
+fn cluster_bbox(cb: &ClusterBlob) -> (i64, i64, i64, i64) {
+    let (mut w, mut s, mut e, mut n) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for &(x, y) in &cb.outline {
+        if x < w { w = x; } if x > e { e = x; } if y < s { s = y; } if y > n { n = y; }
+    }
+    (w, s, e, n)
+}
+fn prof_file_code(prof_low: u16) -> String {
+    const B: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let v = (prof_low & 0xFF) as usize;
+    [B[v / 32], B[v % 32]].iter().map(|&c| c as char).collect()
+}
+fn parse_hex_or_dec(s: &str) -> u16 {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u16::from_str_radix(h, 16).unwrap_or(0)
+    } else {
+        t.parse().unwrap_or(0)
+    }
+}
+// Read a *AA.IDX (step-1 osm2map output or a stock MAP dir) for the region tile grid.
+fn read_map_idx(dir: &str) -> Option<(String, (i64, i64, i64, i64), [i32; 4], [usize; 4])> {
+    let mut found: Option<std::path::PathBuf> = None;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let nm = ent.file_name().to_string_lossy().to_string();
+            if nm.ends_with("AA.IDX") {
+                found = Some(ent.path());
+                break;
+            }
+        }
+    }
+    let p = found?;
+    let d = fs::read(&p).ok()?;
+    if d.len() < 0x20 {
+        return None;
+    }
+    let stem = p.file_name()?.to_string_lossy().to_string();
+    let ridx = stem.trim_end_matches("AA.IDX").to_string();
+    let g32 = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as i32 as i64;
+    let bbox = (g32(4), g32(8), g32(12), g32(16));
+    let part_off = u16::from_le_bytes([d[0x14], d[0x15]]) as usize * 4;
+    let mut shifts = [0i32; 4];
+    let mut tilecnt = [0usize; 4];
+    for lvl in 0..4usize {
+        let o = part_off + lvl * 12;
+        if o + 7 >= d.len() {
+            return None;
+        }
+        let u32a = u32::from_le_bytes([d[o + 3], d[o + 4], d[o + 5], d[o + 6]]);
+        shifts[lvl] = (u32a & 0xff) as i32;
+        tilecnt[lvl] = (u32a >> 8) as usize;
+    }
+    Some((ridx, bbox, shifts, tilecnt))
 }
 
 fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {
@@ -801,7 +1098,13 @@ fn seg_len(g: &[(i64, i64)], s: &Seg) -> f64 {
     (dx * dx + dy * dy).sqrt().max(1.0)
 }
 
-fn write_nav(blobs: &[ClusterBlob], segs: &[Seg], gnodes: &[(i64, i64)], file_id: u16, path: &Path) {
+fn write_nav(
+    blobs: &[ClusterBlob],
+    segs: &[Seg],
+    gnodes: &[(i64, i64)],
+    file_id: u16,
+    path: &Path,
+) -> Vec<(u32, usize)> {
     // Pass A: serialize each cluster (sizes independent of cross-cluster offsets), assign each
     // cluster a 16KB-aligned file offset.
     let mut made: Vec<(Vec<u8>, Vec<usize>)> = Vec::with_capacity(blobs.len());
@@ -836,6 +1139,10 @@ fn write_nav(blobs: &[ClusterBlob], segs: &[Seg], gnodes: &[(i64, i64)], file_id
         file[s..s + b.len()].copy_from_slice(b);
     }
     fs::write(path, &file).expect("write NAV");
+    // Return each cluster's (16KB-aligned fileOffset, byte length) for the .tci locator.
+    offs.into_iter()
+        .zip(made.iter().map(|(b, _)| b.len()))
+        .collect()
 }
 
 fn put_u16(b: &mut [u8], o: usize, v: u16) {
@@ -850,15 +1157,20 @@ fn put_i32(b: &mut [u8], o: usize, v: i32) {
 
 fn usage() {
     eprintln!(
-        "osm2rnw — OSM road network (PBF/XML) -> Bosch RNW NAV*.DAT clusters\n\
+        "osm2rnw — OSM road network (PBF/XML) -> Bosch RNW NAV*.DAT clusters (+ optional .tci locator)\n\
          usage: osm2rnw <in.osm.pbf|in.osm> [-o OUTDIR] [--region NAME] [--file-id N]\n\
-         \t\t [--target-oc N] [--bbox W,S,E,N] [--no-overlaps]\n\
+         \t\t [--target-oc N] [--bbox W,S,E,N] [--no-overlaps] [--tci --map-idx DIR [--region-ident N] [--tci-prof HEX|--tci-file NAME]]\n\
          \t-o             output dir (default <REGION>_RNW_out): <out>/<REGION>/NAV<file_id>.DAT\n\
          \t--region       region folder (default POL)\n\
          \t--file-id      NAV file id (default 20001)\n\
          \t--target-oc    segments/cluster <=1024 (default 700)\n\
          \t--bbox         only roads inside W,S,E,N degrees (default: input extent)\n\
          \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
+         \t--tci          also emit the tile->cluster locator <out>/MAP/<shard>.TCI\n\
+         \t--map-idx      DIR with the step-1 osm2map <REGION>AA.IDX (source of the region tile grid)\n\
+         \t--region-ident region ident packed into ref fileOffset low bits (default 0x42a)\n\
+         \t--tci-prof     shard profile code for the .tci file name (default 0x1a -> region1..)\n\
+         \t--tci-file     explicit .tci shard base name (overrides <mapregion>1<code>)\n\
          validate: rnw2osm <out>/<REGION> -b W,S,E,N -o roundtrip.osm"
     );
 }

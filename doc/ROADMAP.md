@@ -66,7 +66,7 @@ demonstrated for MAP/IDX (`osm2map`, byte-matches stock on `AA.IDX`) and, newly,
 | Format | Decode | Extract / convert to OSM | Write (generate) |
 |--------|:------:|--------------------------|:----------------:|
 | **MAP / IDX** | ✅ | ✅ `map2osm` → OSM XML (POIs, lines, polygons + decoded annotations) | ✅ `osm2map` → `.IDX`/`.MAP` (byte-matches stock; re-decodes clean) |
-| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw2osm` → road graph as OSM (class → `highway`, names, oneway/tunnel/bridge/roundabout) | ✅ `osm2rnw` → `NAVnnnnn.DAT` clusters (round-trip validated); ⚠️ car-boot locator open (Phase 2b) |
+| **RNW** | ✅ (incl. AEX direction-of-travel) | ✅ `rnw2osm` → road graph as OSM (class → `highway`, names, oneway/tunnel/bridge/roundabout) | ✅ `osm2rnw` → `NAVnnnnn.DAT` clusters + `.tci` locator (`--tci`, offline-validated); ⚠️ on-device boot untested |
 | **LID** | ✅ structure (block header, POI records, text pool, categories); `GLOB_POI` = SQLite FTS3 | ⚠️ partial — point-POIs readable, no exporter yet | ❌ (byte-level gaps remain) |
 
 Tooling (`src/`, Rust): `map2osm`, `osm2map`, `rnw2osm`, `osm2rnw`, `cprnav_compress`, `cprnav_decompress`.
@@ -103,14 +103,17 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   onecell. Emitting those needs a second serialisation pass (owner writes the neighbour's
   file-offset/fileId/origin into its ci2 records once all cluster offsets are fixed). This makes output
   byte-faithful to stock on the cross-cluster link path; validate with `rnw2osm … overlaps=N>0`.
-- **2b — the cluster locator (`.tci`).** Mechanism **resolved** by Ghidra: the runtime finds a position's
-  cluster through a per-tile `.tci` under `data/data/map/` (a `.tci` = 4-level tile index → `{u32 fileOffset,
-  u16 fileId, u16 length}` → `NAV%05u.DAT`), **not** `NAV_ROOT.DAT` (which is region metadata). Tile grid =
-  `TILECNT=[1,25,2500,250000]`, same as MAP; filename `N/S+ring,E/W+segment,profile.tci`. Full layout + algorithm
-  in `writer_guide.md` §7 "Cluster locator". Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH`
-  memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`. **Remaining:** wire `osm2rnw` to emit
-  the `.tci` (regenerate, or author clusters in place under the stock `fileId`/`fileOffset`/`length` so the
-  stock `.tci` still resolves) + on-device validation.
+- **2b — the cluster locator (`.tci`).** Mechanism **resolved** by Ghidra and **implemented** in `osm2rnw
+  --tci`. The runtime finds a position's cluster through a per-tile `.tci` under `data/data/map/` (a `.tci` =
+  4-level tile index → `{u32 fileOffset, u16 fileId, u16 length}` → `NAV%05u.DAT`), **not** `NAV_ROOT.DAT`
+  (region metadata). Key facts: `fileId` is the literal `%05u` filename (`vFileId2Name`); the ref `fileOffset`
+  packs the region ident in bits 0–13 (`u16GetRegionIdent`) and the 16 KB-aligned cluster offset in bits 14+;
+  the reader reads `nPrim` refs (write `nPrim==nAll`); routing queries the finest level only, so each cluster
+  is registered in every finest-level tile its bbox overlaps. `osm2map` no longer emits `.tci`; `osm2rnw`
+  reads the tile grid from step-1 `<REGION>AA.IDX` (`--map-idx`). Offline-validated (krzeszowice: 52 clusters,
+  `nPrim==nAll`, refs in-bounds, correct region ident). **Remaining:** on-device boot validation; confirm
+  `--region-ident` / shard profile for the exact target region. Patches: cluster flags byte bit 0x80 triggers
+  a `NAV____n.PTH` memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`.
 
 ### Phase 3: MAP / IDX writer
 

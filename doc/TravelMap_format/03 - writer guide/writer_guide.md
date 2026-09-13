@@ -290,7 +290,7 @@ the RNW tree, in the MAP folder — see the "Cluster locator" section below. Fie
 | cluster **16 KB alignment** | **yes (multi-cluster)** | `rnw2osm` finds clusters on a 0x4000 step; pad each cluster blob to a 16 KB boundary and keep cluster_id ≠ 0 |
 | ci2 overlap *links* | no — recommended (byte-faithful) | `osm2rnw` emits them by default (cluster listFlags bit3 + onecell bit4 + ci2 records); `--no-overlaps` falls back to border-marker-only. Validated: `rnw2osm … overlaps=N/N` |
 | cluster **header flags byte @0x02** bit 0x80 | **must stay CLEAR** | bit 0x80 ⇒ "patched, patchId=flags&7" and the runtime memcpy's `data/connect/rnw/<prof>/<region>/NAV____<id>.PTH` over the cluster → corruption. osm2rnw uses flags=0x0001 (bit0 coordmode), never 0x80 |
-| cluster locator (the `.tci` in `data/data/map/`) | **required for in-car load** | see "Cluster locator" below — this (not `NAV_ROOT`) is how a lon/lat finds a cluster. Authoring it for a hand-built region = ROADMAP Phase 2b |
+| cluster locator (the `.tci` in `data/data/map/`) | **required for in-car load** | see "Cluster locator" below — this (not `NAV_ROOT`) is how a lon/lat finds a cluster. Emitted by `osm2rnw --tci --map-idx <step-1 MAP out>`; `osm2map` no longer emits `.tci` |
 | AEX files | no — config-gated (`bRNWLoadAexData`) | omit entirely |
 
 ### Implemented: `osm2rnw`
@@ -316,9 +316,9 @@ count, geometry, connectivity, street names and `highway=*` classes. Recipe / de
    drops the name. Class → `highway` inverts `display_class` exactly (see §6a).
 6. **Validate**: `rnw2osm out/<REGION> [--no-snap] -b W,S,E,N -o rt.osm`; compare `highway`/`name`
    histograms vs the input (expect drivable-name parity, no invented names). **Car-boot** load is still
-   gated on the `.tci` locator (Phase 2b), independent of the cluster bytes being correct here.
+   gated on the `.tci` locator (emitted by `osm2rnw --tci`), independent of the cluster bytes being correct here.
 
-### Cluster locator: how the car finds a cluster (`.tci`) — RESOLVED
+### Cluster locator: how the car finds a cluster (`.tci`) — RESOLVED & IMPLEMENTED (`osm2rnw --tci`)
 
 Reverse-engineered from `DAPIAPP.OUT` (call chain `u16SendUniqueIdList` @0x84a2f8 →
 `u16GenerateTileIds`/`u16CalcTileId` @0x8cbe0c → `TCICache::u16GetClusterId` @0x8df958 →
@@ -340,25 +340,39 @@ clusterRefs @ clusterListFileOffset = nAllClusters × TCIClusterId
   TCIClusterId = { u32 fileOffset, u16 fileId, u16 length }     # into data/rnw/<PROF>/<REGION>/NAV%05u.DAT
 load `length` bytes at `fileOffset` in NAV%05u(fileId).DAT  →  that cluster
 ```
+IMPORTANT packing detail (found in `rnw_tclIDBase`): `TCIClusterId.fileOffset` is *packed*. The cluster's
+byte offset lives in bits 14–31 (`u32GetClusterFileOffset = w & 0xffffc000`), so clusters are **16 KB
+aligned**; the **low 14 bits (`w & 0x3fff`) carry the region ident** (`u16GetRegionIdent`) used to pick the
+`<REGION>` folder. i.e. `ref.fileOffset = (clusterByteOffset & 0xffffc000) | regionIdent`. `fileId` is
+literally the `%05u` of the NAV filename (`vFileId2Name` = `sprintf("NAV%05u.DAT", fileId)`, @0x90a7dc).
+The reader loads a block sized for `nAll` refs but pushes only the first `nPrim` to the queue, so write
+`nPrim = nAll = refs.len()`. Routing always queries the **finest** level (`this[0x3b0]==3`), with no
+ancestor walk, so a cluster must be listed in **every finest-level tile its bbox overlaps** (coarse levels
+are populated for the render/LOD subsystem). Region-folder + `fileId` are therefore region-context inputs,
+not encoded in the tile grid.
 The `.tci` header (0x14 B): u16@0,@2; u32@4=filesize; **u16@0x08=partitionTableFileOffset**;
 **u16@0x0A=partitionCount (==4)**; rest unused by the reader. Partition table = 4 × `TCIPartition` (0xC B):
 `u8 mapLevel, pad×3, u32 maxTileIdx (=TILECNT[L]), u32 offsetListFileOffset`. Confirmed against stock
 `N6E210I.TCI` (partitions: lvl 0/1/2/3 → maxIdx 1/25/2500/250000). `fileId→NAV%05u.DAT` confirmed
-(`vFileId2Name` @0x90a16c). NOTE: the ASCII magic "TILE_CLUSTER_INDEX" is a knitter signature the runtime
+(`vFileId2Name` @0x90a7dc). NOTE: the ASCII magic "TILE_CLUSTER_INDEX" is a knitter signature the runtime
 never checks. The per-level `extLon/extLat/LL` (a `WorldTilePartition` table) are the SAME tile geometry
 MAP uses (`osm2map` already encodes `SHIFTS=[13,10,7,4]`, `TILECNT=[1,25,2500,250000]`).
 
 **Consequence for a hand-built region.** Correct cluster bytes are necessary but NOT sufficient to boot:
-the car finds a cluster only through a `.tci` tile entry. Two paths to bootability:
-- **Regenerate `.tci`** for every map tile your region touches: write one `TCIClusterId`
-  `{clusterFileOffset, file_id, clusterLength}` per cluster into the correct tile of the correct
-  region-profile shard, plus the header/partition/offset-list tables. (Needs the exact `WorldTilePartition`
-  extents + the region-profile→shard selection; a still-open sub-step. ROADMAP Phase 2b.)
-- **Or reuse stock addressing**: if you re-author clusters *in place* — same `fileId`s, same 16 KB-aligned
-  `fileOffset`s, same `length` as the clusters the stock `.tci` already references — the stock `.tci` keeps
-  pointing correctly and no `.tci` editing is needed. Cleanest for replacing an existing region's coverage.
-`osm2rnw` currently emits clusters at fresh offsets under one `--file-id`; wiring it to a `.tci` (either
-path) is the remaining in-car step. The geometry itself is verifiable offline via `rnw2osm` regardless.
+the car finds a cluster only through a `.tci` tile entry. Ownership of the `.tci` follows the *data* it
+indexes (RNW clusters), so **`osm2map` no longer emits any `.tci`** (it writes only `.IDX`/`.MAP`) and
+**`osm2rnw` generates it** — pass `--tci --map-idx <step-1 MAP out>`. The tile grid (region bbox +
+`SHIFTS`/`TILECNT`) is read from that step-1 `<REGION>AA.IDX`, guaranteeing `osm2rnw`'s tile indices match
+`osm2map`/the runtime exactly (not from the OSM data extent). `--region-ident` (the region code packed
+into ref bits 0–13, e.g. `0x42a`) and the shard name/profile (`--tci-file` / `--tci-prof`, default
+`<mapregion>1<base32(prof)>`) are the region-specific inputs. Validated offline: 52-cluster krzeszowice →
+`.tci` with `nPrim==nAll`, every cluster at all 4 levels, all refs in-bounds with correct `regionIdent`,
+and geometry self-consistent.
+
+The alternative remains: **reuse stock addressing** — re-author clusters *in place* (same `fileId`s, same
+16 KB-aligned `fileOffset`s, same `length` as the stock `.tci` already references) so the stock `.tci` keeps
+pointing correctly. `osm2rnw`'s `--tci` path takes the *first* option. Either way the cluster geometry
+itself is verifiable offline via `rnw2osm`; the remaining unverified step is an actual in-car boot.
 
 
 
