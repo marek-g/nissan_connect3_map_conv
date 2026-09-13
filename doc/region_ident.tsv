@@ -1,0 +1,34 @@
+# RNW regionIdent table — region code -> regionIdent (profile 1 / CCP)
+# regionIdent = (profile<<10)|codeId ; all shipped RNW regions use profile 1 (folder CCP).
+# Baked into osm2rnw (src/osm2rnw/src/main.rs REGION_IDENT). Derived from stock data, not guessed:
+#   * primary evidence = regionIdent repeats ~1e3x in that region's own DATA/DATA/RNW/CCP/<code>/NAV_ROOT.DAT
+#     vs ~1 elsewhere (NAV_ROOT histogram, owner-vs-foreign margin >= 8x), cross-checked against the
+#     constant regionIdent inside that region's stock MAP shard .TCI clusterRefs (e.g. N6E211A.TCI = 0x42a);
+#   * BNL/MLC: small/overlay regions, no dominant NAV_ROOT signal -> the two values left over from the
+#     confirmed used-value set {1,2,3,4,6,7,8,9,10,11,12,13,14,17,18,22,42} once the other 15 are pinned
+#     (BNL = dense Benelux .TCI shards, MLC = tiny counters);
+#   * GRC = NAV_ROOT-clean (83% share) though no stock .TCI surfaced 0x406.
+# NOTE: Poland's ROAD-network region is POL (0x402) — the krzeszowice/Krakow road clusters live under
+#   CCP/POL (rnw2osm on CCP/POL yields ~5888 roads near Krakow; CCP/EEU yields 0), and stock shard
+#   N6E2102.TCI references them with a uniform regionIdent 0x402. EEU (0x42a) is a SEPARATE aggregate
+#   region (Hungary/Ukraine/Belarus) on the same MAP grid (shard N6E211A.TCI), NOT Poland's roads.
+#   So swap targets for Poland use --region POL (-> 0x402). (An earlier note claiming "Poland=EEU" was wrong.)
+# confidence: high except BNL/MLC (by elimination). Verify on-device before trusting an untested region.
+region	regionIdent	codeId	profile	confidence
+DEU	0x0401	1	1	high
+POL	0x0402	2	1	high
+FRM	0x0403	3	1	high
+BNL	0x0404	4	1	low(elimination)
+GRC	0x0406	6	1	high
+TUR	0x0407	7	1	high
+ACL	0x0408	8	1	high
+IBE	0x0409	9	1	high
+MLC	0x040a	10	1	low(elimination)
+ISV	0x040b	11	1	high
+GBI	0x040c	12	1	high
+SCA	0x040d	13	1	high
+CHS	0x040e	14	1	high
+ELL	0x0411	17	1	high
+INT	0x0412	18	1	high
+EAD	0x0416	22	1	high
+EEU	0x042a	42	1	high

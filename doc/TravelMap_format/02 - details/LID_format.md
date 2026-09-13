@@ -22,13 +22,21 @@ Each region folder holds **five numbered file families** (the leading digit is t
 the following digits are a tile/cluster index) plus a handful of special files. The family scheme
 is identical across every region:
 
-| family | compressed (all regions) | raw (all regions) | role (inferred) |
+| family | compressed (all regions) | raw (all regions) | role |
 | --- | --- | --- | --- |
-| `LID0nnnn` | **1096 (always)** | 0 | per-cluster POI list (the bulk of named POIs) |
-| `LID2nnnn` | 0 | **296 (always)** | map-object data (type A) |
+| `LID0nnnn` | **1096 (always)** | 0 | **Address-search gazetteer** = `fm_tcl` POI sequences grouped by *name-list type* (city/street/…) + country; its text pool holds the place/street strings (`NAME/code/COUNTRY`, `ULICA …`). **Read directly by OSDE** (§10). Also carries landmark POIs. |
+| `LID2nnnn` | 0 | **296 (always)** | map-object data (type A) — `fm_tcl` line/poly/point objects |
 | `LID3nnnn` | 22 | 25 | map-object data (type B, largest) — mixed |
 | `LID4nnnn` | 263 | 33 | map-object data (type A′) — mostly compressed |
 | `LID5nnnn` | 42 | 5 | map-object data (type B′) — mostly compressed |
+
+> **Two file openings, two purposes (CONFIRMED from bytes).** `LID0*` (and `CONNECT.DAT`) open with
+> `0d 00` (u16 = `0x000d`) = the **LISA container** that OSDE's `NLDataBlockReader` walks; `LID2/3/4/5`
+> open with `02 04` (u16 = `0x0402` for POL = **REGION_ID / dataset_id** = regionIdent `0x402`) = the same
+> `fm_tcl` content wrapped as a map-object container. In both, `0x0402` is the region id, `0x0a000000` a
+> count and `0x41ec` a constant section marker. The exact LISA **container framing** of `LID0` (the part the
+> `fm_tcl*` layer does *not* parse — it is fed an already-located block) is the **one byte-level piece still
+> to pin for the writer**; `lid2dump` decodes it against stock (§10.6).
 
 > Compression is **per-file**, not purely per-family: `LID0` is always CPRNAV_2, `LID2` is always raw,
 > and `LID3/4/5` are mixed. Total compressed files under `DATA/DATA` = **1423** (all LID). The POL folder
@@ -209,6 +217,54 @@ referenced by the 16-bit `text_id` (`u16GenerateTextId` / `u16GetTextId`).
 `GLOB_POI.CAT_ID`: CarBrand, Shopping, Hotel, Restaurant, Fuel, Medical, City, Landmark, Transport,
 ServiceArea, Sporting, Entertainment, Business, PublicBuilding, CarRentalBrand, UserSpecificCategory, Sanctuary.
 
+### 5b. Confirmed `fm_tcl` framing (from accessor bodies, `DAPIAPP.OUT`)
+
+All `fm_tcl*Access` classes are zero-copy views over a raw buffer (`*(base+const_off)`), so on-disk offsets
+read straight out of the getters. The non-`Access` structs (`fm_tclPOIData` etc.) carry a 4-byte typebase
+prefix, which is why the *in-memory* getters sit **4 bytes higher** than the on-disk fields (e.g. POI
+`GetDisplayScale` in-mem `@+6` `00d162b0` vs on-disk `@+2`). For **writing**, use the on-disk numbers.
+
+**Block header — `fm_tclStartBlock`, fixed `0x28` bytes** (writer `enSetBlock` `00d40660`):
+
+| Off | size | field | setter |
+| --- | --- | --- | --- |
+| +0x00 | u8 | binary_code = `1` | `vSetBinaryCode` `00d17108` |
+| +0x01..03 | u8×3 | version_major / _minor / _patch=`1` | `00d17120/38/50` |
+| +0x04 | u32 | block_total_size (init 0x28) | `vSetSize` `00d1716c` |
+| +0x08,0x0c | u32×2 | unique_id (first/second) | `vSetUniqueID` `00d2295c` |
+| +0x10..0x1f | 4×i32 | bbox LL.lon, LL.lat, UR.lon, UR.lat (**PAU**) | `vSetBoundingBox` `00d23d50` |
+| +0x20 | u32 | dataset_id (= REGION_ID, POL=`0x402`) | `vSetDatasetID` `00d17184` |
+| +0x24 | u8 | draw_prio | `vSetDrawPrio` `00d1719c` |
+| +0x25 | u8 | block_type | `vSetBlockType` `00d2512c` |
+| +0x26..27 | 2 | padding |
+
+**Sequence header — `fm_tclPOISeq` / `fm_tclLineSeq`, `0x0c` bytes** (then `count` records @ `+0x0c`):
+
+| Off | size | field |
+| --- | --- | --- |
+| +0x00 | u8 | binary_code |
+| +0x01 | u8 | **name-list type** = `fm_tenPOIType` → maps to OSDE category (§10.2: 2=city,3=street,…) |
+| +0x02 | u16 | sequence total size |
+| +0x04 | u16 | country (ISO code) |
+| +0x06 | u16 | dummy |
+| +0x08 | u32 | **element_count** (records) — updated by `vAddPOIData` `00d2a97c` |
+
+This `type`+`country` sequence grouping **is** the OSDE "name list": a city list = a `type=2` sequence, a
+street list = `type=3`. Line/poly sequences (§6) share the byte-identical header.
+
+**Text pool — `enSetTextSeq` `00d3c38c`:** seq `binary_code=5`; a raw concatenated string blob, then one
+length-prefixed `fm_tclTextStructure` per text-id; `u16GenerateTextId` `00d3b53c` assigns ids sequentially,
+so `text_id` = nth structure → its `{offset,length}` into the blob. Place/street display strings
+(`NAME/code/COUNTRY`, `ULICA …`) live here.
+
+**POI record — `fm_tclPOIData` (`0x14`):** `size@+0, display_scale@+2, lon i32, lat i32, text_id@+0x0c, dummy@+0x0e`.
+> ⚠ The two lon/lat on-disk offsets are **unresolved**: the accessor path implies `@+0x04/@+0x08`, but an
+> empirical read of a real ELL block matched `lon@+0x0c / lat@+0x10 / text_id@+0x14` (§3/here). `lid2dump`
+> must parse a *known* city/street sequence to settle the exact record base before the writer is trusted.
+
+**Line/Poly record (§6):** `size@+0, display_scale@+2, coord-list-bytes u32@+0x04, 0x0e-byte header, then
+PositionWGS84 points`; `text_id` exact on-disk offset ≈ `+0x36` (INFERRED; in-mem `@+0x3a`).
+
 ---
 
 ## 6. `LID2/3/4/5nnnn` — map-object files  **[DECOMPRESSED; object structs partially mapped]**
@@ -242,12 +298,101 @@ partially mapped; the §5 point record is the reference. Compressed siblings are
 
 ---
 
-## 8. How LID relates to RNW / MAP
+## 8. How LID relates to RNW / MAP (and why address search needs it)
 
 - **RNW** = road-network topology (decoded — see `RNW_format.md`).
 - **MAP** = rendered base-map geometry / "FastMap" (see `MAP_format.md`).
 - **LID** = the *content* layer on top: named POIs, map objects, and text. RNW/MAP give the roads and
   tiles; LID gives the searchable landmarks and the objects drawn on them.
+
+> **Address search is served by LID, NOT by RNW/MAP.** The car's "city → street → house number"
+> destination lookup is an entirely separate subsystem (**OSDE/LISA**, §10) that queries the LID
+> name-lists, a global city SQLite DB, relation files and HNR point files. **A converter that only writes
+> MAP + RNW does not update the address database** — the roads will route and draw, but the address field
+> will keep using the stock (stale) LID. To refresh addresses you must also emit LID (§10, `osm2lid`).
+
+---
+
+## 10. Address search (OSDE / LISA) — where city / street / house-number data lives  **[MOSTLY DECODED]**
+
+The destination-address lookup runs in the **LISA** name-list subsystem, configured by
+`CRYPTNAV/CFG/LID/OSDE/ADDRESS/CONF.XML` (weights `WEIGHT_CITY/CITYDISTRICT/ZIP/STREET/CROSS/HNR`,
+`FACTOR_HNR_MATCH/NEARBY/NO_HNR`, `only_search_in_street_list`). It reads the LID file family directly —
+**never the road network**. Everything below was traced in `DAPIAPP.OUT`.
+
+### 10.1 File-type → physical file (CONFIRMED: `LISA_tclDataManager::bGetFileNameFromDataAddress` @`00bc4d54`)
+
+| LISA file type | file |
+| --- | --- |
+| `0x13/0x14/0x15` | `LID%05u.DAT` (`0x15` = fileID+90000) |
+| `0x16` | `REL%05u.DAT` (relations: city→street / city→district, per listID) |
+| `0x17` | `POSTILES.DAT` |
+| `0x18` | `PA_%05u.DAT` — **point addresses = exact house-number coordinates** |
+| `0x03` | `DB_CITY.DAT` — **SQLite FTS** global city gazetteer (+ zips) |
+| `1/2/0x11/0x12/0x22/0x23/0x32/0x33` | `META%04u.DAT` (PSF meta/ref tables) |
+| `0x21/0x31` | `CONNECT.DAT` (root / region connect entries) |
+| `0x42/0x52` | `CONF.XML` / `AREA_CODES.XML` under `CFG/LID/OSDE/ADDRESS/` (path @`bDetermneAccessPathAndMediumID` `00bc3784`) |
+
+**FileID bands inside one region's LID family (CONFIRMED):** `+0` = name lists (city/street), `+10000` =
+**crossings** (`bGetCrossingFileID` `00bd4188`), `+20000` = **GenAttr / HNR** (`bGetGenAttrFileID` `00bd4080`).
+
+### 10.2 Name-list category ids (CONFIRMED: `bSendListUpdate` `00c74fc8`, tag table `enParseLineForTags` `00c84cfc`)
+
+`2`=CITY · `3`=STREET · `4`=JUNCTION/CROSS · `5`=HOUSENUMBER · `0x3d`(61)=ZIP · `12`=city-district · `9`=state ·
+`0x76`(118)=`OSDE_ADDRESSES` pseudo-category. These are the **sequence `type` byte** (§5, `fm_tclPOISeq`@+1) of
+the `fm_tcl` POI sequences inside `LID0` — i.e. a city/street "name list" *is* a `type`-tagged POI sequence.
+
+### 10.3 Category → data source (CONFIRMED unless marked)
+
+| Field | Source | Accessor |
+| --- | --- | --- |
+| **CITY** | regional: `LID0` name-list cat 2; global: `DB_CITY.DAT` SQLite `GlobalCityList` | `vPopulateCityIndices` `00c73b68`; `bGetGlobalCityList` `00c96384` (`SELECT NameNorm,Longitude,Latitude,Province_ID FROM GlobalCityList … MATCH …`) |
+| **CITYDISTRICT** | same city list (district = extra list element), linked by `REL` relation **type 2** | `vAddCityDistrictInCity` `00c7f258` → `NLRelationProcessor::bGetRelationsPerIndexByType(2)` |
+| **ZIP** | `DB_CITY.DAT` `GlobalCityList` zips-as-NameNorm; LID zip-aliases (cat `0x3d`) | `bGetProvinceIdFromZIPCode` `00c952f4`; `bGetCityByID` `00c955d8` (returns `CAT_ID`) |
+| **STREET** | `LID0` name-list cat 3 (**no separate street table/DB**) | `bVerifyList` `00c75bf4`; `NLPAOSDEStreetIdxCollector` `00ce8abc` |
+| **CROSS** | `LID0` with **fileID+10000** (crossing variant), street pairs by index | `poGetNewNLCrossingProcessor` `00bd41b4`; `enGetCrossingStreetIndices` `00e086c4` |
+| **HNR** | `LID0` with **fileID+20000** (GenAttr blocks keyed by street element idx); exact coords from `PA_%05u.DAT`; else **interpolated** along the street | `poGetNewNLGenAttrProcessor` `00bd40ac`; `bGetHnrs` `00ce72a4`; `enGetHnr` `00e0d078`; `bGetPACells` `00be072c`; `bGetInterpolationRatio` `00ce4098` |
+
+**HNR record (INFERRED from `enGetHnr`):** `{ u32 hnr; u32 prefixNum; number/addition/prefix/suffix strings;
+NLHnrStatus{ even-parity, odd-parity, refuseInterpolation, countedAgainstDigits }; u32 rangeEnd (-1=none) }`.
+Position = `PA` point if present, else `pos = street[i + idx/(n-1)]` between the range bounds unless
+`refuseInterpolation`. So house numbers are **attribute records + optional exact points, keyed to a street**
+— *not* LID polygons and *not* RNW interpolation.
+
+### 10.4 End-to-end flow (typed "city → street → number")
+
+1. `bProcOSDEAddress` `00c337b0` → `bSearchAddress` `00c771a8`.
+2. Parse line by tags (`enParseLineForTags` `00c84cfc`: `city:→2 zip:→0x3d street:→3 houseno:→5`).
+3. `bSearchRootNames` `00c75f28` locates region roots (`CONNECT.DAT`/META PSF) → `bSearchStreetsAndCities` `00c766b4`
+   matches the `LID0` name lists per category (`only_search_in_street_list` = whitelist `{3}`).
+4. `LISA_tclHypothesisValidator::bValidate` over `REL%05u` (city→street, city→district); districts via `00c7f258`.
+5. `bSendListUpdate` `00c74fc8` builds result descriptors `city:..;street:..;houseno:..`.
+6. Selection → `bGetCellsForOSDE` `00b8b900` (`bReadCrossingCells`/`bReadHNRCells`/`bGetPACells`).
+7. Resolve coordinate (GenAttr HNR + `PA`, else interpolate; city = LID element WGS84 or `DB_CITY`) →
+   handed to the router via `posfi_tclMsgSetPositionByLocation`.
+
+### 10.5 `DB_CITY.DAT` / `GLOB_POI.DAT` (SQLite)
+
+- `DB_CITY.DAT` (optional; **absent on the reviewed EUR card** — regional LID name-lists are used instead):
+  table `GlobalCityList(ID, Name, NameNorm, Longitude, Latitude, Province_ID, CAT_ID)`, FTS `MATCH`; **`CAT_ID == 0x3f`(63) = City**; zips are `NameNorm` entries. Path = connect-global folder + `DB_CITY.DAT` (`vGetGlobalCityListFileName` `00bc3cdc`).
+- `GLOB_POI.DAT` (§3) is the **POI-search** gazetteer (queried by `bSearchPOIs` `00c1e2ec` / `bGetPOIList` `00c1de98`).
+  Its `CAT_ID` = an internal **FI category id**, mapped through `CFG/LID/POI_SRV/POI_MAPPING.DAT` (`IndexCategories`
+  + `neh_IDTable`); `REGION_ID` = the region's regionIdent (POL = 1026 = `0x402`); `CONTROL` observed always `1`;
+  `LANG_IDX` = per-language index (`NAME` is that language's display form, `NAMENORM` the ASCII-folded FTS source;
+  `ORIGINAL_IDX` groups the same POI across languages). **Streets/HNRs have no CAT_ID — they are LID name-list
+  constructs, not POI-DB rows.**
+
+### 10.6 Decoded vs not — writer implications (drives `osm2lid`)
+
+**Writable now:** `GLOB_POI.DAT` / `DB_CITY.DAT` SQLite (plain SQLite, exact schema known). `LID0` POI records +
+text pool (block/seq/POI record layouts §5).
+**Still to pin byte-level (via `lid2dump`, in progress):** the `LID0` **LISA container** framing (`0d00`…), the
+**`type`-tagged name-list sequences** for cat 2/3, the `REL`/GenAttr/`PA` file formats, and the `META`/`CONNECT`
+PSF connect tables. These four back **street** and **house-number** search; until written, a converter's
+address data is POI/city-only. **Road network is not involved** (CONFIRMED — no `rnw_tcl*` callee in the OSDE path).
+
+---
+
 
 ---
 
@@ -269,6 +414,10 @@ partially mapped; the §5 point record is the reference. Compressed siblings are
 2. **Line/polygon object record layouts** (`fm_tclLineData` / `fm_tclPolyData`, §6) for the LID2-5 payloads.
 3. **Sequence TOC framing** — how a block enumerates its (country, POI-type) sequences and their lengths.
 4. The `CONNECT`/`META`/`REL` index structures (§7).
+5. **Address search (§10):** pin the `LID0` **LISA container** framing (`0d00`…), the exact POI/`type`-sequence
+   record offsets, and the `REL` / GenAttr(`+20000`) / `PA_%05u` file formats that back **street** and
+   **house-number** lookup. Approach: build `lid2dump` (Bosch→JSON gazetteer dumper) as the ground-truth
+   reader, decode stock addresses with it, then write `osm2lid` and validate by round-trip.
 
 > Practical note for a converter: if your goal is *navigation*, LID is the optional content layer — the
 > network still loads and routes via RNW→MAP without it. If you need POI search / landmark rendering, the files
