@@ -507,8 +507,33 @@ either, so the oracle skips it). Confirmed encoders: raw-u32 (`0x11`), VLE (`0x1
 (`0x16`), Simple9 greedy-largest-count (`0x18`, mode table `1:(28,1)…9:(1,28)` matches author exactly),
 run/boundaries (`0x12` u32 / `0x15`,`0x17` VLE of run-ending boundaries), bitmap (`0x01` LSB-dense / `0x02`
 sparse-set / `0x03` sparse-clear, both as delta-VLE over `param` bits). So *emitting* our data through these
-same encoders yields device-correct bytes; only choosing each column's `param`/`off` + the street↔record join
+ same encoders yields device-correct bytes; only choosing each column's `param`/`off` + the street↔record join
 for OSM `addr:housenumber` remains (see §11.8).
+
+**GenAttr *writer* + join model derived from firmware (2026-09, `src/lid_format/src/write.rs` + reader).**
+Ghidra (`enGetHnr 0xe0d078`, `enGetHnrOwnerDescrIndices 0xe0c218`, `enGetOwner 0xe0bdd0`,
+`SetDataBlock 0xe09b60` selector switch `0xe09bb0..`) pins the per-record member layout and the join. A record
+= **one address element** (the `elem_start..=elem_end` range); members read for the HnR lookup:
+`+0x28` VL\<u32\> selector `0xc01` = **per-street list of address-element ids** (existence/ `4000` bitmap,
+`8000` = *cumulative offset* deltas, `0000` = the concatenated ids) — this is the street→addresses inverse the
+UI browses; `+0x7c` selector `0x002` SV\<u32\> (per-addr u32); `+0x260..+0x300` `0xc09..0xc0d` `tBitArray`
+(parity/refuse-interp/interp); `+0x300` `0x00c` `Range<u32>` (the **house number** `from`=`8000`/`to`=`0000`)
+read via `enGetValue(+0x300,…)`; `+0x47c` `0xc12` `Range<u32>` per-addr **owner-descr index** → `enGetHnr-
+OwnerDescrIndices` → `+0x4d0` `0xc13` VL\<u32\> = **per owner-desc the street-elem list** (`enGetOwner`) = the
+record→street join, and `LISA_…` then resolves each street-elem id back to LID2 for the result set. Param rule
+(author): `flag 4000`.param = *domain* (existence bit count), `flag 8000`.param = Σ/total or #exist,
+`flag 0000`.param = #values; each member's *own* `8000` param equals its `4000` popcount. The synthetic
+`#[test] gen_attr_writer_roundtrip_device_model` writes 2 tiling blocks and asserts, on re-parse,
+`rebuild_all` byte-equality **and** the enGetHnr/enGetOwner-style member lookups return the exact encoded
+street→addr / addr→number / addr→street answers. **Still needs** the OSM-→element join in `osm2lid`: map each
+`addr:housenumber` point is now wired: `osm2lid` collects those objects, joins them to **the street**
+`LID20006` element named by `addr:street`, and feeds `BlockData{0xc01 street→addr elem, 0x002 addr→street
+Range, 0x00c number Range(from=to=num), 0xc0a parity bits}` to `write_gen_attr_file` (§11.6b end / §12.10).
+Stock keyed some of these columns through **LID3 crossing** element/owner-descr ids we do not generate; the
+author join semantics on-device (`NLHnrToTree`) are unverifiable without the card, so our columns are the
+reader-consistent subset validated offline: 5 `gen_attr_*` tests (rebuild oracle + device read-model) and
+`osm2lid/tests/genattr.rs` (real binary, real fixture, columns re-read with `read_gen_attr`).
+
 
 **GenAttr is a *different* container — `NLGenAttrFile`, not `NLNameList` (RESOLVED 2026-09; earlier
 "same container, garbage section table" note was WRONG).** Both are opened via
@@ -559,7 +584,11 @@ is the real implementation cost** — build `lid2dump` first and decode stock be
 > are now decoded too — container, block TOC **and the block interior** (`NLGenAttrFile` /
 > `read_gen_attr` / `GenAttrIndex::decode_block`, §11.6; validated on `POL/LID40006` block 0) — the reader no
 > longer returns garbage on them and the descriptor/attr-vector structure + parity/owner/value columns decode.
-> **Still pending:** the **GenAttr/HNR writer** + the street↔record join and `NLHnrToTree` semantics, `PA`, `REL`.
+> **GenAttr writer DONE (2026-09):** `src/lid_format::write` + `osm2lid` `write_gen_attr` emit `LID40006.DAT`
+> (OSM `addr:housenumber` objects joined to their `addr:street` street element); encoders are the byte-exact
+> ones proven over `POL/LID40006` and the writer round-trips through the reader + a device read-model
+> (`gen_attr_writer_roundtrip_device_model`, `osm2lid/tests/genattr.rs`). **Still pending:** `NLHnrToTree`
+> on-device matcher semantics (no card to run it), crossing files (+10000), `PA`, `REL`.
 > No `DB_CITY.DAT` on this card, so SQLite cannot substitute for the regional city name-list — it must be
 > written as `LID20000.DAT`.
 
@@ -677,13 +706,29 @@ deltas are otherwise exact. Verified it is a pure trie (single-parent, all nodes
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
-TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now calls it to write **both** the
-**street** name-list (`write_streets` → `LID20006.DAT`, one element per unique highway `name` at its way
-centroid, absolute PAU, block origin 0) and the **city/settlement** name-list (`write_cities` → `LID20000.DAT`,
-one element per unique OSM `place=` name at its centroid). Both round-trip name- and position-exact (unit
-tests + `malopolskie`: streets **8828 names → 14 blocks → 8828 elements back**; cities **10482 names → 12
-blocks → 10482 elements back**, diacritics intact). **Still pending:** house-number GenAttr `+20000`, point-address `PA`,
-`REL`, and the on-device block geo-origin (§12.5) for absolute coordinates.
+TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now writes **all three** address
+files (unit tests + `malopolskie` fixtures):
+
+* **streets** (`LID20006.DAT`): one element per unique highway `name` at its way centroid, absolute PAU,
+  block origin 0 — **8828 names → 14 blocks → 8828 elements back**.
+* **cities/settlements** (`LID20000.DAT`): one element per unique OSM `place=` name — **10482 names → 12
+  blocks → 10482 elements back**, diacritics intact.
+
+**12.10 House-number GenAttr writer (`LID40006.DAT`).** Same crate, different container (§11.6b). `osm2lid`
+collects `addr:housenumber` objects (nodes or building/entrance ways; the street comes from `addr:street`,
+falling back to `addr:place`) that land within `--bbox`, keeps **numeric** numbers only (the authoring tool
+too dropped suffixed/compound numbers such as `11A` — they cannot live in the `u32` number column), and joins
+each to the *same* street-element order as `LID20006.DAT`. It chunks the address records
+(`HN_ATTR_CHUNK`=8192, adaptive so even tiny inputs emit the ≥ 2 TOC blocks the container requires) and writes
+the four device columns: `0xc01`(+0x28) street→address **element-list** (existence `4000` over the used-street
+domain, cumulative `8000`, `0000` element ids in sorted-street order), `0x002`(+0x7c) address→street (Range
+from/to = street id), `0x00c`(+0x300) the house **number** (Range from/to = the number; `8000`=VLE-delta of
+the froms so their decode-cumulatives are exact, `0000`=raw-u32 tos), and `0xc0a`(+0x280) per-address
+**parity** (even-number bit ride in the column's existence bitmap). Validation is offline (no card in the
+loop): `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle over `POL/LID40006` + device read-model
+round-trip) and `osm2lid/tests/genattr.rs`, which runs the real binary on a tiny fixture and re-reads every
+column with `read_gen_attr`/`decode_block`. **Still pending:** `PA`, `REL`, crossing files (+10000), and the
+absolute block-origin (§12.5); the on-device `NLHnrToTree` matcher itself cannot be run here.
 
 > **Corrected decoder notes (were wrong in earlier revisions):**
 > - **Simple9 mode→(count,bits)** (from `DecodeSimple9` `00cdc3bc`/`00cdc908`, values LSB-first, mode nibble
@@ -719,7 +764,9 @@ blocks → 10482 elements back**, diacritics intact). **Still pending:** house-n
    UTF-8 on `POL`, so not exercised yet).
 3. **Writer (`osm2lid` + `lid_format::encode`)** — DONE for the **street + city name-lists** (plain trie,
    multi-block, §12.9): OSM highway `name` → `LID20006.DAT` and OSM `place=` → `LID20000.DAT`, both validated
-   by full round-trip. **Still pending:** house-number GenAttr `+20000` (§11.6), point-address `PA` / `REL`,
+   by full round-trip, **plus the house-number GenAttr `+20000` file** (`LID40006.DAT`, §11.6/§11.6b,
+   OSM `addr:housenumber` → street-joined records, validated by `osm2lid/tests/genattr.rs`).
+   **Still pending:** point-address `PA` / `REL`, crossing files (+10000),
    and on-device block geo-origin (§12.5) for absolute coordinates.
 
 > The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**

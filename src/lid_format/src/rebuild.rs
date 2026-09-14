@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Byte-exact rebuild oracle for GenAttr (`LID4nnnn`) blocks.
 //!
 //! Goal (writer correctness, provable offline without a car): re-encode every GenAttr block's
@@ -38,7 +39,7 @@ fn _unused_bitfield_region() { let _ = bitfield_region; }
 
 /// Inverse of `Cur::simple9` (decoder @0xcdb3bc / @0xcdc908, mode in bits 28..32). Greedy: emit the
 /// largest-count mode whose value window fits its bit width (mode 9 = fewest values, widest).
-fn encode_simple9(v: &[u32]) -> Vec<u32> {
+pub(crate) fn encode_simple9(v: &[u32]) -> Vec<u32> {
     const MODES: [(u32, usize, usize); 9] = [
         (1, 28, 1), (2, 14, 2), (3, 9, 3), (4, 7, 4), (5, 5, 5),
         (6, 4, 7), (7, 3, 9), (8, 2, 14), (9, 1, 28),
@@ -65,7 +66,7 @@ fn encode_simple9(v: &[u32]) -> Vec<u32> {
 }
 
 /// Re-encode a numeric stream (`decode_u32`). `None` = authoring packing not yet pinned.
-fn encode_numeric(v: &[u32], code: u32) -> Option<Vec<u8>> {
+pub(crate) fn encode_numeric(v: &[u32], code: u32) -> Option<Vec<u8>> {
     let mut o = Vec::new();
     match code {
         0x11 => for &x in v { o.extend_from_slice(&x.to_le_bytes()) },
@@ -99,7 +100,7 @@ fn encode_numeric(v: &[u32], code: u32) -> Option<Vec<u8>> {
 }
 
 /// Re-encode a bitmap stream (`bitfield`).
-fn encode_bitmap(bits: &[bool], code: u32) -> Option<Vec<u8>> {
+pub(crate) fn encode_bitmap(bits: &[bool], code: u32) -> Option<Vec<u8>> {
     let mut o = Vec::new();
     match code {
         0x01 => {
@@ -128,6 +129,7 @@ pub fn encode_row(values: &[u32], bits: &[bool], code: u32) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Debug)]
 pub struct Mismatch {
     pub block: usize,
     pub row: usize,

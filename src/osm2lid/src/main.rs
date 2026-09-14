@@ -6,12 +6,15 @@
 // Both match the exact schemas the car reads (LID_format.md §3 / §10.5) and are validated
 // by the reader `lid2dump` (round-trip). Coordinates are PAU = deg * 2^31 / 180.
 //
-// Scope note: writes the SQLite half (cities + POIs) AND the street name-list half
-// (`LID20006.DAT`, the ASF columnar trie, §12) built by `src/lid_format::encode`. House-number
-// GenAttr (+20000) and point-address (`PA_%05u`) tables are still pending. The street name-list is
-// validated by the reader `lid2dump` (full OSM -> LID -> dump round-trip, position- and name-exact).
+// Scope note: writes the SQLite half (cities + POIs), the street + city name-lists
+// (`LID20006.DAT` / `LID20000.DAT`, the ASF columnar trie, §12) built by `src/lid_format::encode`, and the
+// house-number GenAttr half (`LID40006.DAT`, §11.6) built by `src/lid_format::write` from OSM
+// `addr:housenumber` objects joined to their `addr:street`. Point-address (`PA_%05u`) tables and crossing
+// (+10000) files are still pending. The street/city name-lists are validated by `lid2dump`
+// (full OSM -> LID -> dump round-trip, position- and name-exact); the GenAttr writer is validated offline by
+// `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle + a device read-model round-trip).
 //
-// Usage: osm2lid <in.osm.pbf|in.osm> -o OUTDIR [--region POL] [--lang 22] [--bbox W,S,E,N] [--no-poi]
+// Usage: osm2lid <in.osm.pbf|in.osm> -o OUTDIR [--region POL] [--lang 22] [--bbox W,S,E,N] [--no-poi] [--no-genattr]
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -44,11 +47,12 @@ struct Data {
     places: Vec<(String, (i64, i64), String)>, // (name, coord, place-kind)
     pois: Vec<(String, (i64, i64))>,           // (name, coord)
     streets: Vec<(String, Vec<i64>)>,          // (name, node refs) — Phase-2 (not emitted)
+    addrs: Vec<(String, (i64, i64), String)>,  // (housenumber, coord, street) — GenAttr source
 }
 
 impl Data {
     fn new() -> Data {
-        Data { nodes: HashMap::new(), places: Vec::new(), pois: Vec::new(), streets: Vec::new() }
+        Data { nodes: HashMap::new(), places: Vec::new(), pois: Vec::new(), streets: Vec::new(), addrs: Vec::new() }
     }
 }
 
@@ -60,6 +64,7 @@ fn main() {
     let mut lang: i64 = 22;
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
     let mut no_poi = false;
+    let mut no_genattr = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -68,6 +73,7 @@ fn main() {
             "--lang" => { i += 1; lang = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(lang); }
             "--bbox" => { i += 1; bbox = args.get(i).and_then(|s| parse_bbox(s)); }
             "--no-poi" => no_poi = true,
+            "--no-genattr" => no_genattr = true,
             "-h" | "--help" => { usage(); exit(0); }
             other => input = Some(other.to_string()),
         }
@@ -90,8 +96,8 @@ fn main() {
         parse_osm_xml(&input, &mut data);
     }
     eprintln!(
-        "parsed: {} nodes, {} places, {} POIs, {} street-name ways",
-        data.nodes.len(), data.places.len(), data.pois.len(), data.streets.len()
+        "parsed: {} nodes, {} places, {} POIs, {} street-name ways, {} addr:housenumber objects",
+        data.nodes.len(), data.places.len(), data.pois.len(), data.streets.len(), data.addrs.len()
     );
 
     let outdir = Path::new(&out);
@@ -100,13 +106,15 @@ fn main() {
     let npoi = write_glob_poi(&outdir.join("GLOB_POI.DAT"), &data, region_id, lang, bbox, !no_poi);
     let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
     let ncit = write_cities(&outdir.join("LID20000.DAT"), &data, bbox);
-    let nst = write_streets(&outdir.join("LID20006.DAT"), &data, bbox);
+    let (st_entries, street_idx) = collect_street_entries(&data, bbox);
+    let nst = write_name_list(&outdir.join("LID20006.DAT"), &st_entries);
+    let naddr = if no_genattr { 0 } else { write_gen_attr(&outdir.join("LID40006.DAT"), &data, bbox, &street_idx) };
 
     eprintln!(
-        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20000.DAT ({} cities), LID20006.DAT ({} streets), REGION_ID=0x{:03x} ({})",
-        out, npoi, ncity, ncit, nst, region_id, region.to_uppercase()
+        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20000.DAT ({} cities), LID20006.DAT ({} streets), LID40006.DAT ({} house numbers), REGION_ID=0x{:03x} ({})",
+        out, npoi, ncity, ncit, nst, naddr, region_id, region.to_uppercase()
     );
-    eprintln!("NOTE: house-number GenAttr (+20000) and point-address (PA) tables are not generated yet — see LID_format.md §12.");
+    eprintln!("NOTE: crossing (+10000) and point-address (PA) tables are not generated yet — see LID_format.md §12.");
 }
 
 fn usage() {
@@ -115,14 +123,18 @@ fn usage() {
         \t--region POL   content region code (sets REGION_ID = regionIdent)\n\
         \t--lang 22      LANG_IDX tag written on GLOB_POI rows (language index)\n\
         \t--bbox W,S,E,N keep only entries within this lon/lat box\n\
-        \t--no-poi       skip amenity/shop/tourism POIs (cities only)"
+        \t--no-poi       skip amenity/shop/tourism POIs (cities only)\n\
+        \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file"
     );
 }
 
 // --------------------------------------------------------------------------- OSM parse
 
+// PBF dense-nodes-first ordering is *block*-scoped (primitives per ~16k nodes), not file-global, so a way's
+// nodes may not have streamed yet. Buffer (coordinate + relevant tags) per node, and (refs + relevant tags)
+// per interesting way, resolve refs after the stream closes; tag_node/tag_way then see every way complete.
 fn parse_pbf(path: &str, d: &mut Data) {
-    use pbf_craft::models::{Element, Tag as PbfTag};
+    use pbf_craft::models::Element;
     use pbf_craft::readers::PbfReader;
     fn nd_to_deg(nd: i64) -> f64 {
         if nd < 0 { return -nd_to_deg(-nd); }
@@ -130,6 +142,9 @@ fn parse_pbf(path: &str, d: &mut Data) {
         let frac = nd % 1_000_000_000;
         format!("{}.{:09}", whole, frac).parse::<f64>().unwrap_or_else(|_| nd as f64 / 1e9)
     }
+    const REL: [&str; 8] = ["name", "place", "amenity", "shop", "tourism", "craft", "addr:housenumber", "addr:street"];
+    let mut pnodes: Vec<((i64, i64), HashMap<String, String>)> = Vec::new();
+    let mut pways: Vec<(Vec<i64>, HashMap<String, String>)> = Vec::new();
     let mut reader = PbfReader::from_path(path).unwrap_or_else(|e| panic!("open pbf {path}: {e}"));
     reader
         .read(|_h, el| {
@@ -139,21 +154,36 @@ fn parse_pbf(path: &str, d: &mut Data) {
                     if !n.visible { return; }
                     let c = (deg2pau(nd_to_deg(n.longitude)), deg2pau(nd_to_deg(n.latitude)));
                     d.nodes.insert(n.id, c);
-                    let tags: HashMap<String, String> =
-                        n.tags.iter().map(|t: &PbfTag| (t.key.clone(), t.value.clone())).collect();
-                    tag_node(d, c, &tags);
+                    let mut tags: HashMap<String, String> = HashMap::new();
+                    for t in &n.tags {
+                        let k: &str = &t.key;
+                        let k = if k == "addr:place" { "addr:street" } else { k }; // addr:place fallback
+                        if REL.contains(&k) { tags.insert(k.to_string(), t.value.clone()); }
+                    }
+                    if !tags.is_empty() { pnodes.push((c, tags)); }
                 }
                 Element::Way(w) => {
                     if !w.visible { return; }
-                    let ids: Vec<i64> = w.way_nodes.iter().map(|wn| wn.id).collect();
-                    let tags: HashMap<String, String> =
-                        w.tags.iter().map(|t: &PbfTag| (t.key.clone(), t.value.clone())).collect();
-                    tag_way(d, ids, &tags);
+                    let mut tags: HashMap<String, String> = HashMap::new();
+                    for t in w.tags.iter() {
+                        let k: &str = &t.key;
+                        let k = if k == "addr:place" { "addr:street" } else { k };
+                        if k == "addr:housenumber" || k == "highway" || k == "name" || (k == "addr:street" && w.tags.iter().any(|t2| t2.key == "addr:housenumber")) {
+                            tags.insert(k.to_string(), t.value.clone());
+                        }
+                    }
+                    let street = tags.contains_key("highway") && tags.contains_key("name");
+                    let addr = tags.contains_key("addr:housenumber") && tags.contains_key("addr:street");
+                    if street || addr {
+                        pways.push((w.way_nodes.iter().map(|wn| wn.id).collect(), tags));
+                    }
                 }
                 Element::Relation(_) => {}
             }
         })
         .unwrap_or_else(|e| panic!("read pbf {path}: {e}"));
+    for (c, tags) in pnodes { tag_node(d, c, &tags); }
+    for (ids, tags) in pways { tag_way(d, ids, &tags); }
 }
 
 fn parse_osm_xml(path: &str, d: &mut Data) {
@@ -208,14 +238,28 @@ fn tag_node(d: &mut Data, c: (i64, i64), t: &HashMap<String, String>) {
             d.pois.push((name.clone(), c));
         }
     }
+    if let Some(num) = t.get("addr:housenumber") {
+        if let Some(street) = t.get("addr:street").or_else(|| t.get("addr:place")) {
+            d.addrs.push((num.clone(), c, street.clone()));
+        }
+    }
 }
 
 fn tag_way(d: &mut Data, ids: Vec<i64>, t: &HashMap<String, String>) {
     if ids.len() < 2 { return; }
-    // Street name-lists are Phase 2; we still parse them for reporting.
     if t.contains_key("highway") {
         if let Some(name) = t.get("name") {
-            d.streets.push((name.clone(), ids));
+            d.streets.push((name.clone(), ids.clone()));
+        }
+    }
+    // address on a building/entrance way: street from tags, coordinate = node centroid
+    if let (Some(num), Some(street)) = (t.get("addr:housenumber"), t.get("addr:street").or_else(|| t.get("addr:place"))) {
+        let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
+        for &r in &ids {
+            if let Some(c) = d.nodes.get(&r) { sx += c.0; sy += c.1; k += 1 }
+        }
+        if k > 0 {
+            d.addrs.push((num.clone(), (sx / k, sy / k), street.clone()));
         }
     }
 }
@@ -282,13 +326,13 @@ fn write_db_city(path: &Path, d: &Data, region_id: u16, bbox: Option<(f64, f64, 
     id as usize
 }
 
-/// Emit a street name-list (`LID2*` ASF columnar trie, §12) from the parsed highway `name` ways.
-/// Each unique street name becomes one element at its way centroid (absolute PAU; block origin 0).
-/// Written bytes are exactly the format `lid_format::read` (and the car's `NLProcessor`) parses.
-fn write_streets(path: &Path, d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> usize {
+/// Collect the *unique* street name-list entries (same dedup/centroid as before) **and** the
+/// `name -> element index` map that `LID20006.DAT` encodes — the GenAttr writer must join house numbers
+/// through *this* index, exactly like the author's tooling keyed its street-domain columns.
+fn collect_street_entries(d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> (Vec<lid_format::NameEntry>, HashMap<String, u32>) {
     use lid_format::NameEntry;
-    let mut seen: HashSet<String> = HashSet::new();
     let mut entries: Vec<NameEntry> = Vec::new();
+    let mut idx: HashMap<String, u32> = HashMap::new();
     for (name, refs) in &d.streets {
         let nm = name.trim();
         if nm.is_empty() || nm.contains('\0') { continue }
@@ -299,12 +343,101 @@ fn write_streets(path: &Path, d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> u
         if k == 0 { continue }
         let (cx, cy) = (sx / k, sy / k);
         if !in_bbox((cx, cy), bbox) { continue }
-        if !seen.insert(nm.to_string()) { continue } // dedup by name (keep first occurrence)
+        if idx.contains_key(nm) { continue } // dedup by name (keep first occurrence)
+        idx.insert(nm.to_string(), entries.len() as u32);
         entries.push(NameEntry { label: nm.to_string(), x_pau: cx as i32, y_pau: cy as i32 });
     }
-    let bytes = lid_format::encode(&entries);
+    (entries, idx)
+}
+
+fn write_name_list(path: &Path, entries: &[lid_format::NameEntry]) -> usize {
+    let bytes = lid_format::encode(entries);
     if fs::write(path, &bytes).is_err() { eprintln!("write {path:?} failed"); return 0 }
     entries.len()
+}
+
+/// Housenumber "12" → 12; "12A"/"3/5"/"31a"/"" → None (stock GenAttr is a *numeric* record column;
+/// suffixed/compound numbers have no place in the `u32` number column — author tooling dropped them too).
+fn hnr_number(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { s.parse().ok() } else { None }
+}
+
+/// GenAttr house-number attribute block chunk size (elements per TOC block; stock ≈7300, 134 blocks).
+const HN_ATTR_CHUNK: usize = 8192;
+
+/// Emit `LID40006.DAT` — the house-number GenAttr file (+20000, §11.6). One record element per
+/// numeric `addr:housenumber` joined to a street in `LID20006`; blocks chunk the element range and carry
+/// the four columns the device reads per record (`+0x28` 0xc01 street→addr, `+0x7c` 0x002 addr→street,
+/// `+0x300` 0x00c number range, `+0x280` 0xc0a parity bits) as existence/counts/values triples.
+fn write_gen_attr(path: &Path, d: &Data, bbox: Option<(f64, f64, f64, f64)>, street_idx: &HashMap<String, u32>) -> usize {
+    use std::collections::BTreeMap;
+    use lid_format::write::{write_gen_attr_file, BlockData, ColData};
+
+    // Address elements: keep only numeric numbers whose street is in the street name-list.
+    let mut addrs: Vec<u32> = Vec::new(); // addr elem id -> number; parallel `st_of` below
+    let mut st_of: Vec<u32> = Vec::new(); // addr elem id -> its street element id
+    for (num, c, street) in &d.addrs {
+        let st = street.trim();
+        if !in_bbox(*c, bbox) { continue }
+        let Some(sid) = street_idx.get(st).copied() else { continue };
+        let Some(n) = hnr_number(num) else { continue };
+        addrs.push(n);
+        st_of.push(sid);
+    }
+    let nel = addrs.len() as u32;
+    if nel < 2 { return 0; } // the file format is meaningless with < 2 records; GenAttr files need >=2 blocks
+
+    // Adaptive chunking: always emit >= 2 blocks (the container's block-TOC requires a tiling of >= 2).
+    let chunk = HN_ATTR_CHUNK.min(nel.div_ceil(2) as usize).max(1);
+
+    // Street -> addr elements (global), ascending street -> ascending elem ids.
+    let mut by_street: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (e, &sid) in st_of.iter().enumerate() {
+        by_street.entry(sid).or_default().push(e as u32);
+    }
+    let all_streets: Vec<u32> = by_street.keys().copied().collect();
+    let nstreet = all_streets.len() as u32;
+    let is_st = |id: u32| all_streets.binary_search(&id).unwrap_or(usize::MAX);
+
+    let mut blocks = Vec::new();
+    for lo in (0..nel as usize).step_by(chunk) {
+        let hi = (lo + chunk).min(nel as usize);
+        // per-street slices within [lo,hi)
+        let mut counts = Vec::new();
+        let mut values = Vec::new();
+        let mut exists: Vec<bool> = vec![false; nstreet as usize];
+        for (&sid, elems) in &by_street {
+            let s = elems.partition_point(|&x| (x as usize) < lo);
+            let t = elems.partition_point(|&x| (x as usize) < hi);
+            if let Some(p) = all_streets.get(is_st(sid)) {
+                if *p != sid { continue; } // unreachable; all_streets contains all keys
+            }
+            exists[is_st(sid)] = t > s;
+            counts.extend(std::iter::repeat((t - s) as u32).take(1).filter(|_| t > s));
+            values.extend(&elems[s..t]);
+        }
+        let nums = &addrs[lo..hi];
+        let parity = nums.iter().map(|&n| n % 2 == 0).collect::<Vec<_>>();
+        let streets_in_block = st_of[lo..hi].to_vec();
+        let cols = vec![
+            ColData { selector: 0xc01, domain: nstreet, exists, counts, values,
+                code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+            ColData { selector: 0x002, domain: (hi - lo) as u32, exists: vec![true; hi - lo],
+                counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x11,
+                range_from_to: Some((streets_in_block.clone(), streets_in_block)) },
+            ColData { selector: 0x00c, domain: (hi - lo) as u32, exists: vec![true; hi - lo],
+                counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x11,
+                range_from_to: Some((nums.to_vec(), nums.to_vec())) },
+            ColData { selector: 0xc0a, domain: (hi - lo) as u32, exists: parity,
+                counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x14,
+                range_from_to: None },
+        ];
+        blocks.push(BlockData { elem_start: lo as u32, elem_end: (hi - 1) as u32, cols });
+    }
+    let bytes = write_gen_attr_file(nel, &[], &blocks);
+    if fs::write(path, &bytes).is_err() { eprintln!("write {path:?} failed"); return 0 }
+    nel as usize
 }
 
 /// Emit a city/locality name-list (`LID20000.DAT`, the settlement ASF name-list) from the parsed

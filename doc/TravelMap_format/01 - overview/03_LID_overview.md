@@ -41,9 +41,11 @@ All under `DATA/LID/CCP/<REGION>/`, where `<REGION>` is one of the 16 content re
 
 | File(s) | Plain-language role | Analogy |
 |---------|---------------------|---------|
-| `LID2nnnn.DAT` | **The address name-lists — this is what address search reads.** Batched *names* by kind (cities in one file, streets in another), each tied to a location. The *same* file slot is reused, offset by file-number, for the extras: **+10000 = crossings**, **+20000 = house-number attributes** for that street list. | The phone book: "name → where". |
+| `LID2nnnn.DAT` | **The address name-lists — this is what address search reads.** Batched *names* by kind (cities in one file, streets in another), each tied to a location. | The phone book: "name → where". |
+| `LID(n+10000).DAT` (same slot, +10000) | **Crossings** for that list — where a street crosses/meets another (the intersection points used when you search for a crossing). A *different* container from the name-list (§4.4). *(Our reader/writer treats these as out of scope.)* | Street-corner map in the back of the phone book. |
+| `LID(n+20000).DAT` (same slot, +20000) | **House-number attributes (GenAttr).** For each street: which house numbers exist, their even/odd sides, and — keyed by an address *element* — the exact number, its name and a *record→street* join. This is what lets *"Wiślna 12"* resolve. | The number-range sidebar next to the street entry ("4–14 even, 1–9 odd"). |
 | `LID0nnnn.DAT` | **Landmark / map-object content** (`fm_tcl` blocks). Named POIs (churches, monuments…) and drawn shapes with a shared text pool. *Not* the city/street search source. | The illustrated entries next to the phone-book entry. |
-| `LID3/4/5nnnn.DAT` | **Map objects.** The actual shapes drawn/anchored on the map (points, lines, areas) with their labels. | More illustrated entries. |
+| other `LID3/4/5nnnn.DAT` | **Map objects.** The actual shapes drawn/anchored on the map (points, lines, areas) with their labels — i.e. `LID3/4/5` whose number is *not* a name-list slot shifted by +10000/+20000. | More illustrated entries. |
 | `GLOB_POI.DAT` | **POI search index** — a small SQLite database, a searchable table of named points (fuel, hotels, churches, airports…). | The yellow-pages search box. |
 | `DB_CITY.DAT` | *(optional)* **Global city index** — a SQLite table of every city with its position and ZIP. Used for country-wide city/ZIP lookup when present. *(Absent on the reviewed EUR card, so the regional name-lists carry all city lookup.)* | The nationwide city directory. |
 | `RELnnnnn.DAT` | **Relations.** Links like *"this street belongs to that city"* or *"this is a district of that city."* | The cross-references between phone-book entries. |
@@ -118,17 +120,46 @@ single most important thing to get right in a converter:
 - Where a name has two spellings (a folded ASCII form and a proper accented form) they are stored together
   in the trie separated by a tab byte; the car shows the accented one.
 
-### 4.4 The two containers, corrected
+### 4.4 The container is shared; the *sub*-header is not (corrected)
 
-Open a file and you notice two different first-bytes signatures:
+All the address files share the same **outer header** (the region-id / opening bytes); what *differs* is the
+sub-header read immediately after it, so the *same* file-opening signature hides **three unrelated layouts**.
+This is the most converter-relevant subtlety in LID:
 
-- `LID2/3/4/5…` open with the **region id** (`04 02` = 1026 for POL) — this is the container **address
-  search** walks (the trie/column name-lists live in the `LID2` files here).
-- `LID0…` (and `CONNECT.DAT`) open with `0d 00` — the container for the **landmark-POI / `fm_tcl`** content
-  (§4.6), *not* the address search source.
+- **Name-lists** (the `LID2` cities + streets a search reads) carry, after the header, a *section table* —
+  a list of block positions — and each block is the **trie + parallel columns** of §4.3.
+- **Crossings** and **GenAttr house-number attributes** (a name-list's own slot shifted **+10000** / **+20000**)
+  share that outer header too, but the car reads them with **different sub-parsers**:
+  - crossings: a compact *street-pair index* (which street meets which);
+  - GenAttr: a block TOC (`elem_start / elem_end / block_off` entries that *tile* the element range) whose blocks
+    hold **attribute-vector columns** keyed by an *address* element (see §4.4b).
+- **Landmark / `fm_tcl` content** (`LID0…`, and `CONNECT.DAT`, open differently) uses an entirely distinct
+  block→sequence→record nesting (§4.5) — *not* the address search source.
 
-The `04 02` region id is the same `0x402` "regionIdent" used elsewhere in the system — one region, one id.
-So although an older note called `LID0` "the gazetteer", **address search actually reads the `LID2` files**.
+So "it opens like a name-list" ≠ "it *is* a name-list": opening a **+20000** GenAttr file with the name-list
+reader returns garbage, because the *second* header uses a different format. The region id (`04 02` = 1026
+for POL) at the very start is the same `0x402` "regionIdent" used everywhere — one region, one id.
+
+### 4.4b How the **+20000** GenAttr file answers "this street has numbers 2, 4…88, even"
+
+Inside the GenAttr file sits a **block TOC** (`start / end / offset` entries that *tile without gaps* the
+element range 0…) — the reliable "this is a GenAttr, not a name-list" signal. Each block then describes a run
+of **address elements** (one record per house-numbered point, *not* per street) as attribute columns; the car
+pulls a street's numbers through a small **fixed join**:
+
+- **Which street owns each number (reverse, the browse path):** a per-street column lists the **address-element
+  ids** that street owns (existence bitmap + per-street count + the concatenated ids) → "give me Wiślna's
+  numbers" = the street's slice of that list.
+- **The number range (forward, each address):** a per-address *range* column holds the actual house **number**
+  (and its even/odd + interpolation flags).
+- **Which street each address belongs to (the record→street join):** `address → owner-descr index → list of
+  street elements`; the UI then resolves each street element back to its `LID2` name.
+
+Each column is a *triple* of byte-streams with an author-convention `param`: an existence bitmap (over a domain
+of elements), a *cumulative-count* stream, and the values — a tiny per-element "does it exist / how many bytes /
+what are they". Our `src/lid_format/` reader decodes all of the above against `POL/LID40006`; and the **byte
+encoders are proven device-faithful** — re-encoding every read block reproduces the authoring tool's bytes
+exactly (133 blocks), so the `write.rs` writer's output is byte-valid for the device.
 
 ### 4.5 Blocks, entries, and columns
 
@@ -182,7 +213,8 @@ detail the reader has *not* yet pinned — see `LID_format.md` §12.5. It cancel
 write→read round-trip, so relative positions are exact.)
 
 A search that wants "cities" reads the city `LID2` file; "streets" reads the street `LID2` file; a house
-number also pulls the general-attribute columns in the **+20000** file.
+number also walks the **+20000** GenAttr file's record→street join + number-range columns (§4.4b) — that file is a
+*different* container, so a name-list reader cannot read it.
 
 ---
 
@@ -193,8 +225,10 @@ number also pulls the general-attribute columns in the **+20000** file.
    position (or, if `DB_CITY.DAT` existed, its position there).
 3. Match **Wiślna** in the kind-3 street name-list → a street element.
 4. Use `REL` (relation type "street-in-city") to confirm Wiślna really belongs to Kraków.
-5. Read the street's house-number attributes: even/odd rule and range; pick **12**; take the exact point
-   from a `PA` file, or interpolate it along Wiślna between 10 and 14.
+5. Read the street's **GenAttr house-number attributes** (the **+20000** file, §4.4b): the street's *address-*
+   element list yields the range/even-odd; pick **12**; take the exact point from a `PA` file, or interpolate it
+   along Wiślna between 10 and 14. (The same file also carries the *record→street* join the result list uses to
+   name/address each point.)
 6. Hand the resulting PAU coordinate to the router (RNW). Search done.
 
 Every LID file you read about above exists to make one of those six steps work.
@@ -212,8 +246,9 @@ Every LID file you read about above exists to make one of those six steps work.
 - **Trie (name-list)** — the tree of shared name prefixes that address search reads; one leaf = one entry.
 - **Attribute column** — one per-entry attribute (position, belonging city, "has house numbers"…) laid
   across a block, compressed on its own.
-- **+10000 / +20000 file band** — the *crossing* / *house-number-attribute* variants of a name-list file
-  (same file slot, file-number shifted).
+- **+10000 / +20000 file band** — the *crossing* / *house-number-attribute(GenAttr)* variants of a name-list
+  file *slot* (same slot number, file-number shifted). Same outer header, **different sub-header**, so each
+  needs its own reader (§4.4).
 - **Block / sequence / record** — the *landmark* `LID0` nesting (chunk → typed list → one entry). Address
   name-lists nest as block → trie + columns (§4.5).
 - **Bounding box** — a block's lat/lon rectangle; lets the car skip irrelevant blocks.
@@ -225,11 +260,13 @@ Every LID file you read about above exists to make one of those six steps work.
 - **Interpolation** — guessing a house-number position along a street when no exact point exists.
 
 > **Converter takeaway:** OSM → LID means writing the city and street `LID2` name-lists as **tries** with
-> their position/belonging columns (the reader and writer in `src/lid_format/` already do this and are
-> round-trip validated), the `REL` city links, the SQLite `GLOB_POI` table, and — for house numbers — the
-> **+20000** general-attribute columns plus optional `PA` exact points (the reader in `src/lid_format/` now
-> decodes the **+20000** file's block/column structure too; only its *writer* and `PA`/`REL` remain). Roads
-> come from RNW/MAP —
-> **addresses always come from LID.** On the reviewed card `DB_CITY.DAT` is absent, so the regional `LID2`
-> name-lists are the *only* thing that makes city/street search work: skip them and the address field keeps
-> using the stale stock data.
+> their position/belonging columns (reader + writer in `src/lid_format/`, round-trip validated), the `REL` city
+> links, the SQLite `GLOB_POI` table, and — for house numbers — **writing the correct **+20000** GenAttr file
+> (§4.4b)**. The GenAttr *format* is solved both ways: the reader decodes it from `POL/LID40006` and the
+> **writer (`src/lid_format/src/write.rs`) is now byte-valid** — its column encoders reproduce the authoring
+> tool's bytes exactly over 27 MB (133 blocks), and a synthetic write round-trips through the car's member-lookup
+> path. What's left for a *refreshed* house-number path is the OSM→file **data join**: mapping each
+> `addr:housenumber` object to a street element + a LID3 crossing/address element so the block can actually be
+> filled. Roads come from RNW/MAP — **addresses always come from LID.** On the reviewed card `DB_CITY.DAT` is
+> absent, so the regional `LID2` name-lists are the *only* thing that makes city/street search work: skip them
+> and the address field keeps using stale stock data.

@@ -13,6 +13,7 @@
 //! `NLBlock::ProcessNode`. See LID_format.md (ASF section).
 
 mod rebuild;
+pub mod write;
 
 /// PAU = "position angle unit": deg * 2^31 / 180 (signed 32-bit).
 pub const PAU: f64 = (1i64 << 31) as f64 / 180.0;
@@ -34,7 +35,7 @@ fn put_u32(v: Vec<u8>, x: u32) -> Vec<u8> { let mut v = v; v.extend_from_slice(&
 /// Encode one integer with the custom `ReadVle` (`00cdb218`) stream format (inverse of `Cur::vle`).
 /// value = final_byte + 128*(bijective-base-128 continuation chunks); continuations are high-bit-set
 /// bytes emitted most-significant first, then a high-bit-clear final byte.
-fn vle_encode(v: u32) -> Vec<u8> {
+pub(crate) fn vle_encode(v: u32) -> Vec<u8> {
     let mut cont: Vec<u8> = Vec::new();
     let mut w = v / 128;
     while w > 0 {
@@ -183,7 +184,7 @@ fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u3
 }
 
 /// Decode a `NLBitfieldDecoder` bitmap of `n` bits.
-fn bitfield(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<bool> {
+pub(crate) fn bitfield(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<bool> {
     let mut bits = vec![false; n];
     let end = end.min(b.len());
     match code {
@@ -938,6 +939,63 @@ mod tests {
             );
         }
         assert_eq!(ok, nblocks, "all blocks must byte-rebuild exactly");
+    }
+
+    /// Synthetic GenAttr HnR block: streets -> addr lists, addr -> number range, addr -> owner street-desc,
+    /// parity. Write -> `read_gen_attr`/`decode_block` -> replay the car's member lookups and assert the
+    /// answers match what we encoded. Proves `write` is byte-valid *and* read-model-consistent offline
+    /// (the LID2 element-id join itself is external — these use block-internal street-desc indices).
+    #[test]
+    fn gen_attr_writer_roundtrip_device_model() {
+        use crate::write::{write_gen_attr_file, BlockData, ColData};
+        // block0: elems 0..1 (addrs 0,1); street-list = 2 streets -> addrs {0,1}/{2,3-per-blk0:false}.
+        let mk = |e0: u32, e1: u32, addr0: u32, addr1: u32| BlockData {
+            elem_start: e0, elem_end: e1,
+            cols: vec![
+                // +0x28 (0xc01) street -> addr list. street0 owns both addrs, street1 none.
+                ColData { selector: 0xc01, domain: 2, exists: vec![true, false],
+                          counts: vec![2], values: vec![addr0, addr1],
+                          code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+                // +0x4d0 (0xc13) owner-descr -> street-desc list (addr idx = owner-descr, 1:1).
+                ColData { selector: 0xc13, domain: 2, exists: vec![true, true],
+                          counts: vec![1, 2], values: vec![0, 1],
+                          code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+                // +0x300 (0x00c) Range<u32> number per addr.
+                ColData { selector: 0x00c, domain: 2, exists: vec![true, true],
+                          counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x11,
+                          range_from_to: Some((vec![addr0 * 10, addr1 * 10], vec![addr0 * 10, addr1 * 10])) },
+                // +0x280 (0xc0a) tBitArray per-addr parity-even existence.
+                ColData { selector: 0xc0a, domain: 2, exists: vec![true, false],
+                          counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+            ],
+        };
+        let file = write_gen_attr_file(4, &[], &[mk(0, 1, 0, 1), mk(2, 3, 2, 3)]);
+
+        let gi = read_gen_attr(&file).expect("self-written file must re-parse");
+        assert_eq!(gi.element_count, 4);
+        assert_eq!(gi.blocks.len(), 2);
+        let (ok, mm) = crate::rebuild::rebuild_all(&file);
+        assert!(mm.is_none(), "self-written file must byte-rebuild: {mm:?}");
+        assert_eq!(ok, 2);
+
+        for (bi, (a0, a1)) in [(0usize, (0u32, 1u32)), (1, (2, 3))] {
+            let blk = gi.decode_block(&file, bi).unwrap();
+            let st = |col: u32, flag: u32| blk.streams.iter().find(|s| s.col == col && s.flags == flag)
+                .unwrap_or_else(|| panic!("blk {bi} missing col {col:03x}/{flag:04x}"));
+            // +0x28: street0 -> [addr0, addr1].
+            let ex = st(0xc01, 0x4000); let off = st(0xc01, 0x8000); let val = st(0xc01, 0);
+            assert_eq!(ex.bits, vec![true, false]);
+            assert_eq!(&val.values[..off.values[0] as usize], [a0, a1], "blk {bi} street0 addr list");
+            // +0x4d0: owner-descr(addr idx) -> street-desc.
+            let ooff = st(0xc13, 0x8000); let oval = st(0xc13, 0);
+            assert_eq!(oval.values, vec![0, 1]);
+            assert_eq!(&oval.values[..ooff.values[0] as usize], [0]); // addr0 -> street-desc 0
+            // +0x300 Range number.
+            assert_eq!(st(0x00c, 0x8000).values, vec![a0 * 10, a1 * 10]);
+            assert_eq!(st(0x00c, 0).values, vec![a0 * 10, a1 * 10]);
+            // parity existence.
+            assert_eq!(st(0xc0a, 0x4000).bits, vec![true, false]);
+        }
     }
 
 }

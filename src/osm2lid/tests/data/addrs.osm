@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <node id="100" lat="52.0000" lon="21.0000"/>
+  <node id="101" lat="52.0010" lon="21.0010"/>
+  <node id="102" lat="52.0100" lon="21.0100"/>
+  <node id="103" lat="52.0110" lon="21.0110"/>
+  <node id="1" lat="52.0005" lon="21.0005">
+    <tag k="addr:housenumber" v="10"/>
+    <tag k="addr:street" v="Marszalkowska"/>
+  </node>
+  <node id="2" lat="52.0008" lon="21.0008">
+    <tag k="addr:housenumber" v="11"/>
+    <tag k="addr:street" v="Marszalkowska"/>
+  </node>
+  <node id="3" lat="52.0050" lon="21.0050">
+    <tag k="addr:housenumber" v="11A"/>
+    <tag k="addr:street" v="Marszalkowska"/>
+  </node>
+  <node id="4" lat="52.0105" lon="21.0105">
+    <tag k="addr:housenumber" v="5"/>
+    <tag k="addr:place" v="Nowogrodzka"/>
+  </node>
+  <way id="200">
+    <nd ref="100"/><nd ref="101"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Marszalkowska"/>
+  </way>
+  <way id="201">
+    <nd ref="102"/><nd ref="103"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Nowogrodzka"/>
+  </way>
+</osm>
