@@ -133,6 +133,16 @@ impl<'a> Cur<'a> {
 
 /// Decode a numeric column with `NLStandardDecoder`/`NLValueListDecoder` alphabet.
 fn decode_u32(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
+    decode_u32_c(b, code, start, end, n).0
+}
+
+/// RE-harness probe: same as `decode_u32` but also returns the byte cursor after the last value.
+#[doc(hidden)]
+pub fn decode_u32_probe(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<u32>, usize) {
+    decode_u32_c(b, code, start, end, n)
+}
+
+fn decode_u32_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<u32>, usize) {
     let mut c = Cur { b, p: start, end: end.min(b.len()) };
     let mut out = Vec::with_capacity(n.min(1_000_000));
     match code {
@@ -167,7 +177,7 @@ fn decode_u32(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u3
         }
         _ => for _ in 0..n { if c.eof() { break } out.push(c.ru32()) },
     }
-    out
+    (out, c.p)
 }
 
 fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
@@ -185,15 +195,26 @@ fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u3
 
 /// Decode a `NLBitfieldDecoder` bitmap of `n` bits.
 pub(crate) fn bitfield(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<bool> {
+    bitfield_c(b, code, start, end, n).0
+}
+
+/// RE-harness probe: same as `bitfield` but also returns the byte cursor after the last read.
+#[doc(hidden)]
+pub fn bitfield_probe(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<bool>, usize) {
+    bitfield_c(b, code, start, end, n)
+}
+
+fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<bool>, usize) {
     let mut bits = vec![false; n];
     let end = end.min(b.len());
+    let mut cur = start;
     match code {
-        0x01 => { for i in 0..n { let q = start + (i >> 3); if q >= end { break } bits[i] = b[q] >> (i & 7) & 1 != 0 } }
-        0x02 => { let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = true } } }
-        0x03 => { bits = vec![true; n]; let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = false } } }
+        0x01 => { for i in 0..n { let q = start + (i >> 3); if q >= end { break } bits[i] = b[q] >> (i & 7) & 1 != 0 } cur = (start + (n + 7) / 8).min(end); }
+        0x02 => { let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = true } } cur = c.p; }
+        0x03 => { bits = vec![true; n]; let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = false } } cur = c.p; }
         _ => {}
     }
-    bits
+    (bits, cur)
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +232,10 @@ pub struct NameList {
     pub element_count: u32,
     pub block_count: usize,
     pub elements: Vec<Element>,
+    /// File position origin (PAU) = the `tNLHPosition` the sub-header carries (`hdr+0x10/+0x14`, gated by
+    /// bit16 of `hdr+0x0c`) that every element's X/Y delta is added to. `None` = sub-header says the file
+    /// carries no origins (both fields -1, e.g. POL cities `LID20000` — those get positions elsewhere).
+    pub origin: Option<(i32, i32)>,
 }
 
 /// One `NLBlockTocEntry` of a GenAttr file (fileID+20000): the element index range a block
@@ -416,11 +441,19 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             descs.push(Desc { kind: k & 0xfff, flags: k & 0xf000, code: u16(b, p + 2), off: u32(b, p + 4), param: u32(b, p + 8) });
             p += 12;
         }
-        // data span end for a given descriptor off = next larger descriptor off (or block end)
-        let span_end = |off: u32| -> usize {
-            let mut e = be;
-            for d in &descs { if d.off > off && (bs + d.off as usize) < e { e = bs + d.off as usize } }
-            e
+        // Data span of a descriptor row = [off[i], off[i+1]) in DESCRIPTOR-ROW order; the last row runs
+        // to the block end. Rows sharing an `off` make the *earlier* ones zero-length alias views — this
+        // is the device's streaming rule (same one the byte-exact rebuild oracle uses, section 12.2);
+        // the earlier offset-based "next larger off" rule mis-attributed a column's bytes to its
+        // neighbours whenever several zero-length rows tied (visible garbage on sections of LID20000).
+        let span_end = |d: &Desc| -> usize {
+            let row = descs.iter().position(|x| x.kind == d.kind && x.flags == d.flags && x.off == d.off)
+                .unwrap_or(0);
+            if row + 1 < descs.len() {
+                (bs + descs[row + 1].off as usize).max(bs + d.off as usize)
+            } else {
+                be
+            }
         };
         // helpers to fetch column by (kind,flags)
         let get = |kind: u32, flags: u32| -> Option<&Desc> {
@@ -430,7 +463,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // out-degree column 0x401 (u16)
         let od = match get(0x401, 0) {
             Some(d) => {
-                let mut v = decode_u16(b, d.code, bs + d.off as usize, span_end(d.off), d.param as usize);
+                let mut v = decode_u16(b, d.code, bs + d.off as usize, span_end(d), d.param as usize);
                 v.resize(node_count, 0);
                 v
             }
@@ -467,7 +500,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         let blocklink: Vec<bool> = match get(0x402, 0x4000).or_else(|| get(0x402, 0)) {
             Some(d) => {
                 let nn = (d.param as usize).min(node_count.max(1));
-                let mut v = bitfield(b, d.code, bs + d.off as usize, span_end(d.off), nn);
+                let mut v = bitfield(b, d.code, bs + d.off as usize, span_end(d), nn);
                 v.resize(node_count, false);
                 v
             }
@@ -484,7 +517,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             let bs0 = bs + bd.off as usize;
             blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
             if let Some(offd) = c403.iter().copied().find(|d| d.code != 0x11) {
-                loff = decode_u32(b, offd.code, bs + offd.off as usize, span_end(offd.off), offd.param as usize);
+                loff = decode_u32(b, offd.code, bs + offd.off as usize, span_end(offd), offd.param as usize);
             }
         } else if let Some(bd) = c403.first() {
             let bs0 = bs + bd.off as usize;
@@ -503,18 +536,18 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // (flags 0): NLPositionAttrVector::Decode stores coords = 2*popcount(bitmap) u32 (X,Y pairs);
         // element i with bit set maps to coords[2*rank], coords[2*rank+1], rank = set-bits before i.
         let has_pos = match get(0x407, 0x4000) {
-            Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d.off), elem_count_b),
+            Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d), elem_count_b),
             None => vec![true; elem_count_b],
         };
         let npos = has_pos.iter().filter(|&&x| x).count() * 2;
         let coords = match get(0x407, 0) {
-            Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d.off), npos),
+            Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), npos),
             None => vec![],
         };
         // belonging-name (city): col 0x40c -> bitmap (flags0) + COMPRESSED values (flags 0x4000)
-        let belongs_flag = match get(0x40c, 0) { Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d.off), elem_count_b), None => vec![false; elem_count_b] };
+        let belongs_flag = match get(0x40c, 0) { Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d), elem_count_b), None => vec![false; elem_count_b] };
         let nbel = belongs_flag.iter().filter(|&&x| x).count();
-        let belongs_vals = match get(0x40c, 0x4000) { Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d.off), nbel), None => vec![] };
+        let belongs_vals = match get(0x40c, 0x4000) { Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), nbel), None => vec![] };
 
         // Name accumulation over the trie: node's name = parent's name + its incoming-edge label.
         // Iterate every node as a potential root (forest-safe); children(n) = [childStart[n] ..).
@@ -567,7 +600,13 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         }
     }
 
-    Ok(NameList { element_count: elem_count, block_count: block_off.len(), elements })
+    // tNLHPosition validity: sub-header u32@+0x0c bit 0x0008_0000 (0x080013/0x080001 on stock POL files);
+    // the -1/-1 pair = "file carries no positions" (LID20000 has the flag set but stores -1/-1).
+    let origin = if (u32(b, hdr + 0x0c) & 0x0008_0000) != 0 {
+        let (x, y) = (u32(b, hdr + 0x10) as i32, u32(b, hdr + 0x14) as i32);
+        if x == -1 || y == -1 { None } else { Some((x, y)) }
+    } else { None };
+    Ok(NameList { element_count: elem_count, block_count: block_off.len(), elements, origin })
 }
 
 /// Element order exactly mirroring `NLAsfBlock::CalculateTerminatingElementIndex` +

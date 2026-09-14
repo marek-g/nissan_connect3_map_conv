@@ -665,6 +665,10 @@ descriptor per sub-stream. CONFIRMED mapping in the `SetDescription` bodies (`00
 - Column **`0x8403`** (flags `0x8000`, VLE) = the **charset codebook** (byte-code → character incl. multibyte).
   In `POL/LID20006` labels are literal bytes (UTF-8 decodes correctly), so the codebook is not needed to
   reproduce these names; **UNKNOWN (minor):** when a charset-code mapping would apply.
+- **Descriptor stream lengths:** `NLAsfBlock::enSetListDescriptions` `00cdc0c0` computes each stream as
+  `len = off[next_row] − off[this_row]` in **descriptor-row order** (the next row's `off`, not the next
+  *distinct* one), so equal-`off` rows = a zero-length view. The byte-exact rebuild oracle matches this rule;
+  `read` now uses it too (the old "next strictly-greater `off`" rule mis-assigned bytes for tied rows).
 
 **12.5 Positions** (`NLPositionAttrVector::Decode` `00cdd7dc`, column **`0x407`**) — CONFIRMED:
 `flags=0x4000` sub-stream = **bitmap** (`NLBitfieldDecoder`, code `0x03` = VLE-clear) over `element_count` of
@@ -672,10 +676,19 @@ which elements have a position; `flags=0` sub-stream = **COMPRESSED interleaved 
 values, and element `i` (bit set) maps to `coords[2·rank]`,`coords[2·rank+1]` where `rank` = set bits before `i`
 (`Decode` stores an index vector `= rank<<1` at `+0x20`, `+0x40`=`popcount`). Element position =
 **block origin + (X, Y)**. Verified: values ≈ PAU deltas from origin (first block0 entry `X=233844` ≈ +0.0196°).
-**UNKNOWN (only remaining):** the block **geo origin** (`tNLHPosition`, stored at `+0x48/0x4c`) source — passed
-into `enReadAsfBlock`/`SetDataBlock`/`Decode` from the block-data-container's per-block index, **not in the
-block bytes** (the container's per-block tables are `98×3B` + `98×4B`, too small to hold `X,Y`) → a separate
-position index not yet located; **needed only for absolute lon/lat, cancels in writer↔reader round-trip**.
+**RESOLVED (2026-09 — anchor fit on stock `POL/LID20004` + `LID20006`):** the per-block `tNLHPosition` is **NOT
+in the file** — it is the position of the **city being searched**, passed by the address-search client when it
+loads the block (`NLProcessor::enAddNewAsfBlock` `00ceca4c` → `enReadAsfBlock` `00cf4f70` →
+`NLAsfBlock::SetDataBlock`; the container's per-block `sub+0x20/+0x30` `u32` vectors are **RAM** query state,
+which is why they never appear in the block bytes). Proof: for unique street anchors the residual
+`truth − stored` is constant **per city** and equals `city_position − file_corner` for Warsaw/Kraków/Kielce/
+Łódź (±street spread ≈ 1 km); a search for those `u32` city pairs anywhere in the name-list file finds nothing.
+**Stored street coordinate = element position − queried-city position.** The file-level `tNLHPosition` lives in
+the sub-header (`hdr+0x0c` bit `0x0008_0000` = present, `hdr+0x10/0x14` = `X,Y`; on `POL` the values are the
+region's SW corner ≈ 14.12°,49.10°; `LID20000` sets the bit but stores `-1/-1` = "no positions"). It is the
+anchor used by flows **without** a city context (e.g. the settlement gazetteer), so the **writer contract** is:
+one city per block, elements stored as `pos − that_city_position` (the coordinate the device resolves for the
+city), file header = region corner.
 
 **12.6 Hierarchy (city↔street) + element properties** — CONFIRMED accessors, indexed by `element_index`:
 - **belonging name** = parent/city element: `enGetEntryBelongingNameMainElementIndex` `00cdba88` →
@@ -701,8 +714,9 @@ heuristics/filters): container + block table + descriptor TOC (flag sub-streams)
 `CalculateTerminatingElementIndex` element DFS + `0x403` blob/offsets + `0x09` name-variant split +
 `NLPositionAttrVector` (bitmap + rank-compressed PAU) + belonging column. On `POL/LID20006` it decodes
 **883 936 elements / 883 929 with positions / 231 882 unique names**, all real Polish street names with
-diacritics. **Only remaining UNKNOWN:** the per-block **geo origin** for absolute lon/lat (§12.5); position
-deltas are otherwise exact. Verified it is a pure trie (single-parent, all nodes reached).
+diacritics. The former "only remaining UNKNOWN" (the per-block **geo origin**, §12.5) is **RESOLVED**: stored
+coords are deltas from the queried city's position (query-supplied), and `read` also exposes the file-level
+`tNLHPosition` (`NameList.origin`). Verified it is a pure trie (single-parent, all nodes reached).
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
@@ -710,7 +724,9 @@ TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now 
 files (unit tests + `malopolskie` fixtures):
 
 * **streets** (`LID20006.DAT`): one element per unique highway `name` at its way centroid, absolute PAU,
-  block origin 0 — **8828 names → 14 blocks → 8828 elements back**.
+  block origin 0 — **8828 names → 14 blocks → 8828 elements back**. NOTE (§12.5): device-correct output needs
+  **city-grouped blocks** with positions stored **relative to the owning city's position** — currently the
+  writer emits absolute PAU with a null origin, so rework pending.
 * **cities/settlements** (`LID20000.DAT`): one element per unique OSM `place=` name — **10482 names → 12
   blocks → 10482 elements back**, diacritics intact.
 
@@ -728,7 +744,8 @@ the froms so their decode-cumulatives are exact, `0000`=raw-u32 tos), and `0xc0a
 loop): `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle over `POL/LID40006` + device read-model
 round-trip) and `osm2lid/tests/genattr.rs`, which runs the real binary on a tiny fixture and re-reads every
 column with `read_gen_attr`/`decode_block`. **Still pending:** `PA`, `REL`, crossing files (+10000), and the
-absolute block-origin (§12.5); the on-device `NLHnrToTree` matcher itself cannot be run here.
+city-grouped / city-relative positions in `encode` (§12.5); the on-device `NLHnrToTree` matcher itself cannot
+be run here.
 
 > **Corrected decoder notes (were wrong in earlier revisions):**
 > - **Simple9 mode→(count,bits)** (from `DecodeSimple9` `00cdc3bc`/`00cdc908`, values LSB-first, mode nibble
@@ -757,9 +774,9 @@ absolute block-origin (§12.5); the on-device `NLHnrToTree` matcher itself canno
   text_id@+0x14), the text pool, and the ~16 POI categories (→ `CAT_ID`).
 
 **Not fully decoded (active frontier = the ASF address name-list, §12):**
-1. **Block geo origin** (`tNLHPosition`, §12.5) — the per-block absolute-coordinate anchor, held in the
-   block-data-container's block index (not in the block bytes). Only remaining absolute-lon/lat gap; cancels
-   in writer↔reader round-trip.
+1. **Block geo origin** (`tNLHPosition`, §12.5) — **RESOLVED**: per-block value = the *queried city's*
+   position (client-supplied at block load; RAM-only), file-level value = sub-header corner
+   (`hdr+0x0c/0x10/0x14`). No file table to find.
 2. **Charset codebook** (`0x8403`, §12.4) — when a byte is a charset code vs a literal (labels decode as literal
    UTF-8 on `POL`, so not exercised yet).
 3. **Writer (`osm2lid` + `lid_format::encode`)** — DONE for the **street + city name-lists** (plain trie,
@@ -767,7 +784,7 @@ absolute block-origin (§12.5); the on-device `NLHnrToTree` matcher itself canno
    by full round-trip, **plus the house-number GenAttr `+20000` file** (`LID40006.DAT`, §11.6/§11.6b,
    OSM `addr:housenumber` → street-joined records, validated by `osm2lid/tests/genattr.rs`).
    **Still pending:** point-address `PA` / `REL`, crossing files (+10000),
-   and on-device block geo-origin (§12.5) for absolute coordinates.
+   and the city-grouped / city-relative position encoding in `encode` (§12.5).
 
 > The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**
 > (`0x403` + `0x09` variant split) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all

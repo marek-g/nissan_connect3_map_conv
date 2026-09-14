@@ -207,10 +207,12 @@ These are ordinary SQLite databases — no proprietary encoding, trivially reada
 5. The **attribute columns** — each entry's position, its belonging city, and its flags (has house numbers,
    has crossings, …), one compressed column per attribute.
 
-Positions are stored as small **deltas from a block's origin point**, not as absolute coordinates; the origin
-is looked up from a separate position index at run time. (That per-block origin anchor is the one byte-level
-detail the reader has *not* yet pinned — see `LID_format.md` §12.5. It cancels out in a converter's own
-write→read round-trip, so relative positions are exact.)
+Positions are stored as small **deltas from a per-block origin point**, not as absolute coordinates. The origin
+is now pinned (`LID_format.md` §12.5): for street tiles it is the **position of the city being searched** —
+supplied by the lookup flow when it loads the block, never stored in the name-list — while each file's header
+carries one file-level anchor (the region's corner, `-1/-1` = none, `LID_format.md` §12.5). For a converter
+this means street blocks must be grouped **one city per block**, with positions relative to that city's
+coordinate, so they agree with what the device will assume at query time.
 
 A search that wants "cities" reads the city `LID2` file; "streets" reads the street `LID2` file; a house
 number also walks the **+20000** GenAttr file's record→street join + number-range columns (§4.4b) — that file is a
