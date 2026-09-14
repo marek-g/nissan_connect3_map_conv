@@ -1,0 +1,19 @@
+[package]
+name = "lid_format"
+version = "0.1.0"
+edition = "2021"
+
+# Reader for Bosch TravelMap LID address name-list files (the `LID*.DAT` columnar
+# ASF `NLAsfBlock` format). Decodes the name-list trie/DAWG into a per-element
+# gazetteer: name string + WGS84-ish PAU position (as origin-relative deltas) +
+# hierarchy/category. This is the read-side ground truth used to validate `osm2lid`
+# by round-trip. See doc/TravelMap_format/02 - details/LID_format.md (ASF section).
+
+[lib]
+name = "lid_format"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

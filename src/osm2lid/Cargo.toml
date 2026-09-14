@@ -1,0 +1,23 @@
+[package]
+name = "osm2lid"
+version = "0.1.0"
+edition = "2021"
+
+# OSM (PBF/XML) -> Bosch TravelMap LID address/POI databases (SQLite):
+#   GLOB_POI.DAT (POI gazetteer) + DB_CITY.DAT (global city list).
+# Write-side counterpart of `lid2dump`. See doc/TravelMap_format/02 - details/LID_format.md
+# §3 (GLOB_POI), §10 (OSDE sources), §11 (name-list formats).
+# Streets/house-numbers (LID0 ASF name-lists) are NOT generated yet (Phase 2).
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+quick-xml = { version = "0.42", default-features = false }
+pbf-craft = "1.0"
+lid_format = { path = "../lid_format" }
+
+[[bin]]
+name = "osm2lid"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

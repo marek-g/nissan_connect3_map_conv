@@ -339,8 +339,17 @@ The destination-address lookup runs in the **LISA** name-list subsystem, configu
 ### 10.2 Name-list category ids (CONFIRMED: `bSendListUpdate` `00c74fc8`, tag table `enParseLineForTags` `00c84cfc`)
 
 `2`=CITY · `3`=STREET · `4`=JUNCTION/CROSS · `5`=HOUSENUMBER · `0x3d`(61)=ZIP · `12`=city-district · `9`=state ·
-`0x76`(118)=`OSDE_ADDRESSES` pseudo-category. These are the **sequence `type` byte** (§5, `fm_tclPOISeq`@+1) of
-the `fm_tcl` POI sequences inside `LID0` — i.e. a city/street "name list" *is* a `type`-tagged POI sequence.
+`0x76`(118)=`OSDE_ADDRESSES` pseudo-category. A city/street "name list" is an **ASF block** (§11) carrying the
+names as a string column + positions as a position column; the **category** is fixed by which block/
+relation the search selects (cat 2 city list, cat 3 street list), *not* by a `type` byte inside a flat POI record.
+(The `fm_tcl` `type`-tagged POI sequences of §5/§5b are the **landmark-POI content** blocks; the address
+name-lists use the columnar PSF/ASF layout of §11.)
+
+> **Format reality check.** The address name-lists are a **compressed column-store** (PSF/ASF), materially
+> harder to emit than the `fm_tcl` blocks: each block is a table of typed, independently-compressed columns
+> (codes `0x11`–`0x18`: raw / RLE / bitmap / **LEB128 VLE** / delta-VLE / sparse / **Simple9**), with
+> positions in a dedicated `NLPositionAttrVector`. This is why the plan is **reader (`lid2dump`) first**: it
+> must decode these columns against stock before any writer can be trusted. See §11.
 
 ### 10.3 Category → data source (CONFIRMED unless marked)
 
@@ -393,6 +402,300 @@ address data is POI/city-only. **Road network is not involved** (CONFIRMED — n
 
 ---
 
+## 11. The address name-list internal format = compressed column store (PSF/ASF)  **[MOSTLY DECODED]**
+
+`LID%05u.DAT` (fileType 0x13) is parsed by `NLNameList::LoadHeader` @`00e0e63c` + `NLProcessor::bInitialise`
+@`00cee6e4` + `NLAsfBlock::SetDataBlock` @`00cdf404`. It is a **column store**, not the `fm_tcl` block of §5.
+
+### 11.1 File-id arithmetic within a region (CONFIRMED: `bValidate` `00c83324`)
+
+name-list = `LID%05u` @ `base`; crossing = @ `base+10000`; **GenAttr/HNR = @ `base+20000`**; PA = `PA_%05u`
+(fileType 0x18); relation = `REL_%05u` (fileType 0x16). Name-list / crossing / GenAttr share the **same**
+ASF container + parser.
+
+### 11.2 File header — 38 bytes, no ASCII magic (CONFIRMED)
+
+`+0x00 u16`=format tag (`13` in these files), `+0x02 u16`=region code, `+0x04 u16`=**block count**
+(=the recurring `0d 00` = 13, NOT a binary code), then info u16/u32s; `+0x10 u32`=**hdrSize**, `+0x14 u32`=
+**extraSize**; `+0x18..` five u16 **string offsets** → embedded `LID-COPYRIGHT`/`CREATE DATE`/`SOFTWARE`/… ASCII
+block (the only plaintext in the file). Two compressed **u32 vectors** follow: block **offsets** (obj `+0x9c`)
+and **sizes** (`+0xac`); count in the ASF sub-header `+0x04`.
+
+### 11.3 Block = 8-byte header + column-descriptor TOC + compressed columns (CONFIRMED)
+
+Block header `NLAsfBlock` @`00cdf404`: `u16 total, u16 x, u16 y, u16 ndescr` (leaf count = total−x). Then
+`ndescr` × `NLPSFListDescriptor` **12 bytes** each (`enSetListDescriptions` `00cdc0c0`):
+`{ u16 tag (tag&0xfff = column kind), u16 code/flags, u32 data_offset, u32 param }`; a column's byte span =
+`offset[i+1] − offset[i]` (last = blockEnd−offset). **Column-kind tags:** ASF `0x401…0x416` (0x401 SimpleList
+<u16>, 0x403 EdgeLabelList, 0x404/5 ValueList<u16>, 0x406 SimpleList<u32>, **0x407 PositionAttrVector**,
+0x408–0x40c/0x40e SingleValue<u32>, 0x40d–0x416 Binary/BinList). Block type = `entry & 0x1007` (`00cacf64`).
+
+### 11.4 Column encodings — `NLStandardDecoder::Decode<T>` (CONFIRMED, code ∈ 0x11–0x18)
+
+| code | scheme | | code | scheme |
+|---|---|---|---|---|
+| `0x11` | raw LE | | `0x15` | RLE + VLE |
+| `0x12` | RLE (value = run len) | | `0x16` | delta-VLE (prefix sum) |
+| `0x13` | bitmap (set positions) | | `0x17` | sparse-fill, delta-VLE gaps |
+| `0x14` | **VLE = unsigned LEB128** (`00cdb218`) | | `0x18` | **Simple9** (`00cdc3bc`) |
+
+Fixed ints little-endian (`ReadUnsigned<u32>` `00cdb2e8`). Code `0x0d` is **invalid** (decoders reject it) →
+confirms the header `0d 00`s are counts, and `0x0dNN` high-bytes elsewhere are PA/GenAttr column tags.
+
+### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
+
+A block's places have **no per-record lon/lat field**. Positions live in `NLPositionAttrVector` (tag `0x407`):
+a separate compressed **X** column (`+0x20`) + **Y** column (`+0x30`) + a delta/origin `tNLHPosition` (`+0x48`);
+element *i*'s coordinate = origin + `(X[i], Y[i])`. (The empirical `lon@+0x0c/lat@+0x10/text_id@+0x14` belongs to
+the flat `fm_tcl` **POI** record of §5b — a *different* block type — which is why it did not match the name-list.)
+
+### 11.6 GenAttr/HNR columns (fileID+20000) (CONFIRMED: `enDecodeHnr` `00e0c09c` / `enGetHnr` `00e0d078`)
+
+Column-oriented per street element: owner/descr index col `+0x28`; HNR token + addition strings (ValueList<u8>)
+`+0xb0/0x104/0x158/0x1ac`; **even-parity** bit-vector `+0x260`, **odd-parity** `+0x280`, refuse-interpolation
+`+0x2a0`, counted-against-digits `+0x300`; **range-end** `+0x320` (`0xffffffff` = none); owner descr `+0x4dc`.
+So a street's house numbers = (owner element, value, parity bitvectors, range) — plus optional exact points in `PA`.
+
+**Attr-vector block layout (CONFIRMED + decoded, 2026-09).** A GenAttr block is framed like the name-list
+columns (so it reuses the §11.4 codecs) but has **no trie** (that is `NLAsfBlock` only):
+```
+@block_off:  u16 num_desc                         (e.g. 0x0031 = 49 in POL block 0)
+             num_desc × descriptor { u16 kind, u16 code, u32 data_off, u32 param }   (12 B each)
+             ...block-relative sub-stream data...
+```
+`NLGeneralAttributeBlock::SetDataBlock` (`00e09b60`) splits each `kind`: **`kind & 0xfff`** selects the
+attribute-vector slot (the `+0x28 … +0x4dc` offsets cited above), **`kind & 0xf000`** selects that vector's
+sub-stream (`0`=primary, `0x4000`=secondary, `0x8000`=tertiary) — the very same sub-stream-flag scheme as the
+name-list columns. Empirically on `POL/LID40006` block 0 (49 descriptors, `elem 0..7903`):
+
+| col (`kind&0xfff`) | attr-vector | observed (`POL` block 0) |
+|---|---|---|
+| `0xc01` `0xc11` `0xc12` `0xc13` | `NLValueListAttrVector<u32>` | owner index (values = ascending street-elem ids), HNR value lists (`15690,15691,…` / `16408,15884,…`) |
+| `0xc03`–`0xc06` | `NLValueListAttrVector<u8>` | HNR token/addition strings (mostly empty here) |
+| `0xc02` | `NLSingleValueAttrVector<u32>` | one optional scalar |
+| `0xc08` `0xc10` `0xc14` | `NLRangeAttrVector<u32>` | range low/high pairs (`576,39,0,56,…` interleaved) |
+| `0xc09` `0xc0a` `0xc0b` `0xc0c` `0xc0d` `0xc0e` | `NLBinaryAttrVector` (bitmap) | parity/flags: even-parity **6067/10886 set**, odd **6109/10886** |
+| `0x001`–`0x005` | `NLCellIdAttrVector` | cell ids (`155584,155585,…`) + delta/value sub-streams |
+
+Each attr-vector decodes a small set of sub-streams at block-relative descriptor offsets, using the §11.4
+primitives:
+- `NLSingleValueAttrVector<u32>` (`00cddd74`) = bitfield (has-value bitmap over element_count) + `NLStandardDecoder`
+  of `popcount` values — i.e. one optional scalar per element (same shape as the belonging/position columns).
+- `NLRangeAttrVector<u32>` (`00e07850`) = bitfield (has-range) + two `NLStandardDecoder` value streams (range
+  low / high), each `popcount`-compressed.
+- `NLValueListAttrVector<u32/u8>` (`00cddb38` / `00e0be60`) = bitfield (element present) + a count vector + an
+  `NLValueListDecoder` (`00cdd728`) stream that flattens the per-element variable-length value lists.
+`enDecodeHnr` calls these columns in a fixed order (offsets above). **Status: the GenAttr *container +
+TOC + block interior* are now decoded** (`NLGenAttrFile` container + `NLGeneralAttributeBlock` descriptors +
+attr-vector streams — `src/lid_format::{read_gen_attr, GenAttrIndex::decode_block}`, validated against
+`POL/LID40006` block 0, `#[test] gen_attr_stock_block0_decodes`). What remains is the **HNR writer** and the
+on-device pattern-matching (`NLHnrToTree` / `NLHnrVerification` `00ce76a8`) semantics, which cannot be run here.
+
+**Stream framing + byte-exact write proof (2026-09, `LID_format.md §11.6` / `src/lid_format/src/rebuild.rs`).**
+`SetDataBlock` is *streaming*: a descriptor row `i`'s **byte span is `[off[i], off[i+1])` in table-row order**
+(the last row to the block end); rows sharing an `off` make the *earlier* a zero-length alias view. The
+`u32 param` is the *logical element count* the device's decoders consume — **decoupled from byte length**.
+Dispatch is by `kind & 0xfff` (vector slot — cols 1/2/4/5→CellId, 1/0xc01/0xc11/0xc12→ValueList\<u32\>,
+0xc03-0xc06→ValueList\<u8\>, 0xc02→SingleValue\<u32\>, 0xc08/0xc10/0xc14→Range\<u32\>, 0xc09-0xc0e→Binary,
+>0xc13→ValueList\<pair\>) and `kind & 0xf000` is that vector's *member* selector, **not** a separate codec —
+and a numeric stream's `code` is always ≥ `0x11` while bitfields (`0x01` dense/`0x02` sparse-set/`0x03`
+sparse-clear) use `0x01-0x03`. **Proof the encoders are byte-faithful (no card needed):** ignored test
+`gen_attr_stock_rebuild_byte_exact` rebuilds **every byte** of `POL/LID40006`'s 27 MB across **all 133
+readable blocks** from our decoded values (the descriptor table + inter-region padding are preserved
+verbatim; the 134th TOC entry's `block_off` `0x4c010031`≈1.275e9 is past EOF — the device can't read it
+either, so the oracle skips it). Confirmed encoders: raw-u32 (`0x11`), VLE (`0x14`), cumulative-VLE delta
+(`0x16`), Simple9 greedy-largest-count (`0x18`, mode table `1:(28,1)…9:(1,28)` matches author exactly),
+run/boundaries (`0x12` u32 / `0x15`,`0x17` VLE of run-ending boundaries), bitmap (`0x01` LSB-dense / `0x02`
+sparse-set / `0x03` sparse-clear, both as delta-VLE over `param` bits). So *emitting* our data through these
+same encoders yields device-correct bytes; only choosing each column's `param`/`off` + the street↔record join
+for OSM `addr:housenumber` remains (see §11.8).
+
+**GenAttr is a *different* container — `NLGenAttrFile`, not `NLNameList` (RESOLVED 2026-09; earlier
+"same container, garbage section table" note was WRONG).** Both are opened via
+`NLDataBlockReader(fileType 0x13)` (`poGetNewNLGenAttrProcessor` `00bd40ac`), so the 38-byte outer header is
+shared, but GenAttr files are parsed by `NLGenAttrFile::DecodeSubHeader` (`00e0e3d0`), NOT
+`NLNameList::LoadHeader` — which is why the name-list section-table decode returned garbage on them. Real
+layout (verified on `POL/LID40006`):
+```
+@hdr(=u32@0x10):  u32 elem_count, u32 x, u32 toc_count, u32 other_count   (other_count=1739 here)
+@hdr+16:          toc_count × NLBlockTocEntry { u32 elem_start, u32 elem_end, u32 block_off }
+                  (element ranges tile [0, elem_count) contiguously — the reliable GenAttr signal)
+@block_off:       NLGeneralAttributeBlock: u16 num_desc (=0x31 in block 0, the `31 00`), then num_desc ×
+                  12-byte {u16 kind,u16 code,u32 off,u32 param} descriptors, then column data. No trie.
+```
+`POL/LID40006`: `elem_count = 974 871` (**numerically identical to street base `LID20006`**),
+`toc_count = 134` blocks covering ranges `0..974 870`, `block_off ≈ 206 KB` apart. `src/lid_format` detects
+this via `is_gen_attr` (validated contiguous tiling), indexes it with `read_gen_attr`, and decodes each block's
+column streams with `GenAttrIndex::decode_block`. Note the block columns index a *record* space whose per-block
+count is the descriptors' `param` (e.g. block 0 bitmaps are `10886` bits) — which can exceed the TOC range size
+(`0..7903`); the owner VectorList column `0xc01` (values ascending within the block range, e.g. `2,2,3,6,7,11,…`)
+joins each record → its street element. The per-street **HNR record↔element join** and `NLHnrToTree`
+pattern semantics are the last thing not pinned (the on-device matcher cannot be run here).
+
+### 11.7 `PA_%05u` (point addresses) and `REL_%05u` (relations)
+
+- `PA` (fileType 0x18, `NLPABlock::SetDataBlock` `00e0f0b4` / `bDecodeLists` `00e0f824`): columns
+  owner-street-elem (`0xd04` SimpleList<u32>), flags (`0xd05/6`), **HNR value** (SimpleList<u8>), and an exact
+  `NLPositionAttrVector` → resolves a house number to a real coordinate (no interpolation).
+- `REL` (fileType 0x16): a **relation matrix** (`NLRelMatrixFile` `00e11874`), logically
+  `multimap<(source_elem, target_elem, type)>`; city→street and city→district(type 2). Exact disk bytes
+  still **INFERRED** (matrix sub-header/block `00e11874`/`00e10fbc` to pin).
+
+### 11.8 Converter verdict (CONFIRMED for the address path)
+
+To emit a working **regional** address search you must produce: `LID%05u` (name-list), `LID%05u@(id+10000)`
+(crossings), `LID%05u@(id+20000)` (GenAttr/HNR), `PA_%05u` (point addresses), and the SQLite global city list
+(`GLOB_POI.DAT` and/or `DB_CITY.DAT`). **`META%04u` and `CONNECT.DAT` are NOT required for regional address
+search** (they supply the language table + cross-region thesaurus/linkage; omitting them only degrades
+multi-language fuzzy matching and cross-region aliases). **The columnar writer (VLE/Simple9/position columns)
+is the real implementation cost** — build `lid2dump` first and decode stock before attempting the writer.
+
+> **Status.** `lid2dump` (reader) dumps the SQLite half (`GLOB_POI.DAT`) to JSON, and — via the new
+> `src/lid_format/` crate — now **decodes the ASF `LID2*` name-list blocks** (§12): container, block table,
+> descriptor TOC, column codecs, `outDegree`/DFS trie, edge labels, positions, belonging. Verified on
+> `POL/LID20006` (98 blocks / 974871 elements; real street names surface). `osm2lid` (writer) emits the
+> SQLite `GLOB_POI.DAT` **and** the ASF **city + street name-lists** as a plain trie (`LID20000.DAT`,
+> `LID20006.DAT`, §12.9), both round-trip validated. The GenAttr (`LID4nnnn`, +20000) **container + block TOC**
+> are now decoded too — container, block TOC **and the block interior** (`NLGenAttrFile` /
+> `read_gen_attr` / `GenAttrIndex::decode_block`, §11.6; validated on `POL/LID40006` block 0) — the reader no
+> longer returns garbage on them and the descriptor/attr-vector structure + parity/owner/value columns decode.
+> **Still pending:** the **GenAttr/HNR writer** + the street↔record join and `NLHnrToTree` semantics, `PA`, `REL`.
+> No `DB_CITY.DAT` on this card, so SQLite cannot substitute for the regional city name-list — it must be
+> written as `LID20000.DAT`.
+
+### 11.9 Empirical reality on the EUR card — **[CORRECTED, 2026-09; earlier "no sample" claim was WRONG]**
+
+> ⚠️ A previous revision of this section claimed the `NLNameList` ASF container does not exist on the EUR
+> card and was therefore a "BLOCKER". That was **incorrect** — it was based on scanning only `LID0*`/`META*`
+> in the POL region. It is now **disproven**: the ASF name-lists are present in **every** region. See §12.
+
+Ground truth (verified 2026-09):
+- Every region has ASF name-list files `DATA/DATA/LID/CCP/<reg>/LID2nnnn.DAT` (e.g. POL `LID20000..LID20011`,
+  `LID20006.DAT` = 15.3 MB, `element_count = 974871`). These match the `NLNameList`/`NLAsfBlock` container
+  of §11.2–11.7 exactly (verified by a working reader — see §12).
+- `LID0nnnn.DAT` is the `fm_tcl` **content/landmark** container (§5), *not* the address name-list — that is
+  why an `NLNameList` header scan against `LID0*` finds nothing.
+- **`DB_CITY.DAT` does NOT exist on this card** (verified: the only SQLite DBs are `GLOB_POI.DAT`, table
+  `GLOBAL_POIS`). So `LISA_SQLiteGlobalAccess::bGetGlobalCityList` (`SELECT … FROM GlobalCityList`) finds no
+  table here → the *global* city DB path is inactive on this edition. **Regional city/street/HNR search is
+  served entirely by these ASF `LID2*` name-lists** (via `NLProcessor`), which we must therefore be able to write.
+
+---
+
+## 12. The address name-list is a per-block **trie** (`NLAsfBlock`) — **[DECODED; block geo-origin UNKNOWN]**
+
+The `LID2nnnn.DAT` files are read by `NLProcessor` (`bGoToElemet` `00cef…`, `enGetAllElementProperties`
+`00…`, `copszGetCurrentString` = the accumulated `NLProcessor+0x12c` string). A file = an `NLNameList`
+container; each block is an `NLAsfBlock` that encodes a **name trie (a plain tree — NOT a minimized DAWG:
+empirically every node has exactly one parent, `Σ outDegree = node_count − 1`, 0 multi-parent nodes)**
+plus per-element columns. The block decodes into (all CONFIRMED from accessor bodies unless marked):
+
+**12.1 Container** (`NLNameList::LoadHeader` `00e0e63c`) — as §11.2. Sub-header `@hdrSize`:
+`u32 element_count`, `6×u16` (vec sizes; `[0]`=block count), `2×u32`, then `7×{u8 section_code, u32 file_off}`.
+Section table gives a **block table**: section w/ `code=0x11` = raw `u32` block **file offsets** (monotonic,
+cover the file); section `code=0x14` = **decoded byte-sizes** per block (VLE). Verified `POL/LID20006`:
+98 blocks, block0 @ `0x362`, Σ decoded-sizes ≈ `element_count` × ~102 B.
+
+**12.2 Block** (`NLAsfBlock::SetDataBlock` `00cdf404`) — 8-byte header `4×u16`: `[0]=node_count`, `[1]=x`,
+`[2]=element_count`, `[3]=num_desc`. Then `num_desc × NLPSFListDescriptor` `{u16 kindWithFlags, u16 code,
+u32 data_off (block-relative), u32 param}`. `enSetListDescriptions` `00cdc0c0` dispatches on `kind & 0xfff`
+and **the top nibble `kind & 0xf000` selects the column's sub-stream**: `0x0000`=primary, `0x4000`
+=secondary (`+0x10`), `0x8000`=tertiary (`+0x24`). So each multi-part column (position/value) has one
+descriptor per sub-stream. CONFIRMED mapping in the `SetDescription` bodies (`00cdb42c`–`00cdc090`).
+
+**12.3 The tree** (`NLAsfBlock::ProcessNode` `00cdbf88`, `CalculateFirstEdgeIndex` `00cdc018`) — CSR/DFS:
+- Column **`0x401`** = `NLSimpleList<u16>` = **`outDegree[node]`** (# child edges per node). `Σ outDegree =
+  node_count − 1`.
+- Children of node `n` are the **contiguous node range** `[childStart[n] .. childStart[n] + outDegree[n])`,
+  where `childStart[n] = base + edgeCounter(n)` and `edgeCounter(n)` is the **DFS-preorder** edge counter
+  (not a node-index prefix sum!). `CalculateFirstEdgeIndex` drives it: `base` starts at `1`, the outer loop
+  runs `ProcessNode(node, base, &edgeCounter)` advancing `node += (subtree node count)` and `base += 1`
+  (a plain single-rooted trie makes the first call cover the file, so `base≡1`, `childStart[n]=1+preorder_edges(n)`).
+  Using the **BFS prefix sum** `Σ_{k<n} outDegree[k]` instead of this DFS-preorder counter mis-parents nodes
+  and concatenates sibling street names — the earlier bug. Node 0 = root.
+- It is a **plain trie, not a DAWG** — verified on `POL/LID20006` block0: `max_parents=1`, `orphans=0`,
+  `multi_parent=0`. So `name_of[node]` via the unique parent chain is well-defined.
+- **Terminating elements** (`CalculateTerminatingElementIndex` `00cdbf48` → `ProcessSubTreeTEIC` `00cdbe58`):
+  a **`element` = a leaf node (`outDegree==0`) with no block-link**; assigned in a specific **DFS**: for each
+  node, first its leaf children (in child order), then recurse into its internal children (in child order).
+  `+0x8c[element] = leaf node`; `enGetTerminatingElementIndex` binary-finds the node in `+0x8c`. **The element
+  index = rank in that DFS order** — all per-element columns (position/belonging/flags) are indexed by it.
+
+**12.4 Edge labels / names** (`NLEdgeLabelList::Decode` `00cdf2f0`, column **`0x403`**) — two sub-streams:
+- The **raw** sub-stream (code `0x11`, at object `+0x10`) = a **name blob** of `param` bytes = concatenation of
+  per-node labels. The **other** sub-stream (VLE, at `+0x0`) = **absolute per-edge byte offsets** into that blob
+  (`count = node_count−1`, monotonic, `last = blob.len`). Node `n`'s label = `blob[off[n-1] .. off[n]]`
+  (root `n=0` = empty). A node's **name = concatenation of labels root→node** (path labels).
+- Verified on `POL/LID20006` block0: labels are first the alphabet (`" ' 1 2 … A B … Z`, 1 char each, = root's
+  children) then **full-name phrases**. A leaf path spells one street name.
+- **Name variants are separated by `0x09` (tab):** typically `<ASCII-folded> \t <proper-UTF8 w/ diacritics>`
+  (e.g. `"ZOSKA", ULICA BATALIONU \t "ZOŚKA", …`). The display name is the diacritic-bearing variant; the
+  ASCII fold is a fold of it. `decode_name` splits on `0x09` and returns the variant with non-ASCII bytes
+  (else the longest). Both variants appear as text — sometimes one element with an embedded `0x09`, sometimes
+  as two sibling elements. This is the store's alt/main name encoding (the `enGetEntry*Name*` accessors).
+- Column **`0x8403`** (flags `0x8000`, VLE) = the **charset codebook** (byte-code → character incl. multibyte).
+  In `POL/LID20006` labels are literal bytes (UTF-8 decodes correctly), so the codebook is not needed to
+  reproduce these names; **UNKNOWN (minor):** when a charset-code mapping would apply.
+
+**12.5 Positions** (`NLPositionAttrVector::Decode` `00cdd7dc`, column **`0x407`**) — CONFIRMED:
+`flags=0x4000` sub-stream = **bitmap** (`NLBitfieldDecoder`, code `0x03` = VLE-clear) over `element_count` of
+which elements have a position; `flags=0` sub-stream = **COMPRESSED interleaved `X,Y` `u32`** — only `2·popcount`
+values, and element `i` (bit set) maps to `coords[2·rank]`,`coords[2·rank+1]` where `rank` = set bits before `i`
+(`Decode` stores an index vector `= rank<<1` at `+0x20`, `+0x40`=`popcount`). Element position =
+**block origin + (X, Y)**. Verified: values ≈ PAU deltas from origin (first block0 entry `X=233844` ≈ +0.0196°).
+**UNKNOWN (only remaining):** the block **geo origin** (`tNLHPosition`, stored at `+0x48/0x4c`) source — passed
+into `enReadAsfBlock`/`SetDataBlock`/`Decode` from the block-data-container's per-block index, **not in the
+block bytes** (the container's per-block tables are `98×3B` + `98×4B`, too small to hold `X,Y`) → a separate
+position index not yet located; **needed only for absolute lon/lat, cancels in writer↔reader round-trip**.
+
+**12.6 Hierarchy (city↔street) + element properties** — CONFIRMED accessors, indexed by `element_index`:
+- **belonging name** = parent/city element: `enGetEntryBelongingNameMainElementIndex` `00cdba88` →
+  `NLSingleValueAttrVector<u32>` @`+0x328` (column **`0x40c`**: `flags0`=bitmap "has-belonging",
+  `flags0x4000`=values).
+- per-element flags: `bIsEntryValidDestination` / `bHasEntryCrossing` / **`bHasEntryHouseNumber`** /
+  `bHasEntryPointAddresses` / `bHasEntryCells` / `…DetailedDescription` (bitvector columns; `enGetEntryCharacterStatus`
+  → column `0x415` `NLBinListAttrVector`).
+- name variants: `Permutation`/`Alternative`/`Belonging`/`Exonym`/`Base` (`enGetEntry…NameMainElementIndex`).
+- `0x402` = `NLBlockLinkAttrVector` = bitmap + `2·k` u32 pairs → `map<node, {block, index}>` (cross-block links).
+
+**12.7 Converter verdict.** To emit a working regional address search (city+street+HNR) we must write
+`LID%05u` (cities/streets name-lists) + `@(id+20000)` GenAttr/HNR + `PA_%05u` (+ `REL`), as this **trie/column
+format**. Stock is already a **plain trie** (§12.3), so the writer builds a trie directly — insert each full
+name root→leaf (terminating each with `0x00` so strict-prefix names stay leaves), number nodes in the
+DFS-preorder `childStart` layout, split into ≤ ~10k-node blocks (`node_count`/`element_count` are `u16`), and
+populate the terminating-element DFS order + the per-element columns. No DAWG minimization needed. House
+numbers = per-street GenAttr `+20000` columns (§11.6); optional exact points in `PA` (§11.7).
+
+**12.8 Reader status.** `src/lid_format/` (Rust, wired into `lid2dump`) implements §12.1–12.6 faithfully (no
+heuristics/filters): container + block table + descriptor TOC (flag sub-streams) + column decoders (§11.4,
+**correct** Simple9 mode table §12.4 and custom `ReadVle`) + `outDegree`/DFS-`childStart` children +
+`CalculateTerminatingElementIndex` element DFS + `0x403` blob/offsets + `0x09` name-variant split +
+`NLPositionAttrVector` (bitmap + rank-compressed PAU) + belonging column. On `POL/LID20006` it decodes
+**883 936 elements / 883 929 with positions / 231 882 unique names**, all real Polish street names with
+diacritics. **Only remaining UNKNOWN:** the per-block **geo origin** for absolute lon/lat (§12.5); position
+deltas are otherwise exact. Verified it is a pure trie (single-parent, all nodes reached).
+
+**12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
+numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
+TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now calls it to write **both** the
+**street** name-list (`write_streets` → `LID20006.DAT`, one element per unique highway `name` at its way
+centroid, absolute PAU, block origin 0) and the **city/settlement** name-list (`write_cities` → `LID20000.DAT`,
+one element per unique OSM `place=` name at its centroid). Both round-trip name- and position-exact (unit
+tests + `malopolskie`: streets **8828 names → 14 blocks → 8828 elements back**; cities **10482 names → 12
+blocks → 10482 elements back**, diacritics intact). **Still pending:** house-number GenAttr `+20000`, point-address `PA`,
+`REL`, and the on-device block geo-origin (§12.5) for absolute coordinates.
+
+> **Corrected decoder notes (were wrong in earlier revisions):**
+> - **Simple9 mode→(count,bits)** (from `DecodeSimple9` `00cdc3bc`/`00cdc908`, values LSB-first, mode nibble
+>   `= word>>28`): `1:(28,1) 2:(14,2) 3:(9,3) 4:(7,4) 5:(5,5) 6:(4,7) 7:(3,9) 8:(2,14) 9:(1,28)`
+>   (u16 variant: mode `9`→bits 16). Earlier "mode 1 = 1×28" (Lucene convention) was **reversed**.
+> - **`ReadVle` `00cdb218`** is a custom LEB, not standard: continuation byte → `acc = (byte-0x7f) + prev*128`,
+>   final byte → `value = byte + prev*128` (i.e. each continuation contributes `128·(chunk+1)`), max 5 bytes.
+>   `ReadUnsigned<u32>` = plain LE u32; `ReadUnsigned<u16>` = LE u16.
+
+---
+
+
 
 ---
 
@@ -408,16 +711,20 @@ address data is POI/city-only. **Road network is not involved** (CONFIRMED — n
   @+5), POI sequences, the point-POI record (`fm_tclPOIData`: display_scale@+6, PAU lon/lat @+0x0c/+0x10,
   text_id@+0x14), the text pool, and the ~16 POI categories (→ `CAT_ID`).
 
-**Not fully decoded (next steps, in order):**
-1. **Exact byte offsets of every header field** (`unique_id`, `dataset_id`, `draw_prio`, `block_type`) — the
-   getters exist but several share names across classes; pin via the `fm_tclStartBlockAccess` accessor set.
-2. **Line/polygon object record layouts** (`fm_tclLineData` / `fm_tclPolyData`, §6) for the LID2-5 payloads.
-3. **Sequence TOC framing** — how a block enumerates its (country, POI-type) sequences and their lengths.
-4. The `CONNECT`/`META`/`REL` index structures (§7).
-5. **Address search (§10):** pin the `LID0` **LISA container** framing (`0d00`…), the exact POI/`type`-sequence
-   record offsets, and the `REL` / GenAttr(`+20000`) / `PA_%05u` file formats that back **street** and
-   **house-number** lookup. Approach: build `lid2dump` (Bosch→JSON gazetteer dumper) as the ground-truth
-   reader, decode stock addresses with it, then write `osm2lid` and validate by round-trip.
+**Not fully decoded (active frontier = the ASF address name-list, §12):**
+1. **Block geo origin** (`tNLHPosition`, §12.5) — the per-block absolute-coordinate anchor, held in the
+   block-data-container's block index (not in the block bytes). Only remaining absolute-lon/lat gap; cancels
+   in writer↔reader round-trip.
+2. **Charset codebook** (`0x8403`, §12.4) — when a byte is a charset code vs a literal (labels decode as literal
+   UTF-8 on `POL`, so not exercised yet).
+3. **Writer (`osm2lid` + `lid_format::encode`)** — DONE for the **street + city name-lists** (plain trie,
+   multi-block, §12.9): OSM highway `name` → `LID20006.DAT` and OSM `place=` → `LID20000.DAT`, both validated
+   by full round-trip. **Still pending:** house-number GenAttr `+20000` (§11.6), point-address `PA` / `REL`,
+   and on-device block geo-origin (§12.5) for absolute coordinates.
+
+> The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**
+> (`0x403` + `0x09` variant split) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all
+> CONFIRMED and reproduced faithfully by `src/lid_format/` (883 936 elements off `POL/LID20006`).
 
 > Practical note for a converter: if your goal is *navigation*, LID is the optional content layer — the
 > network still loads and routes via RNW→MAP without it. If you need POI search / landmark rendering, the files

@@ -1,0 +1,22 @@
+[package]
+name = "lid2dump"
+version = "0.1.0"
+edition = "2021"
+
+# Bosch TravelMap LID (address/POI/city) -> JSON dumper.
+# The READ-side ground-truth counterpart of osm2lid: decode stock (or generated)
+# LID files into a diffable JSON gazetteer so a writer can be validated by round-trip.
+# See doc/TravelMap_format/02 - details/LID_format.md (§3 GLOB_POI, §10 OSDE, §11 ASF).
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+cprnav = { path = "../cprnav" }
+lid_format = { path = "../lid_format" }
+
+[[bin]]
+name = "lid2dump"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

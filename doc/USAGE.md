@@ -10,7 +10,7 @@ sudo apt install osmctools osmium-tool
 # Build the converter
 
 ```bash
-for p in map2osm osm2map rnw2osm osm2rnw rnw_extract rnw_join cprnav_compress cprnav_decompress; do (cd src/$p && cargo build --release); done
+for p in map2osm osm2map rnw2osm osm2rnw osm2lid lid2dump rnw_extract rnw_join cprnav_compress cprnav_decompress; do (cd src/$p && cargo build --release); done
 ```
 
 Binaries land in the shared cargo target dir (`.../release/map2osm`, `.../release/osm2map`).
@@ -356,6 +356,35 @@ come back unchanged. The emitted clusters are byte-faithful. With `--tci` the `.
 also produced (clusters 16 KB-aligned; refs `{(offset&~0x3fff)|regionIdent, file-id, length}`, `nPrim==nAll`,
 each cluster in every finest-level tile it overlaps), so the car can boot the region — see `writer_guide.md`
 §7 "Cluster locator". `osm2map` no longer emits any `.tci`; the only unverified step is an in-car boot.
+
+## 3d. OSM → LID (`osm2lid`) — writing the address / POI database, and `lid2dump` (reader)
+
+MAP + RNW make the map draw and route, but the destination **"city → street → house number"** search is
+served by a separate layer, **LID** (`doc/TravelMap_format/.../LID_format.md` §8/§10). `osm2lid` is the
+write side; `lid2dump` is its read-side ground-truth validator (like `rnw2osm` is for `osm2rnw`).
+
+`osm2lid` currently emits the **SQLite half** of the address base — both match the exact schemas the car
+reads and round-trip through `lid2dump`:
+- `GLOB_POI.DAT` — POI gazetteer (`GLOBAL_POIS`, FTS3): cities (`place=city/town/village/…`) + POIs
+  (`amenity`/`shop`/`tourism` with a `name`).
+- `DB_CITY.DAT` — addressable-city list (`GlobalCityList`, FTS3), used by the car's global city search
+  (`bGetGlobalCityList`).
+
+```bash
+OSM2LID=/home/marek/Ext/.cargo_cache/release/osm2lid
+LID2DUMP=/home/marek/Ext/.cargo_cache/release/lid2dump
+
+osm2lid krzeszowice.osm.pbf -o /tmp/lid --region POL --bbox 19.50,50.05,19.88,50.28   # writes GLOB_POI.DAT + DB_CITY.DAT
+lid2dump /tmp/lid/GLOB_POI.DAT -o /tmp/lid/glob.json          # JSON dump (schema/rows) to inspect/diff
+lid2dump .../DATA/DATA/LID/CCP/POL -r -o /tmp/pol_lid.json    # dump a whole stock region dir (incl. LID*.DAT name strings)
+sqlite3 /tmp/lid/DB_CITY.DAT "SELECT Name,Longitude,Latitude FROM GlobalCityList WHERE NameNorm MATCH 'KRZESZ*';"
+```
+
+`REGION_ID` is the region's regionIdent (`POL` = `0x402`), `LONGITUDE/LATITUDE` are PAU, `NAME`/`NAMENORM`
+are the display/ASCII-folded forms. **Not yet generated:** street + house-number name-lists, which live in
+the `LID0` columnar **PSF/ASF** format (`LID_format.md` §11) — see TODO §17; `osm2lid` reports the street
+count it saw but does not write them. `CAT_ID` is best-effort for now (TODO §17 wires it to `POI_MAPPING.DAT`).
+
 
 
 
