@@ -142,7 +142,8 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
     let reuse = hdr.min(outer.len());
     out[..reuse].copy_from_slice(&outer[..reuse]);
     out[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
-    // Sub-header @hdr: elem_count, x (reuse or 0), toc_count, other (reuse or 0).
+    out[0x14..0x18].copy_from_slice(&(hdr as u32 + toc_size as u32).to_le_bytes()); // sub-header region size
+                                                                                    // Sub-header @hdr: elem_count, x (reuse or 0), toc_count, other (reuse or 0).
     if outer.len() >= hdr + 16 {
         out[hdr..hdr + 4].copy_from_slice(&outer[hdr..hdr + 4]);
         out[hdr + 4..hdr + 8].copy_from_slice(&outer[hdr + 4..hdr + 8]);

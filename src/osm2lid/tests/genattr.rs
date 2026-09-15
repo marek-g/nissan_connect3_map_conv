@@ -71,9 +71,10 @@ fn genattr_osm_roundtrip() {
         );
     }
 
-    // 1c. the settlement gazetteer stays coordinate-free (stock LID20000 flavor).
+    // 1c. the settlement gazetteer stays coordinate-free (stock settlement-list flavor, listID 2 =
+    // LID20001; note stock LID20000 is the listID-129 HNR domain, §11 inventory).
     let cities =
-        lid_format::read(&std::fs::read(out.join("LID20000.DAT")).unwrap()).expect("city LID");
+        lid_format::read(&std::fs::read(out.join("LID20001.DAT")).unwrap()).expect("city LID");
     assert_eq!(
         cities.origin, None,
         "gazetteer carries no origin (stock -1/-1)"
@@ -165,6 +166,31 @@ fn genattr_osm_roundtrip() {
         "even-number parity bits (10 even; 11,5 odd)"
     );
     let _ = (hi, lo);
+
+    // 3. outer-header identities (the device binds list files by these first bytes) + the REL matrix.
+    for (f, id, kind) in [
+        ("LID20001.DAT", 2u8, 1u8),
+        ("LID20006.DAT", 3, 1),
+        ("LID40006.DAT", 3, 3),
+    ] {
+        let raw = std::fs::read(out.join(f)).unwrap();
+        assert_eq!(
+            &raw[..8],
+            &[2, 4, id, 0, 0, 0, 0xEC, 0x41],
+            "{f} rIdxListID identity"
+        );
+        assert_eq!(&raw[0x0c..0x10], &[kind, 0, 0, 0], "{f} file kind");
+    }
+    let rel = std::fs::read(out.join("REL00001.DAT")).unwrap();
+    let ridx = lid_format::rel::RelIndex::parse(&rel).expect("REL00001 parses");
+    assert_eq!(
+        (ridx.d[0], ridx.d[1]),
+        (3, 2),
+        "file stores (street, city) list ids"
+    );
+    let pairs = lid_format::rel::get_relations(&rel, &ridx, true, 0, 2).unwrap();
+    assert_eq!(pairs.len(), 2, "one street->city pair per street");
+    assert!(pairs.iter().all(|&(_, t)| t < 2), "city elems in range");
 
     std::fs::remove_dir_all(&out).ok();
 }

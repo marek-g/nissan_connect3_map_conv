@@ -23,7 +23,7 @@ To use this converter you must have an (original) copy of such SD Card, because 
 
 The other requirement is that you have to copy the SD Card content to another one for which you can change its CID number to the same as in the original one. Most common SD Cards do not allow to change their CID numbers.
 
-## Protections
+## ProtectionsCo dalej
 
 - the navigation system verifies CID number of the SD Card, so you have to find a way to copy your CID number to a new SD Card
 - some manifest files are signed (they include list of supported regions), but it is unclear if that is enforced to limit region data possible to replace, the data itself is not encrypted and at least Europe version of the SD card allows us to replace Europe data

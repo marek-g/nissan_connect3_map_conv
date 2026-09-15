@@ -1,0 +1,474 @@
+//! `REL%05u.DAT` sparse relation files (fileType 0x16) — reader model + writer.
+//!
+//! Layout (CONFIRMED against `NLRelMatrixFile::DecodeSubHeader` `00e11874`,
+//! `NLRelMatrixDescr::bCheckAndCalculate` `00e11564`,
+//! `enDetermineDataBlocksByType` `00e11ab8`, `enGetSubMatricesInBlock` `00e10fd4`,
+//! `enGetRelationsByType` `00e11310`, `NLSubMatrix::en{Column,Row}Values`
+//! `00e111ac`/`00e1125c`, and stock `POL/REL00004.DAT` byte-for-byte):
+//!
+//! * container: `u32@0x10` = header/sub-header split offset (0x77 on stock); `u32@0x14` =
+//!   **region size** = `(9 + d6*d7)*4`; the region starts at that split offset.
+//! * sub-header region — 9 consecutive u32: `d0, d1` = the two related side ids (stock
+//!   REL00004: 129/12); `d2` = source element count, `d3` = target element count; `d4` = source
+//!   elements per **band**, `d5` = target elems per band; `d6, d7` = matrix grid dims
+//!   (`0 < x < 0x10000`); `d8` (@+0x20) = total tile bytes. Then `d6*d7` u32 **absolute file
+//!   offsets** in scan order `g = d6*colBandGroup + rowBandGroup`; tile `g` spans
+//!   `[cell[g], cell[g+1])`, the last wraps through `d8 + cell[0]`.
+//! * derived geometry (`bCheckAndCalculate`): `srcBands = ceil(d2/d4)`, `tgtBands = ceil(d3/d5)`;
+//!   bands per matrix row `bpr` = `srcBands/d6` incremented while `(d6-1)*(bpr+1) < srcBands`
+//!   (skipped when `d6 == 1`), same for `bpc`; matrix row `r` covers source bands
+//!   `[r*bpr, min((r+1)*bpr, srcBands))` (last group absorbs the remainder).
+//! * tile payload: `tcs = rows*cols` u16 **CSR table** where `table[0]` doubles as the
+//!   `= tcs` validator (mismatch aborts the tile) and the first cell's value start; entries
+//!   non-decreasing; the start of the last cell's successor defaults to `(size & 0x1FFFF) >> 1`,
+//!   so tiles must stay < 128 KiB. Table cells are indexed `ci = colBandLocal*rows +
+//!   rowBandLocal`. Then per band-pair value lists at `tile + 2*start`, `count = end - start`:
+//!   running `pos` += u16 (`0xFFFF` = filler adding `0xFFFE`); decoded with stride `d4` as
+//!   `src = d4*srcBandGlobal + pos % d4`, `tgt = d5*tgtBandGlobal + pos / d4` — column queries
+//!   (access 2) filter `src` and emit `tgt`, row queries (access 1) filter `tgt` and emit `src`.
+//!
+//! Writer: uniform grid `d4 = d5 = REL_BAND` elements per band, aiming at `REL_CELL_BANDS` bands
+//! per matrix cell (with the device's `bpr` derivation replicated so tables match); errors out
+//! instead of emitting tiles that would exceed the device's u16/128 KiB limits.
+
+/// Parsed `REL` file index (sub-header + matrix cells).
+#[derive(Debug)]
+pub struct RelIndex {
+    pub hdr: usize,
+    pub region: u32,
+    pub d: [u32; 9],
+    /// absolute file offset of each matrix cell (scan order `d6*colg + rowg`).
+    pub cells: Vec<u32>,
+}
+
+impl RelIndex {
+    /// Parse + validate (region size, dimension bounds — mirrors the device checks).
+    pub fn parse(b: &[u8]) -> Result<RelIndex, String> {
+        if b.len() < 0x18 {
+            return Err("rel: file too small".to_string());
+        }
+        let hdr = u32v(b, 0x10) as usize;
+        let region = u32v(b, 0x14);
+        if hdr as u64 + region as u64 > b.len() as u64 || region < 36 {
+            return Err("rel: bad region".to_string());
+        }
+        let mut d = [0u32; 9];
+        let head: [u32; 8] = core::array::from_fn(|i| u32v(b, hdr + 4 * i));
+        d[..8].copy_from_slice(&head);
+        d[8] = u32v(b, hdr + 0x20);
+        let (src, tgt, d4, d5, d6, d7) = (d[2], d[3], d[4], d[5], d[6], d[7]);
+        if [src, tgt, d4, d5, d6, d7].contains(&0) || d6 >= 0x10000 || d7 >= 0x10000 {
+            return Err("rel: bad dimensions".to_string());
+        }
+        if region != (d6 * d7 + 9) * 4 {
+            return Err("rel: region size mismatch".to_string());
+        }
+        let n = (d6 * d7) as usize;
+        let cells = (0..n).map(|i| u32v(b, hdr + 36 + 4 * i)).collect();
+        Ok(RelIndex {
+            hdr,
+            region,
+            d,
+            cells,
+        })
+    }
+
+    /// Device-derived `(srcBands, tgtBands, bpr, bpc)` (see `bCheckAndCalculate`).
+    pub fn grid(&self) -> (u64, u64, u64, u64) {
+        let (d2, d3, d4, d5, d6, d7) = (
+            self.d[2] as u64,
+            self.d[3] as u64,
+            self.d[4] as u64,
+            self.d[5] as u64,
+            self.d[6] as u64,
+            self.d[7] as u64,
+        );
+        let (sb, tb) = (d2.div_ceil(d4), d3.div_ceil(d5));
+        (sb, tb, bands_per_group(sb, d6), bands_per_group(tb, d7))
+    }
+}
+
+/// Device `bCheckAndCalculate` band-group size: `S/g` bumped while `(g-1)*(x+1) < S`.
+pub fn bands_per_group(bands: u64, groups: u64) -> u64 {
+    if groups == 1 {
+        return bands;
+    }
+    let mut x = bands / groups;
+    while (groups - 1) * (x + 1) < bands {
+        x += 1;
+    }
+    x
+}
+
+/// All relations with the *filtered* side in `[lo, hi)`.
+/// `by_source = true` → column query (access 2): filter source, returns `(src, tgt)`.
+/// `by_source = false` → row query (access 1): filter target, returns `(tgt, src)`.
+pub fn get_relations(
+    b: &[u8],
+    idx: &RelIndex,
+    by_source: bool,
+    lo: u32,
+    hi: u32,
+) -> Result<Vec<(u32, u32)>, String> {
+    let (d4, d5, d6, d7) = (
+        idx.d[4] as u64,
+        idx.d[5] as u64,
+        idx.d[6] as u64,
+        idx.d[7] as u64,
+    );
+    let (src_bands, tgt_bands, bpr, bpc) = idx.grid();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for g in 0..(d6 * d7) as usize {
+        let (rowg, colg) = (g as u64 % d6, g as u64 / d6);
+        let (r0, r1) = (rowg * bpr, ((rowg + 1) * bpr).min(src_bands));
+        let (c0, c1) = (colg * bpc, ((colg + 1) * bpc).min(tgt_bands));
+        if r0 >= r1 || c0 >= c1 {
+            continue;
+        }
+        let (q0, q1) = if by_source {
+            (lo as u64 / d4, (hi as u64).div_ceil(d4))
+        } else {
+            (lo as u64 / d5, (hi as u64).div_ceil(d5))
+        };
+        let (b0, b1) = if by_source { (r0, r1) } else { (c0, c1) };
+        if b1 <= q0 || b0 >= q1 {
+            continue; // this cell's bands cannot hold a queried element
+        }
+        let off = idx.cells[g] as usize;
+        let size = if g + 1 < idx.cells.len() {
+            idx.cells[g + 1].wrapping_sub(idx.cells[g]) as usize
+        } else {
+            idx.d[8]
+                .wrapping_add(idx.cells[0])
+                .wrapping_sub(idx.cells[g]) as usize
+        };
+        let (rows, cols) = ((r1 - r0) as usize, (c1 - c0) as usize);
+        let tcs = rows * cols;
+        if off + 2 * tcs > b.len() {
+            return Err(format!("rel: cell {g} table past EOF"));
+        }
+        if u16v(b, off) as usize != tcs {
+            return Err(format!("rel: cell {g} table head != {rows}x{cols}"));
+        }
+        for c in 0..cols {
+            for r in 0..rows {
+                let ci = c * rows + r;
+                let start = u16v(b, off + 2 * ci) as usize;
+                let end = if ci + 1 < tcs {
+                    let e = u16v(b, off + 2 * (ci + 1)) as usize;
+                    if e < start {
+                        return Err(format!("rel: cell {g} CSR not monotonic at {ci}"));
+                    }
+                    e
+                } else {
+                    (size & 0x1_FFFF) / 2
+                };
+                if end < start || start < tcs || off + 2 * end > b.len() {
+                    return Err(format!("rel: cell {g} values out of tile"));
+                }
+                let (row_base, col_base) = ((r0 + r as u64) * d4, (c0 + c as u64) * d5);
+                if (by_source && hi as u64 <= row_base) || (!by_source && hi as u64 <= col_base) {
+                    continue;
+                }
+                let mut pos: u64 = 0;
+                let mut p = off + 2 * start;
+                for _ in start..end {
+                    let v = u16v(b, p);
+                    p += 2;
+                    if v == 0xFFFF {
+                        // filler: advances the position but is not a relation (enGetRowValues)
+                        pos = pos.wrapping_add(0xFFFE);
+                        continue;
+                    }
+                    pos = pos.wrapping_add(v as u64);
+                    let (src, tgt) = (row_base + pos % d4, col_base + pos / d4);
+                    if src >= idx.d[2] as u64 || tgt >= idx.d[3] as u64 {
+                        continue;
+                    }
+                    if by_source {
+                        if (lo as u64..hi as u64).contains(&src) {
+                            out.push((src as u32, tgt as u32));
+                        }
+                    } else if (lo as u64..hi as u64).contains(&tgt) {
+                        out.push((tgt as u32, src as u32));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn u32v(b: &[u8], o: usize) -> u32 {
+    if o + 4 > b.len() {
+        0
+    } else {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+}
+
+fn u16v(b: &[u8], o: usize) -> u16 {
+    if o + 2 > b.len() {
+        0
+    } else {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+}
+
+trait U16Ok {
+    fn u16_ok(self) -> Option<u16>;
+}
+impl U16Ok for usize {
+    fn u16_ok(self) -> Option<u16> {
+        u16::try_from(self).ok()
+    }
+}
+
+/// Elements per band (`d4`/`d5`) and target bands per matrix cell for [`write_rel`].
+pub const REL_BAND: u64 = 512;
+pub const REL_CELL_BANDS: u64 = 32;
+
+/// Sorted position stream as u16 deltas; a `0xFFFF` entry is the filler adding `0xFFFE`.
+fn encode_positions(pos: &[u32]) -> Vec<u8> {
+    let mut t: Vec<u8> = Vec::new();
+    let mut last = 0u64;
+    for &p in pos {
+        let mut delta = p as u64 - last;
+        last = p as u64;
+        while delta >= 0xFFFF {
+            t.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            delta -= 0xFFFE;
+        }
+        t.extend_from_slice(&(delta as u16).to_le_bytes());
+    }
+    t
+}
+
+/// Build a `REL` file relating `src_elems` source to `tgt_elems` target elements;
+/// `list_a`/`list_b` are the side ids stored in the sub-header.
+pub fn write_rel(
+    src_elems: u64,
+    tgt_elems: u64,
+    list_a: u16,
+    list_b: u16,
+    rels: &[(u32, u32)],
+) -> Result<Vec<u8>, String> {
+    if src_elems == 0
+        || tgt_elems == 0
+        || src_elems > u64::from(u32::MAX) / 2
+        || tgt_elems > u64::from(u32::MAX) / 2
+    {
+        return Err("rel: element count out of range".to_string());
+    }
+    let src_bands = src_elems.div_ceil(REL_BAND);
+    let tgt_bands = tgt_elems.div_ceil(REL_BAND);
+    let d6 = src_bands.div_ceil(REL_CELL_BANDS);
+    let d7 = tgt_bands.div_ceil(REL_CELL_BANDS);
+    if d6 >= 0x10000 || d7 >= 0x10000 {
+        return Err("rel: grid too large".to_string());
+    }
+    let (bpr, bpc) = (
+        bands_per_group(src_bands, d6),
+        bands_per_group(tgt_bands, d7),
+    );
+    if d6 * bpr < src_bands || d7 * bpc < tgt_bands {
+        return Err("rel: derived band groups do not cover all bands".to_string());
+    }
+
+    // matrix cell `g` = (colg, rowg); its CSR shape is rows x cols band pairs
+    let tcs_of = |g: u64| -> (u64, u64, usize) {
+        let (rowg, colg) = (g % d6, g / d6);
+        let rows = ((rowg + 1) * bpr).min(src_bands) - rowg * bpr;
+        let cols = ((colg + 1) * bpc).min(tgt_bands) - colg * bpc;
+        (rows, cols, (rows * cols) as usize)
+    };
+    let mut runs: Vec<Vec<(usize, u32)>> = (0..d6 * d7).map(|_| Vec::new()).collect();
+    for &(s, t) in rels {
+        let (s, t) = (u64::from(s), u64::from(t));
+        if s >= src_elems || t >= tgt_elems {
+            return Err(format!("rel: pair ({s},{t}) out of range"));
+        }
+        let (sb, tb) = (s / REL_BAND, t / REL_BAND);
+        let (rowg, colg) = (sb / bpr, tb / bpc);
+        let g = colg * d6 + rowg;
+        let (rows, _, _) = tcs_of(g);
+        let ci = (tb % bpc) * rows + (sb % bpr);
+        // position is band-pair relative: src = rowBase + pos % d4, tgt = colBase + pos / d4
+        runs[g as usize].push((
+            ci as usize,
+            ((t % REL_BAND) * REL_BAND + s % REL_BAND) as u32,
+        ));
+    }
+
+    // one tile per matrix cell: u16 CSR head table, then the concatenated delta streams
+    let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(runs.len());
+    for (g, cell_runs) in runs.iter().enumerate() {
+        let (_, _, tcs) = tcs_of(g as u64);
+        if cell_runs.iter().any(|&(ci, _)| ci >= tcs) {
+            return Err(format!("rel: cell {g} bad table index"));
+        }
+        let mut cell_runs = cell_runs.clone();
+        cell_runs.sort_unstable();
+        cell_runs.dedup();
+        let mut hist = vec![0usize; tcs + 1];
+        for &(ci, _) in &cell_runs {
+            hist[ci + 1] += 1;
+        }
+        for k in 1..=tcs {
+            hist[k] += hist[k - 1];
+        }
+        // encode each table cell's positions first: filler u16s (0xFFFF for huge deltas) make the
+        // encoded length differ from the pair count, so the CSR head must use real offsets.
+        let mut streams: Vec<Vec<u8>> = Vec::with_capacity(tcs);
+        let mut starts: Vec<u16> = Vec::with_capacity(tcs);
+        let mut cur = tcs;
+        for k in 0..tcs {
+            let lo = hist[k];
+            let hi = hist[k + 1];
+            starts.push(
+                cur.u16_ok()
+                    .ok_or(format!("rel: cell {g} value offset exceeds u16"))?,
+            );
+            if lo < hi {
+                let mut ps: Vec<u32> = cell_runs[lo..hi].iter().map(|&(_, p)| p).collect();
+                ps.sort_unstable();
+                ps.dedup();
+                let enc = encode_positions(&ps);
+                cur += enc.len() / 2;
+                streams.push(enc);
+            } else {
+                streams.push(Vec::new());
+            }
+        }
+        if cur > 0xFFFF {
+            return Err(format!("rel: cell {g} tile exceeds device limit"));
+        }
+        let mut tile = Vec::with_capacity(2 * cur);
+        for w in &starts {
+            tile.extend_from_slice(&w.to_le_bytes());
+        }
+        for s in &streams {
+            tile.extend_from_slice(s);
+        }
+        tiles.push(tile);
+    }
+
+    // assemble file: canonical 0x77 outer header (kind REL), region (9 words + cell table), tiles
+    let region = 36 + 4 * (d6 * d7) as usize;
+    let tiles_start = 0x77 + region;
+    let tiles: Vec<Vec<u8>> = tiles;
+    let tiles_total: usize = tiles.iter().map(|t| t.len()).sum();
+    let mut f = crate::header::nl_header(
+        crate::header::KIND_REL,
+        0,
+        0,
+        region as u32, // device-validated: region == (9 + d6*d7)*4
+    );
+    for w in [
+        u32::from(list_a),
+        u32::from(list_b),
+        src_elems as u32,
+        tgt_elems as u32,
+        REL_BAND as u32,
+        REL_BAND as u32,
+        d6 as u32,
+        d7 as u32,
+        tiles_total as u32,
+    ] {
+        f.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut off = tiles_start;
+    for t in &tiles {
+        f.extend_from_slice(&(off as u32).to_le_bytes());
+        off += t.len();
+    }
+    for t in &tiles {
+        f.extend_from_slice(t);
+    }
+    Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// write -> parse -> query returns exactly the intended pairs; gap fillers + multi-cell grid.
+    #[test]
+    fn rel_roundtrip() {
+        let mut rels: Vec<(u32, u32)> = Vec::new();
+        for s in 0..2000u32 {
+            for t in 0..9u32 {
+                if (s * t + s + t) % 3 == 0 {
+                    rels.push((s, (t * 600 + (s * 7 + t) % 600) % 5000));
+                }
+            }
+        }
+        rels.extend([(0u32, 4999u32), (1999, 0), (1999, 4999)]);
+        rels.sort();
+        rels.dedup();
+        let f = write_rel(2000, 5000, 1, 2, &rels).expect("write");
+        let idx = RelIndex::parse(&f).expect("parse");
+        let all = get_relations(&f, &idx, true, 0, 2000).expect("query all");
+        assert_eq!(all.len(), rels.len(), "extra: {all:?} vs {rels:?}");
+        assert_eq!(all, rels, "by_source full-range must match exactly");
+        for &(s, t) in rels.iter().take(60) {
+            assert!(
+                get_relations(&f, &idx, true, s, s + 1)
+                    .unwrap()
+                    .contains(&(s, t)),
+                "by_source {s},{t}"
+            );
+            assert!(
+                get_relations(&f, &idx, false, t, t + 1)
+                    .unwrap()
+                    .contains(&(t, s)),
+                "by_target {t},{s}"
+            );
+        }
+    }
+
+    /// Empty relation set parses and answers "none"; tiles are emitted in the device-valid shape.
+    #[test]
+    fn rel_roundtrip_empty() {
+        let f = write_rel(1000, 1000, 5, 6, &[]).unwrap();
+        let idx = RelIndex::parse(&f).unwrap();
+        assert!(get_relations(&f, &idx, true, 0, 1000).unwrap().is_empty());
+        assert!(get_relations(&f, &idx, false, 0, 1000).unwrap().is_empty());
+    }
+
+    /// Writer header satisfies the device validation rules.
+    #[test]
+    fn rel_header_invariants() {
+        let f = write_rel(194118, 412392, 9, 4, &[(0, 0)]).unwrap();
+        let hdr = u32v(&f, 0x10) as usize;
+        let (d6, d7) = (u32v(&f, hdr + 0x18) as u64, u32v(&f, hdr + 0x1c) as u64);
+        assert_eq!(u32v(&f, 0x14) as u64, (9 + d6 * d7) * 4);
+        assert_eq!(u32v(&f, hdr + 8), 194118);
+        let cells = (0..d6 * d7)
+            .map(|i| u32v(&f, hdr + 36 + (4 * i) as usize) as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(cells[0], 0x77 + (9 + d6 * d7) as usize * 4);
+        assert_eq!(cells[0] + u32v(&f, hdr + 0x20) as usize, f.len());
+    }
+
+    /// Stock card `REL00004.DAT` parses with the device's derived grid.
+    #[ignore = "requires the stock card dump"]
+    #[test]
+    fn rel_stock_rel00004() {
+        let p = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00004.DAT";
+        let b = std::fs::read(p).unwrap();
+        let idx = RelIndex::parse(&b).unwrap();
+        assert_eq!((idx.d[0], idx.d[1]), (129, 12));
+        assert_eq!((idx.d[2], idx.d[3]), (194118, 412392));
+        assert_eq!((idx.d[4], idx.d[5]), (380, 806));
+        assert_eq!((idx.d[6], idx.d[7]), (20, 10));
+        let (sb, tb, bpr, bpc) = idx.grid();
+        assert_eq!((sb, tb, bpr, bpc), (511, 512, 26, 56));
+        // a source-element query must answer with plausible target ids
+        let r = get_relations(&b, &idx, true, 0, 40).unwrap();
+        assert!(!r.is_empty());
+        assert!(r.iter().all(|&(s, t)| s < 40 && t < idx.d[3]));
+    }
+}

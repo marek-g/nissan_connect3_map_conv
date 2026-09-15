@@ -12,7 +12,9 @@
 //! `NLPositionAttrVector::Decode`, `NLBlockLinkAttrVector::Decode`,
 //! `NLBlock::ProcessNode`. See LID_format.md (ASF section).
 
+pub mod header;
 mod rebuild;
+pub mod rel;
 pub mod write;
 
 /// PAU = "position angle unit": deg * 2^31 / 180 (signed 32-bit).
@@ -990,16 +992,26 @@ struct TrieNode {
 /// stock keeps ~11k nodes/block, so we split entries into blocks under this budget.
 const MAX_NODES_PER_BLOCK: usize = 10_000;
 
-/// Encode name entries into an ASF `LID*` name-list file (a plain trie, possibly multi-block),
-/// the exact byte format `read()` parses back. This is the round-trip oracle for the converter:
+/// Default identity wrapper around [`encode_id`] (test/oracle convenience).
+pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
+    encode_id(0, 0, entries)
+}
+
+/// Encode name entries into an ASF `LID2nnnn` name-list file (a plain trie, possibly multi-block),
+/// the exact byte format `read()` parses back; this is the round-trip oracle for the converter:
 /// `read(&encode(&entries)).elements` reproduces the `(name, position)` multiset.
+///
+/// The file carries the canonical 0x77-byte outer header (`header::nl_header`, kind `1`) with the
+/// `rIdxListID` identity `{region, list_id}` — the device identifies a raw list file by these first
+/// bytes (stock `LID2nnnn` do exactly this; §11), so they must match the list id used in META
+/// relation records.
 ///
 /// Position handling follows the device (§12.5): entries that carry an owning `city` are grouped into
 /// blocks **per city** and stored as `position − city` deltas (the device adds the queried city back);
 /// the file header then advertises the region's SW corner as its file-level anchor (flags `0x0008_0001`).
 /// Entries without a city (the settlement gazetteer) are stored without any coordinate stream (flags
 /// `0x0008_0000`, origin `-1/-1`) — exactly like the stock `LID20000`.
-pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
+pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
     let with_city = entries.iter().any(|e| e.city.is_some());
 
     // --- group by city (first-seen order), then chunk each city under MAX_NODES_PER_BLOCK ---
@@ -1052,15 +1064,17 @@ pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
     };
     let flags: u32 = if with_city { 0x0008_0001 } else { 0x0008_0000 };
 
-    // --- container: header @0x40, then block table (u32 block starts), then blocks ---
-    let hdr = 0x40u32;
+    // --- container: canonical 0x77 outer header, then sub-header, block table (u32 starts), blocks ---
+    let hdr = crate::header::NL_HEADER_LEN as u32;
     let table_at = hdr as usize + 59;
     let table_len = blocks.len() * 4;
     let first_block_at = table_at + table_len;
-    let mut f = vec![0u8; hdr as usize];
-    f[0..4].copy_from_slice(b"NLID");
-    f[0x10..0x14].copy_from_slice(&hdr.to_le_bytes());
-    f[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // extra
+    let mut f = crate::header::nl_header(
+        crate::header::KIND_NAME_LIST,
+        region,
+        list_id,
+        (59 + table_len) as u32, // sub-header region size (stock keeps header+table there)
+    );
     let mut sh: Vec<u8> = Vec::new();
     sh = put_u32(sh, total_elem as u32); // element_count (global)
     for i in 0..6 {

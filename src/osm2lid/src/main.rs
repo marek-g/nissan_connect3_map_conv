@@ -166,19 +166,34 @@ fn main() {
         !no_poi,
     );
     let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
-    let ncit = write_cities(&outdir.join("LID20000.DAT"), &data, bbox);
-    let st_entries = collect_street_entries(&data, bbox);
-    let (nst, street_idx) = write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries);
+    let (ncit, city_idx) = write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2);
+    let (st_entries, city_of) = collect_street_entries(&data, bbox);
+    let (nst, street_idx) =
+        write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
+    let nrel = write_street_city_rel(
+        &outdir.join("REL00001.DAT"),
+        &st_entries,
+        &city_of,
+        &street_idx,
+        &city_idx,
+    );
     let naddr = if no_genattr {
         0
     } else {
-        write_gen_attr(&outdir.join("LID40006.DAT"), &data, bbox, &street_idx)
+        write_gen_attr(
+            &outdir.join("LID40006.DAT"),
+            &data,
+            bbox,
+            &street_idx,
+            region_id,
+        )
     };
 
     eprintln!(
-        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20000.DAT ({} cities), LID20006.DAT ({} streets), LID40006.DAT ({} house numbers), REGION_ID=0x{:03x} ({})",
-        out, npoi, ncity, ncit, nst, naddr, region_id, region.to_uppercase()
+        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), REGION_ID=0x{:03x} ({})",
+        out, npoi, ncity, ncit, nst, nrel, naddr, region_id, region.to_uppercase()
     );
+    eprintln!("NOTE: ship the stock META0000.DAT unchanged — its relation table entry #1 is (2↔3), which is what REL00001.DAT carries.");
     eprintln!("NOTE: crossing (+10000) and point-address (PA) tables are not generated yet — see LID_format.md §12.");
 }
 
@@ -558,11 +573,12 @@ fn write_db_city(
 fn collect_street_entries(
     d: &Data,
     bbox: Option<(f64, f64, f64, f64)>,
-) -> Vec<lid_format::NameEntry> {
+) -> (Vec<lid_format::NameEntry>, Vec<Option<String>>) {
     use lid_format::NameEntry;
     let mut entries: Vec<NameEntry> = Vec::new();
+    let mut city_of: Vec<Option<String>> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let places: Vec<(i64, i64)> = d.places.iter().map(|(_, c, _)| *c).collect();
+    let places: Vec<(&String, (i64, i64))> = d.places.iter().map(|(n, c, _)| (n, *c)).collect();
     for (name, refs) in &d.streets {
         let nm = name.trim();
         if nm.is_empty() || nm.contains('\0') {
@@ -587,27 +603,32 @@ fn collect_street_entries(
             continue;
         } // dedup by name (keep first occurrence)
         let city = nearest_place(&places, cx, cy);
+        city_of.push(city.map(|(n, _)| n.clone()));
         entries.push(NameEntry {
             label: nm.to_string(),
             x_pau: cx as i32,
             y_pau: cy as i32,
-            city,
+            city: city.map(|(_, c)| c),
         });
     }
-    entries
+    (entries, city_of)
 }
 
-/// Nearest `place=` node (the street's city anchor), squared PAU distance. Falls back to 0,0 only when the
-/// input has no settlement at all (empty gazetteer) — then deltas stay absolute, matching the old output.
-fn nearest_place(places: &[(i64, i64)], x: i64, y: i64) -> Option<(i32, i32)> {
-    let mut best: Option<(i128, i64, i64)> = None;
-    for &(px, py) in places {
+/// Nearest `place=` node (name + coords) — the street's city anchor — by squared PAU distance. Falls
+/// back to `None` only when the input has no settlement at all (empty gazetteer).
+fn nearest_place<'a>(
+    places: &[(&'a String, (i64, i64))],
+    x: i64,
+    y: i64,
+) -> Option<(&'a String, (i32, i32))> {
+    let mut best: Option<(i128, &String, (i64, i64))> = None;
+    for &(name, (px, py)) in places {
         let d2 = ((px - x) * (px - x) + (py - y) * (py - y)) as i128;
         if best.is_none_or(|(b, _, _)| d2 < b) {
-            best = Some((d2, px, py));
+            best = Some((d2, name, (px, py)));
         }
     }
-    best.map(|(_, px, py)| (px as i32, py as i32))
+    best.map(|(_, name, (px, py))| (name, (px as i32, py as i32)))
 }
 
 /// Write the street name-list and return the **device element ids** of its entries (name → element index).
@@ -616,8 +637,10 @@ fn nearest_place(places: &[(i64, i64)], x: i64, y: i64) -> Option<(i32, i32)> {
 fn write_name_list_idx(
     path: &Path,
     entries: &[lid_format::NameEntry],
+    region: u16,
+    list_id: u16,
 ) -> (usize, HashMap<String, u32>) {
-    let bytes = lid_format::encode(entries);
+    let bytes = lid_format::encode_id(region, list_id, entries);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
         return (0, HashMap::new());
@@ -654,6 +677,7 @@ fn write_gen_attr(
     d: &Data,
     bbox: Option<(f64, f64, f64, f64)>,
     street_idx: &HashMap<String, u32>,
+    region: u16,
 ) -> usize {
     use lid_format::write::{write_gen_attr_file, BlockData, ColData};
     use std::collections::BTreeMap;
@@ -760,7 +784,8 @@ fn write_gen_attr(
             cols,
         });
     }
-    let bytes = write_gen_attr_file(nel, &[], &blocks);
+    let outer = lid_format::header::nl_header(lid_format::header::KIND_GEN_ATTR, region, 3, 0);
+    let bytes = write_gen_attr_file(nel, &outer, &blocks);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
         return 0;
@@ -768,10 +793,58 @@ fn write_gen_attr(
     nel as usize
 }
 
-/// Emit a city/locality name-list (`LID20000.DAT`, the settlement ASF name-list) from the parsed
-/// `place=` nodes. One element per unique place name — **without coordinates**: the stock settlement
-/// name-list carries none (empty `0x407` streams, origin `-1/-1`, §12.5), so the writer keeps `city: None`.
-fn write_cities(path: &Path, d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> usize {
+/// Emit `REL00001.DAT` — the street↔city relation matrix the stock META0000 relation table expects at
+/// index 1 (`{from=listID 2 TOWN, to=listID 3 STREET}`), which the file stores as d0=3/d1=2 (rows =
+/// street elements of `LID20006`, cols = city elements of `LID20001`; stock file 00001 = same shape).
+/// One pair per street: its element ↔ the city element of its anchor place (§11.7).
+fn write_street_city_rel(
+    path: &Path,
+    entries: &[lid_format::NameEntry],
+    city_of: &[Option<String>],
+    street_idx: &HashMap<String, u32>,
+    city_idx: &HashMap<String, u32>,
+) -> usize {
+    let src_elems = street_idx.len() as u64;
+    let tgt_elems = city_idx.len() as u64;
+    let mut rels: Vec<(u32, u32)> = Vec::new();
+    for (e, city) in entries.iter().zip(city_of) {
+        let (Some(s), Some(cn)) = (street_idx.get(e.label.as_str()), city) else {
+            continue;
+        };
+        if let Some(t) = city_idx.get(cn.as_str()) {
+            rels.push((*s, *t));
+        }
+    }
+    if src_elems == 0 || tgt_elems == 0 || rels.is_empty() {
+        return 0;
+    }
+    match lid_format::rel::write_rel(src_elems, tgt_elems, 3, 2, &rels) {
+        Ok(bytes) => {
+            if fs::write(path, &bytes).is_err() {
+                eprintln!("write {path:?} failed");
+                return 0;
+            }
+            rels.len()
+        }
+        Err(e) => {
+            eprintln!("REL00001: {e}");
+            0
+        }
+    }
+}
+
+/// Emit the settlement name-list — the stock `LID20001.DAT` for **listID 2 (TOWN)** (the HNR-domain
+/// `LID20000` is listID 129 — see the inventory table §11). One element per unique place name —
+/// **without coordinates**: the stock settlement name-list carries none (empty `0x407` streams, origin
+/// `-1/-1`, §12.5), so the writer keeps `city: None`. Returns `(count, name → device element id)`.
+#[allow(clippy::type_complexity)]
+fn write_cities(
+    path: &Path,
+    d: &Data,
+    bbox: Option<(f64, f64, f64, f64)>,
+    region: u16,
+    list_id: u16,
+) -> (usize, HashMap<String, u32>) {
     use lid_format::NameEntry;
     let mut seen: HashSet<String> = HashSet::new();
     let mut entries: Vec<NameEntry> = Vec::new();
@@ -790,12 +863,18 @@ fn write_cities(path: &Path, d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> us
             city: None,
         });
     }
-    let bytes = lid_format::encode(&entries);
+    let bytes = lid_format::encode_id(region, list_id, &entries);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
-        return 0;
+        return (0, HashMap::new());
     }
-    entries.len()
+    let mut idx = HashMap::new();
+    if let Ok(nl) = lid_format::read(&bytes) {
+        for (i, e) in nl.elements.iter().enumerate() {
+            idx.entry(e.name.clone()).or_insert(i as u32);
+        }
+    }
+    (entries.len(), idx)
 }
 
 fn in_bbox(c: (i64, i64), bbox: Option<(f64, f64, f64, f64)>) -> bool {

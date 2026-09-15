@@ -413,13 +413,27 @@ name-list = `LID%05u` @ `base`; crossing = @ `base+10000`; **GenAttr/HNR = @ `ba
 (fileType 0x18); relation = `REL_%05u` (fileType 0x16). Name-list / crossing / GenAttr share the **same**
 ASF container + parser.
 
-### 11.2 File header — 38 bytes, no ASCII magic (CONFIRMED)
+### 11.2 File header — canonical 0x77-byte outer header (CONFIRMED, stock-byte proof)
 
-`+0x00 u16`=format tag (`13` in these files), `+0x02 u16`=region code, `+0x04 u16`=**block count**
-(=the recurring `0d 00` = 13, NOT a binary code), then info u16/u32s; `+0x10 u32`=**hdrSize**, `+0x14 u32`=
-**extraSize**; `+0x18..` five u16 **string offsets** → embedded `LID-COPYRIGHT`/`CREATE DATE`/`SOFTWARE`/… ASCII
-block (the only plaintext in the file). Two compressed **u32 vectors** follow: block **offsets** (obj `+0x9c`)
-and **sizes** (`+0xac`); count in the ASF sub-header `+0x04`.
+Every raw NL file (`LID2nnnn`, `LID3nnnn`, `LID4nnnn`, `RELnnnnn`, `PA_*`) begins with an identical
+0x77-byte header — `[0x18, 0x77)` is byte-identical across all kinds and files (verified on POL stock;
+generator: `lid_format::header::nl_header`):
+
+| off | content |
+|---|---|
+| `0x00` | name-list/GenAttr: **`rIdxListID`** = `{u16 regionIdent; u16 listID; u16 0; u16 0x41ec}` — the *same 8-byte shape* the META relation records store; REL files: 12 zero bytes |
+| `0x0c` | `u32` file kind: **1** = raw name list, **3** = GenAttr, **6** = REL matrix |
+| `0x10` | `u32` = `0x77` split/sub-header offset |
+| `0x14` | `u32` sub-header region size (REL: device-validated `(9+d6·d7)·4`) |
+| `0x18` | 0x5F-byte author block: format u16s `{26, 54, 5f, 60, 0d, 02, 76}`, then plaintext runs at `0x26` copyright, `0x54` build date, `0x60` `TLID_EQUIVALENT_CHAR` |
+
+The `listID` field is how the device *binds* a list file: `bFindRelation`/filter paths compare list
+entries by the full `rIdxListID` (region+id), so a generated file **must** carry the right numbers.
+POL stock inventory (`region 0x0402`): `LID20000`=listID **129**(HNR elements) `LID20001`=**2** TOWN
+`LID20002`=10 `LID20003`=8 `LID20004`=**12** `LID20005`=9 `LID20006`=**3** STREET; `LID30006` = crossings
+of listID 3 (+10000); `LID4000n` = GenAttr of listID(n-domain) (+20000, observed 129,2,10,8,12,9,3);
+`LID50001` = listID 2 kind 4. The compressed `LID0nnnn` speller files use a different (`2777000d`)
+container and are *not* this format.
 
 ### 11.3 Block = 8-byte header + column-descriptor TOC + compressed columns (CONFIRMED)
 
@@ -564,27 +578,60 @@ pattern semantics are the last thing not pinned (the on-device matcher cannot be
   `NLPositionAttrVector` → resolves a house number to a real coordinate (no interpolation).
 - `REL` (fileType 0x16, `LISA_tclDataManager::bGetFileNameFromDataAddress` `00bc4dd0`; +90000 variant for
   cross-domain): a **sparse blocked relation matrix**. `NLRelMatrixFile::DecodeSubHeader` `00e11874` reads
-  **9 × u32** at the region start (file `u32@0x10` = header size, `u32@0x14` = region size):
-  `d0, d1` = the two list ids related (samples: `REL00000` d0=2; `REL00004`: `d0=129, d1=12`),
+  **9 consecutive u32** at the region start (file `u32@0x10` = header size 0x77, `u32@0x14` = region size):
+  `d0, d1` = the two side ids related (samples: `REL00000` d0=2; `REL00004`: `d0=129, d1=12`),
   `d2` = source element count, `d3` = target element count (REL00004: 194118 ← LID20000, 412392 ← LID20004),
-  `d4, d5` = tile element extents (row/col), `d6, d7` = index-grid dims (`< 0x10000`, both mandatory),
-  `d8` (@+0xb8) = region-end anchor. Then a **`d6 × d7` u32 tile-offset matrix** (column index =
-  `d6*colGridBlock + rowGridBlock`); region size validated = `(matrix_len + 9)*4` + tiles.
-  `NLRelMatrixDescr::bCheckAndCalculate` `00e11564` derives tile-grid counts
-  (`+0x20..+0x34`). `enDetermineDataBlocksByType` `00e11ab8` converts an element interval into
-  `{offset,size}` tile descriptors (`size = next_cell − cell`, last wraps via `d8`) — access type 1 = by
-  rows (element → its targets), type 2 = by columns (**city→street = type 2 with rows=cities? — writer
-  must emit both directions as the per-query access type dictates**).
-- **Tile payload (CONFIRMED, `NLRelMatrixBlock::enGetRelationsByType` `00e11310`)**: a tile is
-  **two u16 parts**: `rowsInTile × colsInTile` u16 **cell count-table** (validated: `table[0] ==
-  rows*cols` and a non-decreasing CSR of cell offsets), then the referenced u16 **value lists** at
-  `tile + table[cell]*2` — each non-empty cell = the row/col ids related to the tile's row/col element.
-  `enGetRowValues`/`enGetColumnValues` read forward from `table[cell]` until `table[cell+1]`.
-  Empty matrix cells → matrix offset 0/adjacent (writer must confirm the "no tile" encoding empirically).
-- **Writer recipe for city→street**: rows = cities (or districts), cols = streets (of that file pair),
-  u16 counts+values CSR as above, tile grid per `tile_elems` fields (≥ 1 relation per tile), matrix index
-  entry per used tile. **POSTILES.DAT** = fileID `0x17` (`NLPOIPosSubHeader` `00e10edc`, decode
-  `00e10d90`) — needed for POI tile search, not for the address phone-book path.
+  `d4, d5` = **source/target elements per band**, `d6, d7` = matrix-grid dims (`< 0x10000`, both mandatory),
+  `d8` (9th word, region+0x20 / RAM `+0xb8`) = total tile bytes. Then a **`d6 × d7` u32 absolute tile-offset
+  matrix** (scan order `d6*colBandGroup + rowBandGroup`); region size validated = `(matrix_len + 9)*4`.
+  `NLRelMatrixDescr::bCheckAndCalculate` `00e11564`: `srcBands = ceil(d2/d4)`, `tgtBands = ceil(d3/d5)`;
+  bands per matrix row-group `bpr` = `srcBands/d6` incremented while `(d6−1)(bpr+1) < srcBands` (`d6==1` ⇒
+  `bpr = srcBands`), same for `bpc`; group `r` covers bands `[r·bpr, min((r+1)·bpr, srcBands))` (stock
+  REL00004: 511/512 bands → bpr 26 / bpc 56). `enDetermineDataBlocksByType` `00e11ab8` converts an element
+  interval into `{offset,size}` descriptors (`size = next_cell − cell`, last wraps via `d8`) — access type 2
+  filters **source** (stride `d4`), type 1 filters **target** (stride `d5`); both are served by the *same*
+  tile bytes (stock REL00004 relates LID20000 address-elements ↔ LID20004 street-elements).
+- **Tile payload (CONFIRMED, `enGetRelationsByType` `00e11310` + `NLSubMatrix::en{Column,Row}Values`
+  `00e111ac`/`00e1125c`)**: a `tcs = rowsBands × colsBands` **u16 CSR head-table** (validated `table[0] == tcs`
+  and non-decreasing; last cell's end defaults to `(size & 0x1FFFF) >> 1` ⇒ tiles must stay < 128 KiB) indexed
+  `cell = colBandLocal·rows + rowBandLocal`, then per-cell **u16 delta streams** at `tile + 2·table[cell]`:
+  running `pos` += value, a `0xFFFF` value is a *filler* adding `0xFFFE` and emitting nothing; decoded with
+  stride `d4` as `src = d4·srcBandGlobal + pos % d4`, `tgt = d5·tgtBandGlobal + pos / d4` (the in-band writer
+  position is `pos = tgtLocal·d4 + srcLocal`). Any head-table mismatch/monotonicity break aborts the whole tile.
+- **listIds and REL file numbering (SOLVED, `bSetUpRelationOrIndexFilter` `00c608f0` +
+  `bDetermineRelationMatrixOfList` `00c607b8` + `bFindRelation` `00cbf1d8` +
+  `poGetNewNLRelationProcessor` `00bd3e68`)**: the region's **ConList relation description table**
+  (entry = `rIdxRelationDescription` = `regionIdent` + from/to `rIdxListID` + relationType) is queried by
+  `bFindRelation` for a list pair; it matches `from==A, to==B` *or* `to==A, from==B` (reverse match sets
+  the direction flag → access type 1 vs 2) and returns **`relIdx` = the 0-based index of the entry among
+  all entries of that region**. That index *is* the REL file number: `u32SetRegionIDtoFileID(region, relIdx)`
+  + `fileType 0x16` → `REL%05u.DAT` via `bExistFile` (missing file ⇒ graceful null processor). The table
+  itself lives in `META%04u.DAT` (read by `bReadRegionMetaData` `00bd6ad8`: fileType `0x12`, fileID region/0,
+  0x1C-byte header; **header `u32@+0x10` = relation-table file offset, `u32@+0x14` = entry count,
+  `u32@+0x18` = total file size**). Table (**fully decoded, POL: offset `0x46a4`, count `7`**) = packed
+  **28-byte records** (`bSetAbsoluteAddress` passes struct size `0x1C`) of
+  `{u16 regionIdent; u16 relType; rIdxRelationDescription.from = {u16 region; u16 listID; u16 0; u16 0x41ec};
+  .to = {…same…}; u32 0}` — the `0x41ec` slot is a constant (ConList-section dir anchor, [OPEN]).
+  POL records: (2→2,t1)(2→3,t0)(12→2,t1)(2→10,t1)(12→129,t2)(3→59,t1)(2→9,t1) — index *k* (counting
+  same-region entries only!) = REL file number ⇒ REL00000(2,2) REL00001(street,town) REL00002(2,12)
+  REL00003(10,2) REL00004(129,12), **REL00005 = pair 3↔59 with no matrix file** (`bExistFile` ⇒ null),
+  REL00006(9,2) — 100 % consistent. Observed: `REL file d0/d1 = (meta record to, from)` in all 6 files.
+  `d0/d1` in the file sub-header are these `rIdxListID` list ids — the search-domain kinds
+  (`TEMPLATE.XML` comments: 2=TOWN, 3=STREET, 4=JUNCTION, 5=HOUSENUMBER, 60=CITYDISTRICT, 61=POSTAL DISTRICT;
+  stock POL additionally uses POI-domain ids 9, 10, 12 and 129=`0x81` — the latter's domain is [OPEN]).
+  A name-list file can also carry its related meta-relidx vector in its ASF sub-header (`RAM +0x64..+0x68`,
+  `bGetListSpecRelIdxFromMetaDataRelIdx` `00cec9e8` maps meta idx ⇒ list-local idx).
+  **Consequence for `osm2lid`:** the stock `META0000.DAT` is shipped unchanged; its relation entry #1 is
+  (2↔3), so `osm2lid` writes exactly `REL00001.DAT` (street→city) with stock-faithful headers — any *additional*
+  relation would require rewriting the META table (offset/count live at `+0x10/+0x14`; append-at-EOF relocation
+  is safe since only the header anchors the table).
+- **Writer implemented** in `src/lid_format/src/rel.rs` (`write_rel` + reader model `RelIndex::parse` /
+  `get_relations` / `bands_per_group`; `REL_BAND = 512` elems, target `REL_CELL_BANDS = 32` band-groups,
+  writer replicates the device `bpr/bpc` derivation so tables agree; empty matrix cells still get a real tile
+  = flat head table of `tcs` equal starts). Roundtrip (both access modes, multi-band grid, gap fillers) + the
+  device-faithful header invariants pass; `#[ignore]` probe parses stock `POL/REL00004.DAT` and answers queries
+  through the real reader path. **POSTILES.DAT** =
+  fileID `0x17` (`NLPOIPosSubHeader` `00e10edc`, decode `00e10d90`) — POI tile search, not the address path.
 
 ### 11.8 Converter verdict (CONFIRMED for the address path)
 
@@ -599,8 +646,8 @@ is the real implementation cost** — build `lid2dump` first and decode stock be
 > `src/lid_format/` crate — now **decodes the ASF `LID2*` name-list blocks** (§12): container, block table,
 > descriptor TOC, column codecs, `outDegree`/DFS trie, edge labels, positions, belonging. Verified on
 > `POL/LID20006` (98 blocks / 974871 elements; real street names surface). `osm2lid` (writer) emits the
-> SQLite `GLOB_POI.DAT` **and** the ASF **city + street name-lists** as a plain trie (`LID20000.DAT`,
-> `LID20006.DAT`, §12.9), both round-trip validated. The GenAttr (`LID4nnnn`, +20000) **container + block TOC**
+> SQLite `GLOB_POI.DAT` **and** the ASF **city + street name-lists** as a plain trie (`LID20001.DAT`
+> city/listID 2, `LID20006.DAT` street/listID 3, §12.9), both round-trip validated. The GenAttr (`LID4nnnn`, +20000) **container + block TOC**
 > are now decoded too — container, block TOC **and the block interior** (`NLGenAttrFile` /
 > `read_gen_attr` / `GenAttrIndex::decode_block`, §11.6; validated on `POL/LID40006` block 0) — the reader no
 > longer returns garbage on them and the descriptor/attr-vector structure + parity/owner/value columns decode.
@@ -610,7 +657,7 @@ is the real implementation cost** — build `lid2dump` first and decode stock be
 > (`gen_attr_writer_roundtrip_device_model`, `osm2lid/tests/genattr.rs`). **Still pending:** `NLHnrToTree`
 > on-device matcher semantics (no card to run it), crossing files (+10000), `PA`, `REL`.
 > No `DB_CITY.DAT` on this card, so SQLite cannot substitute for the regional city name-list — it must be
-> written as `LID20000.DAT`.
+> written as the **listID-2** file `LID20001.DAT` (stock `LID20000` is the listID-129 HNR domain, §11.2).
 
 ### 11.9 Empirical reality on the EUR card — **[CORRECTED, 2026-09; earlier "no sample" claim was WRONG]**
 
@@ -619,7 +666,7 @@ is the real implementation cost** — build `lid2dump` first and decode stock be
 > in the POL region. It is now **disproven**: the ASF name-lists are present in **every** region. See §12.
 
 Ground truth (verified 2026-09):
-- Every region has ASF name-list files `DATA/DATA/LID/CCP/<reg>/LID2nnnn.DAT` (e.g. POL `LID20000..LID20011`,
+- Every region has ASF name-list files `DATA/DATA/LID/CCP/<reg>/LID2nnnn.DAT` (e.g. POL `LID20000..20006`, identity inventory §11.2,
   `LID20006.DAT` = 15.3 MB, `element_count = 974871`). These match the `NLNameList`/`NLAsfBlock` container
   of §11.2–11.7 exactly (verified by a working reader — see §12).
 - `LID0nnnn.DAT` is the `fm_tcl` **content/landmark** container (§5), *not* the address name-list — that is
@@ -753,7 +800,8 @@ files (unit tests + `malopolskie` fixtures):
   the device's city-relative decode reconstructs the absolute position exactly; the street **element ids**
   for the GenAttr join are read back from the encoded file's terminating-element DFS order
   (`write_name_list_idx`). **8828 names → 14+ blocks → 8828 elements back**.
-* **cities/settlements** (`LID20000.DAT`): one element per unique OSM `place=` name, written **without any
+* **cities/settlements** (`LID20001.DAT`, listID 2 — stock `LID20000` is the listID-129 HNR domain): one
+  element per unique OSM `place=` name, written **without any
   coordinates** (stock gazetteer flavor: empty `0x407` streams, origin `-1/-1`) — **10482 names → 12
   blocks → 10482 elements back**, diacritics intact.
 
@@ -806,12 +854,14 @@ is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matc
    (`hdr+0x0c/0x10/0x14`). No file table to find.
 2. **Charset codebook** (`0x8403`, §12.4) — when a byte is a charset code vs a literal (labels decode as literal
    UTF-8 on `POL`, so not exercised yet).
-3. **Writer (`osm2lid` + `lid_format::encode`)** — DONE for the **street + city name-lists** (plain trie,
-   multi-block, §12.9): OSM highway `name` → `LID20006.DAT` and OSM `place=` → `LID20000.DAT`, both validated
-   by full round-trip, **plus the house-number GenAttr `+20000` file** (`LID40006.DAT`, §11.6/§11.6b,
-   OSM `addr:housenumber` → street-joined records, validated by `osm2lid/tests/genattr.rs`).
-   **Still pending:** point-address `PA` / tile payload **`REL` generator** (container now *decoded* §11.7,
-   generation not implemented), crossing files (+10000),
+3. **Writer (`osm2lid` + `lid_format`)** — DONE for: **street name-list** (OSM highway `name` →
+   `LID20006.DAT`, listID 3), **city name-list** (OSM `place=` → `LID20001.DAT`, listID 2), the **house-number
+   GenAttr** (`LID40006.DAT`, §11.6/§11.6b) and the **street→city relation `REL00001.DAT`** (street element ↔
+   anchor-city element; stock-numbered: META0000 relation entry #1 = (2↔3) — ship the stock META0000.DAT
+   unchanged and the device finds the file). All files carry the canonical 0x77 outer header with their
+   `rIdxListID` identity (`lid_format::header`, byte-verified against stock); `osm2lid/tests/genattr.rs`
+   asserts identities + REL matrix end-to-end. **Nothing is on-device-validated yet — first card test pending.**
+   **Still pending:** point-address `PA`, crossing files (+10000), own META writer,
    and on-device acceptance (`NLHnrToTree` against a real card).
 
 > The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**
