@@ -805,7 +805,7 @@ diacritics. The former "only remaining UNKNOWN" (the per-block **geo origin**, Â
 coords are deltas from the queried city's position (query-supplied), and `read` also exposes the file-level
 `tNLHPosition` (`NameList.origin`). Stock-name garbage (2026-09): the old reader keyed labels by child node-id
 and "picked a variant" by longest/diacritic heuristics; replaced by the device-faithful walk above
-(`debug_trie`/`debug_find` in `lid_format` are the diagnostic tools used to prove it against stock `POL`).
+(verified against stock `POL` via the RE'd accessors; the temporary diagnostic dumps were removed once fixed).
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into â‰¤10k-node blocks, and emits the container + descriptor
