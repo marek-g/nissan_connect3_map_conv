@@ -374,6 +374,11 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
 pub struct Element {
     pub category: u16,
     pub name: String,
+    /// Full raw device string of this element's trie path **before** the display cut (line 1 =
+    /// ASCII-folded sort/type-in form, then TAB-separated extra lines: settlement number + the
+    /// diacritic/original form). `name` is the post-first-TAB display line (empty when line 1 had
+    /// no content), per `vCollectNamesOfCat`. Kept latin-1-decoded for invalid UTF-8 fidelity.
+    pub sort_name: String,
     pub x_pau: i32, // stored delta: absolute = queried-city (or file `origin`) + (x_pau, y_pau) (§12.5)
     pub y_pau: i32,
     pub has_pos: bool,
@@ -704,21 +709,25 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             }
             None => continue,
         };
-        // childStart[n] / firstEdge via faithful CalculateFirstEdgeIndex + ProcessNode (DFS preorder):
-        //   firstEdge[n]=edgeCounter; childStart[n]=base+edgeCounter; edgeCounter+=outDegree[n]; recurse children.
-        // children(n) = [childStart[n] .. +outDegree[n]). Iterative to avoid native stack overflow.
+        // firstEdge/childStart per node, exactly like the device: `CalculateFirstEdgeIndex` runs
+        // `ProcessNode` as a PURE DFS with no visited-guard — in the shared-node (DAWG) layout a node
+        // is reached through several parents and its stored firstEdge/childStart hold the values from
+        // the LAST visit (overwrite per visit). childStart[n] = treeBase + firstEdge[n];
+        // children(n) = [childStart[n] .. +outDegree[n]). Root loop jumps by the subtree VISIT count.
         let mut cs = vec![0usize; node_count];
+        let mut fe = vec![usize::MAX; node_count];
         {
             let mut ec = 0usize;
-            let mut node = 0usize;
+            let mut root = 0usize;
             let mut base = 1usize;
-            while node < node_count {
-                let mut stack = vec![node];
-                let mut consumed = 0usize;
+            while root < node_count {
+                let mut stack = vec![root];
+                let mut visits = 0usize;
                 while let Some(n) = stack.pop() {
+                    fe[n] = ec;
                     cs[n] = base + ec;
                     ec += od[n] as usize;
-                    consumed += 1;
+                    visits += 1;
                     let c0 = cs[n];
                     for i in (0..od[n] as usize).rev() {
                         let c = c0 + i;
@@ -727,7 +736,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                         }
                     }
                 }
-                node += consumed;
+                root += visits;
                 base += 1;
             }
         }
@@ -766,24 +775,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             let bs0 = bs + bd.off as usize;
             blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
         }
-        let label = |node: usize| -> &[u8] {
-            if node == 0 {
-                return &blob[..0];
-            }
-            let a = if node - 1 < loff.len() {
-                loff[node - 1] as usize
-            } else {
-                blob.len()
-            };
-            let bb = if node < loff.len() {
-                loff[node] as usize
-            } else {
-                blob.len()
-            };
-            let a = a.min(blob.len());
-            let bb = bb.max(a).min(blob.len());
-            &blob[a..bb]
-        };
+        // (edges are consumed by `fe[n]+i` in the element walk below, not by child id)
 
         // positions: col 0x407 -> bitmap over element_count (flags 0x4000) + COMPRESSED coords
         // (flags 0): NLPositionAttrVector::Decode stores coords = 2*popcount(bitmap) u32 (X,Y pairs);
@@ -808,43 +800,56 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             None => vec![],
         };
 
-        // Name accumulation over the trie: node's name = parent's name + its incoming-edge label.
-        // Iterate every node as a potential root (forest-safe); children(n) = [childStart[n] ..).
-        let mut name_of: Vec<Vec<u8>> = vec![Vec::new(); node_count];
-        let mut seen = vec![false; node_count];
-        let mut stack: Vec<usize> = Vec::new();
-        for r in 0..node_count {
-            if seen[r] {
-                continue;
-            }
-            seen[r] = true;
-            stack.push(r);
-            while let Some(node) = stack.pop() {
-                let base = cs[node];
-                for i in 0..od[node] as usize {
-                    let c = base + i;
-                    if c >= node_count || seen[c] {
-                        continue;
+        // Element names: replay `CalculateTerminatingElementIndex`/`ProcessSubTreeTEIC` — a PURE DFS
+        // per forest root over the DAG (a shared node is visited once per incoming path; its element
+        // name is the labels accumulated along THAT path, appended exactly like
+        // `NLInputStep::bSetSelectedEdge` does when the device walks). At each node: first register
+        // the leaf children (od==0, no block-link) as elements, then recurse into internal children.
+        // Raw label per (parent n, i-th child) = blob[loff[fe[n]+i] .. loff[fe[n]+i+1]].
+        let raw_names: Vec<Vec<u8>> = {
+            let lab = |e: usize| -> &[u8] {
+                let a = *loff.get(e).unwrap_or(&(blob.len() as u32)) as usize;
+                let bb = *loff.get(e + 1).unwrap_or(&(blob.len() as u32)) as usize;
+                let a = a.min(blob.len());
+                let bb = bb.max(a).min(blob.len());
+                &blob[a..bb]
+            };
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(elem_count_b);
+            let mut stack: Vec<(usize, Vec<u8>)> = Vec::new(); // (node, accumulated string so far)
+            let mut root = 0usize;
+            while root < node_count {
+                let mut edgevisits = 0usize; // ProcessSubTreeTEIC return value for this root
+                stack.push((root, Vec::new()));
+                while let Some((n, s)) = stack.pop() {
+                    edgevisits += od[n] as usize;
+                    let base = cs[n];
+                    let fen = fe[n];
+                    for i in 0..od[n] as usize {
+                        let c = base + i;
+                        if c < node_count && od[c] == 0 && !blocklink[c] {
+                            let mut t = s.clone();
+                            t.extend_from_slice(lab(fen + i));
+                            out.push(t);
+                        }
                     }
-                    seen[c] = true;
-                    let mut s = name_of[node].clone();
-                    s.extend_from_slice(label(c));
-                    name_of[c] = s;
-                    stack.push(c);
+                    for i in (0..od[n] as usize).rev() {
+                        let c = base + i;
+                        if c < node_count && od[c] != 0 {
+                            let mut t = s.clone();
+                            t.extend_from_slice(lab(fen + i));
+                            stack.push((c, t));
+                        }
+                    }
                 }
+                root += edgevisits + 1;
             }
-        }
-
-        // Element order = terminating-element DFS (CalculateTerminatingElementIndex /
-        // ProcessSubTreeTEIC): leaf nodes (outDegree==0, no block-link) assigned in the order
-        // leaf-children-then-recurse. element_index = rank in this order; property vectors index by it.
-        let mut term: Vec<usize> = Vec::with_capacity(elem_count_b);
-        collect_terms(&od, &cs, &blocklink, node_count, &mut term);
+            out
+        };
 
         let mut pos_rank = 0usize;
         let mut bel_rank = 0usize;
-        for (ei, node) in term.iter().enumerate() {
-            let name = decode_name(&name_of[*node]);
+        for (ei, raw) in raw_names.iter().enumerate() {
+            let name = decode_name(raw);
             let hp = has_pos.get(ei).copied().unwrap_or(false);
             let (x, y) = if hp {
                 let k = pos_rank * 2;
@@ -870,6 +875,21 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             elements.push(Element {
                 category: 0,
                 name,
+                sort_name: {
+                    let mut s: &[u8] = raw;
+                    if let Some(p) = s.iter().position(|&c| c == 0x00) {
+                        s = &s[..p];
+                    }
+                    match std::str::from_utf8(s) {
+                        Ok(t) => t.trim().to_string(),
+                        Err(_) => s
+                            .iter()
+                            .map(|&c| c as char)
+                            .collect::<String>()
+                            .trim()
+                            .to_string(),
+                    }
+                },
                 x_pau: x,
                 y_pau: y,
                 has_pos: hp,
@@ -896,6 +916,428 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         elements,
         origin,
     })
+}
+
+/// Diagnostic dump of the per-block trie (labels indexed BOTH ways: by child-node id and by
+/// device edge number), to reconcile our reader against `NLAsfBlock` semantics. Not for
+/// production use.
+pub fn debug_trie(b_in: &[u8], lo: usize, hi: usize) -> String {
+    use std::fmt::Write as _;
+    let b = b_in;
+    let n = b.len();
+    let hdr = u32(b, 0x10) as usize;
+    let mut out = String::new();
+    let block_count = u16(b, hdr + 4) as usize;
+    let mut sec = [(0u8, 0u32); 7];
+    for i in 0..7 {
+        let p = hdr + 24 + i * 5;
+        if p + 5 > n {
+            break;
+        }
+        sec[i] = (b[p], u32(b, p + 1));
+    }
+    let boff_base = sec[1].1 as usize;
+    let mut block_off = Vec::with_capacity(block_count);
+    for i in 0..block_count {
+        let o = boff_base + i * 4;
+        if o + 4 > n {
+            break;
+        }
+        block_off.push(u32(b, o) as usize);
+    }
+    for bi in 0..block_off.len() {
+        let bs = block_off[bi];
+        let be = if bi + 1 < block_off.len() {
+            block_off[bi + 1]
+        } else {
+            n
+        };
+        if bs + 8 > n {
+            break;
+        }
+        let node_count = u16(b, bs) as usize;
+        let f2 = u16(b, bs + 2) as usize;
+        let elem_count_b = u16(b, bs + 4) as usize;
+        let num_desc = u16(b, bs + 6) as usize;
+        if node_count == 0 {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "block {bi}: bs={bs:#x} node_count={node_count} f2={f2} elem={elem_count_b} ndesc={num_desc}"
+        );
+        let mut descs: Vec<Desc> = Vec::with_capacity(num_desc);
+        let mut p = bs + 8;
+        for _ in 0..num_desc {
+            if p + 12 > be {
+                break;
+            }
+            let k = u16(b, p);
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
+            p += 12;
+        }
+        for (ri, d) in descs.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  desc[{ri}]: kind={:#x} flags={:#x} code={:#x} off={:#x} param={}",
+                d.kind, d.flags, d.code, d.off, d.param
+            );
+        }
+        let mut p = bs + 8;
+        for _ in 0..num_desc {
+            if p + 12 > be {
+                break;
+            }
+            let k = u16(b, p);
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
+            p += 12;
+        }
+        let span_end = |d: &Desc| -> usize {
+            let row = descs
+                .iter()
+                .position(|x| x.kind == d.kind && x.flags == d.flags && x.off == d.off)
+                .unwrap_or(0);
+            if row + 1 < descs.len() {
+                (bs + descs[row + 1].off as usize).max(bs + d.off as usize)
+            } else {
+                be
+            }
+        };
+        let get = |kind: u32, flags: u32| -> Option<&Desc> {
+            descs.iter().find(|d| d.kind == kind && d.flags == flags)
+        };
+        let od = match get(0x401, 0) {
+            Some(d) => {
+                let mut v = decode_u16(
+                    b,
+                    d.code,
+                    bs + d.off as usize,
+                    span_end(d),
+                    d.param as usize,
+                );
+                v.resize(node_count, 0);
+                v
+            }
+            None => continue,
+        };
+        let mut cs = vec![0usize; node_count];
+        let mut tree_base = vec![0usize; node_count];
+        let mut lbl_edge = vec![0usize; node_count]; // device edge-number of a node's incoming edge
+        {
+            let mut ec = 0usize;
+            let mut node = 0usize;
+            let mut base = 1usize;
+            while node < node_count {
+                let mut stack = vec![(node, 0usize)];
+                let mut consumed = 0usize;
+                while let Some((nb, e_in)) = stack.pop() {
+                    cs[nb] = base + ec;
+                    tree_base[nb] = base;
+                    lbl_edge[nb] = e_in;
+                    let fe = ec;
+                    ec += od[nb] as usize;
+                    consumed += 1;
+                    let c0 = cs[nb];
+                    for i in (0..od[nb] as usize).rev() {
+                        let c = c0 + i;
+                        if c < node_count {
+                            stack.push((c, fe + i));
+                        }
+                    }
+                }
+                node += consumed;
+                base += 1;
+            }
+        }
+        let blob: &[u8];
+        let mut loff: Vec<u32> = Vec::new();
+        let c403: Vec<&Desc> = descs.iter().filter(|d| d.kind == 0x403).collect();
+        let mut held = &b[..0];
+        if let Some(bd) = c403.iter().copied().find(|d| d.code == 0x11) {
+            let bs0 = bs + bd.off as usize;
+            held = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
+            if let Some(offd) = c403.iter().copied().find(|d| d.code != 0x11) {
+                loff = decode_u32(
+                    b,
+                    offd.code,
+                    bs + offd.off as usize,
+                    span_end(offd),
+                    offd.param as usize,
+                );
+            }
+        } else if let Some(bd) = c403.first() {
+            let bs0 = bs + bd.off as usize;
+            held = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
+        }
+        blob = held;
+        let _ = writeln!(
+            out,
+            "  blob={} loff={} loff[len-1]={:?}",
+            blob.len(),
+            loff.len(),
+            loff.last()
+        );
+        let lab_slice = |a: usize, bb: usize| -> Vec<u8> {
+            let a = a.min(blob.len());
+            let bb = bb.max(a).min(blob.len());
+            blob[a..bb].to_vec()
+        };
+        let esc = |v: &[u8]| -> String {
+            v.iter()
+                .map(|&c| match c {
+                    0x09 => "<TAB>".to_string(),
+                    0x00 => "<NUL>".to_string(),
+                    0x20..=0x7e => (c as char).to_string(),
+                    _ => format!("<{c:02x}>"),
+                })
+                .collect()
+        };
+        let hi = hi.min(node_count);
+        for nd in lo..hi {
+            let via_child = if nd == 0 {
+                vec![]
+            } else {
+                lab_slice(
+                    *loff.get(nd - 1).unwrap_or(&(blob.len() as u32)) as usize,
+                    *loff.get(nd).unwrap_or(&(blob.len() as u32)) as usize,
+                )
+            };
+            let edge = lbl_edge[nd];
+            let via_edge = lab_slice(
+                *loff.get(edge).unwrap_or(&(blob.len() as u32)) as usize,
+                *loff.get(edge + 1).unwrap_or(&(blob.len() as u32)) as usize,
+            );
+            let _ = writeln!(
+                out,
+                "  n={nd} od={} cs={} base={} | childIdx:'{}' | edgeIdx(e={}):'{}'",
+                od[nd],
+                cs[nd],
+                tree_base[nd],
+                esc(&via_child),
+                edge,
+                esc(&via_edge)
+            );
+        }
+    }
+    out
+}
+
+/// Diagnostic: locate every node whose (edge-ordered, device-faithful) accumulated raw name
+/// contains `needle`; prints node id, block, element rank if terminating, and raw path.
+pub fn debug_find(b_in: &[u8], needle: &str) -> String {
+    use std::fmt::Write as _;
+    let b = b_in;
+    let n = b.len();
+    let hdr = u32(b, 0x10) as usize;
+    let mut out = String::new();
+    let block_count = u16(b, hdr + 4) as usize;
+    let mut sec = [(0u8, 0u32); 7];
+    for i in 0..7 {
+        let p = hdr + 24 + i * 5;
+        if p + 5 > n {
+            break;
+        }
+        sec[i] = (b[p], u32(b, p + 1));
+    }
+    let boff_base = sec[1].1 as usize;
+    let mut block_off = Vec::with_capacity(block_count);
+    for i in 0..block_count {
+        let o = boff_base + i * 4;
+        if o + 4 > n {
+            break;
+        }
+        block_off.push(u32(b, o) as usize);
+    }
+    for bi in 0..block_off.len() {
+        let bs = block_off[bi];
+        let be = if bi + 1 < block_off.len() {
+            block_off[bi + 1]
+        } else {
+            n
+        };
+        if bs + 8 > n {
+            break;
+        }
+        let node_count = u16(b, bs) as usize;
+        let elem_count_b = u16(b, bs + 4) as usize;
+        let num_desc = u16(b, bs + 6) as usize;
+        if node_count == 0 {
+            continue;
+        }
+        let mut descs: Vec<Desc> = Vec::with_capacity(num_desc);
+        let mut p = bs + 8;
+        for _ in 0..num_desc {
+            if p + 12 > be {
+                break;
+            }
+            let k = u16(b, p);
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
+            p += 12;
+        }
+        let span_end = |d: &Desc| -> usize {
+            let row = descs
+                .iter()
+                .position(|x| x.kind == d.kind && x.flags == d.flags && x.off == d.off)
+                .unwrap_or(0);
+            if row + 1 < descs.len() {
+                (bs + descs[row + 1].off as usize).max(bs + d.off as usize)
+            } else {
+                be
+            }
+        };
+        let get = |kind: u32, flags: u32| -> Option<&Desc> {
+            descs.iter().find(|d| d.kind == kind && d.flags == flags)
+        };
+        let od = match get(0x401, 0) {
+            Some(d) => {
+                let mut v = decode_u16(
+                    b,
+                    d.code,
+                    bs + d.off as usize,
+                    span_end(d),
+                    d.param as usize,
+                );
+                v.resize(node_count, 0);
+                v
+            }
+            None => continue,
+        };
+        let mut cs = vec![0usize; node_count];
+        let mut lbl_edge = vec![usize::MAX; node_count];
+        let mut parent = vec![usize::MAX; node_count];
+        {
+            let mut ec = 0usize;
+            let mut node = 0usize;
+            let mut base = 1usize;
+            while node < node_count {
+                let mut stack = vec![(node, usize::MAX, usize::MAX)];
+                let mut consumed = 0usize;
+                while let Some((nb, e_in, par)) = stack.pop() {
+                    cs[nb] = base + ec;
+                    lbl_edge[nb] = e_in;
+                    parent[nb] = par;
+                    let fe = ec;
+                    ec += od[nb] as usize;
+                    consumed += 1;
+                    let c0 = cs[nb];
+                    for i in (0..od[nb] as usize).rev() {
+                        let c = c0 + i;
+                        if c < node_count {
+                            stack.push((c, fe + i, nb));
+                        }
+                    }
+                }
+                node += consumed;
+                base += 1;
+            }
+        }
+        let blocklink: Vec<bool> = match get(0x402, 0x4000).or_else(|| get(0x402, 0)) {
+            Some(d) => {
+                let nn = (d.param as usize).min(node_count.max(1));
+                let mut v = bitfield(b, d.code, bs + d.off as usize, span_end(d), nn);
+                v.resize(node_count, false);
+                v
+            }
+            None => vec![false; node_count],
+        };
+        let mut blob: &[u8] = &[];
+        let mut loff: Vec<u32> = Vec::new();
+        let c403: Vec<&Desc> = descs.iter().filter(|d| d.kind == 0x403).collect();
+        if let Some(bd) = c403.iter().copied().find(|d| d.code == 0x11) {
+            let bs0 = bs + bd.off as usize;
+            blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
+            if let Some(offd) = c403.iter().copied().find(|d| d.code != 0x11) {
+                loff = decode_u32(
+                    b,
+                    offd.code,
+                    bs + offd.off as usize,
+                    span_end(offd),
+                    offd.param as usize,
+                );
+            }
+        } else if let Some(bd) = c403.first() {
+            let bs0 = bs + bd.off as usize;
+            blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
+        }
+        let lab = |e: usize| -> Vec<u8> {
+            if e == usize::MAX {
+                return vec![];
+            }
+            let a = *loff.get(e).unwrap_or(&(blob.len() as u32)) as usize;
+            let bb = *loff.get(e + 1).unwrap_or(&(blob.len() as u32)) as usize;
+            let a = a.min(blob.len());
+            let bb = bb.max(a).min(blob.len());
+            blob[a..bb].to_vec()
+        };
+        let raw = |nd: usize| -> Vec<u8> {
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            let mut cur = nd;
+            while cur != usize::MAX {
+                segs.push(lab(lbl_edge[cur]));
+                cur = parent[cur];
+            }
+            segs.reverse();
+            segs.concat()
+        };
+        let esc = |v: &[u8]| -> String {
+            v.iter()
+                .map(|&c| match c {
+                    0x09 => "<TAB>".to_string(),
+                    0x00 => "<NUL>".to_string(),
+                    0x20..=0x7e => (c as char).to_string(),
+                    _ => format!("<{c:02x}>"),
+                })
+                .collect()
+        };
+        // element ranks (terminating DFS order)
+        let mut term: Vec<usize> = Vec::with_capacity(elem_count_b);
+        collect_terms(&od, &cs, &blocklink, node_count, &mut term);
+        let rank: Vec<Option<usize>> = {
+            let mut r = vec![None; node_count];
+            for (i, &tn) in term.iter().enumerate() {
+                if tn < node_count {
+                    r[tn] = Some(i);
+                }
+            }
+            r
+        };
+        let nb = needle.as_bytes();
+        for nd in 0..node_count {
+            let rn = raw(nd);
+            if rn.len() <= needle.len() * 40 && rn.windows(nb.len()).any(|w| w == nb) {
+                let e = lbl_edge[nd];
+                let _ = writeln!(
+                    out,
+                    "blk {bi} node {nd} term_rank={:?} od={} len={} raw='{}' | prev='{}' nxt='{}'",
+                    rank.get(nd).copied().flatten(),
+                    od[nd],
+                    rn.len(),
+                    esc(&rn),
+                    esc(&lab(e.wrapping_sub(1))),
+                    esc(&lab(e + 1)),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Element order exactly mirroring `NLAsfBlock::CalculateTerminatingElementIndex` +
@@ -941,31 +1383,35 @@ fn collect_terms(
     }
 }
 
-/// Decode a name. The name-list stores each name as one or more **variants separated by
-/// 0x09 (tab)**: typically `<ASCII-folded> \t <proper-UTF8 (with diacritics)>`. Return the
-/// canonical variant (the one carrying non-ASCII/diacritics, else the longest), so the display
-/// name is the diacritic-correct form.
+/// Build an element's display name from the raw trie path, exactly as the device renders it
+/// (`LISA_tclListProcessor::vCollectNamesOfCat` / `LISA_tclSortString::vSetStringAndEquivalent`):
+/// the accumulator is a C string, so it ends at the first `0x00`; a `<?xml>` description is
+/// stripped from display; and the string is a TAB-separated multi-LINE name — line 1 (before the
+/// first `0x09`) is the ASCII-folded **sort/type-in key** ("503 NOWODWOR"), while the **display**
+/// form is everything after the first tab ("08 503 NOWODWÓR", i.e. incl. the settlement's number
+/// and the diacritic-correct/original spelling). `vCollectNamesOfCat` deletes
+/// `s32GetHorizontalTabPos()+1` leading bytes (cut line 1 including the tab) before storing the
+/// name; without a tab the whole line is the name.
 fn decode_name(raw: &[u8]) -> String {
-    let segs: Vec<String> = raw
-        .split(|&c| c == 0x09 || c == 0x00)
-        .filter(|s| !s.is_empty())
-        .map(|s| match std::str::from_utf8(s) {
-            Ok(t) => t.trim().to_string(),
-            Err(_) => s
-                .iter()
-                .map(|&c| c as char)
-                .collect::<String>()
-                .trim()
-                .to_string(),
-        })
-        .collect();
-    if segs.len() <= 1 {
-        return segs.into_iter().next().unwrap_or_default();
+    let mut s: &[u8] = raw;
+    if let Some(p) = s.iter().position(|&c| c == 0x00) {
+        s = &s[..p];
     }
-    // prefer a segment with diacritics; tie-break by length.
-    segs.into_iter()
-        .max_by_key(|s| (s.chars().any(|c| (c as u32) > 0x7f), s.chars().count()))
-        .unwrap_or_default()
+    if let Some(p) = find_bytes(s, b"<?xml>") {
+        s = &s[..p];
+    }
+    if let Some(p) = s.iter().position(|&c| c == 0x09) {
+        s = &s[p + 1..];
+    }
+    let t = match std::str::from_utf8(s) {
+        Ok(t) => t.to_string(),
+        Err(_) => s.iter().map(|&c| c as char).collect(),
+    };
+    t.trim().to_string()
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 // --------------------------------------------------------------------------- writer (encoder)

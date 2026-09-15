@@ -681,10 +681,10 @@ Ground truth (verified 2026-09):
 ## 12. The address name-list is a per-block **trie** (`NLAsfBlock`) — **[DECODED; block geo-origin UNKNOWN]**
 
 The `LID2nnnn.DAT` files are read by `NLProcessor` (`bGoToElemet` `00cef…`, `enGetAllElementProperties`
-`00…`, `copszGetCurrentString` = the accumulated `NLProcessor+0x12c` string). A file = an `NLNameList`
-container; each block is an `NLAsfBlock` that encodes a **name trie (a plain tree — NOT a minimized DAWG:
-empirically every node has exactly one parent, `Σ outDegree = node_count − 1`, 0 multi-parent nodes)**
-plus per-element columns. The block decodes into (all CONFIRMED from accessor bodies unless marked):
+  `00…`, `copszGetCurrentString` = the accumulated `NLProcessor+0x12c` string). A file = an `NLNameList`
+  container; each block is an `NLAsfBlock` that encodes a **name trie forest** (per block: `f2` trees, node
+  ids = DFS-preorder numbering, §12.3) plus per-element columns. The block decodes into (all CONFIRMED from
+  accessor bodies unless marked):
 
 **12.1 Container** (`NLNameList::LoadHeader` `00e0e63c`) — as §11.2. Sub-header `@hdrSize`:
 `u32 element_count`, `6×u16` (vec sizes; `[0]`=block count), `2×u32`, then `7×{u8 section_code, u32 file_off}`.
@@ -692,8 +692,9 @@ Section table gives a **block table**: section w/ `code=0x11` = raw `u32` block 
 cover the file); section `code=0x14` = **decoded byte-sizes** per block (VLE). Verified `POL/LID20006`:
 98 blocks, block0 @ `0x362`, Σ decoded-sizes ≈ `element_count` × ~102 B.
 
-**12.2 Block** (`NLAsfBlock::SetDataBlock` `00cdf404`) — 8-byte header `4×u16`: `[0]=node_count`, `[1]=x`,
-`[2]=element_count`, `[3]=num_desc`. Then `num_desc × NLPSFListDescriptor` `{u16 kindWithFlags, u16 code,
+**12.2 Block** (`NLAsfBlock::SetDataBlock` `00cdf404`) — 8-byte header `4×u16`: `[0]=node_count`,
+`[1]=f2 = tree (forest root) count`, `[2]=element_count`, `[3]=num_desc`. Then `num_desc ×
+NLPSFListDescriptor` `{u16 kindWithFlags, u16 code,
 u32 data_off (block-relative), u32 param}`. `enSetListDescriptions` `00cdc0c0` dispatches on `kind & 0xfff`
 and **the top nibble `kind & 0xf000` selects the column's sub-stream**: `0x0000`=primary, `0x4000`
 =secondary (`+0x10`), `0x8000`=tertiary (`+0x24`). So each multi-part column (position/value) has one
@@ -701,34 +702,47 @@ descriptor per sub-stream. CONFIRMED mapping in the `SetDescription` bodies (`00
 
 **12.3 The tree** (`NLAsfBlock::ProcessNode` `00cdbf88`, `CalculateFirstEdgeIndex` `00cdc018`) — CSR/DFS:
 - Column **`0x401`** = `NLSimpleList<u16>` = **`outDegree[node]`** (# child edges per node). `Σ outDegree =
-  node_count − 1`.
+  node_count − #trees`.
 - Children of node `n` are the **contiguous node range** `[childStart[n] .. childStart[n] + outDegree[n])`,
-  where `childStart[n] = base + edgeCounter(n)` and `edgeCounter(n)` is the **DFS-preorder** edge counter
+  where `childStart[n] = base + firstEdge[n]` and `firstEdge[n]` is the **DFS-preorder** edge counter
   (not a node-index prefix sum!). `CalculateFirstEdgeIndex` drives it: `base` starts at `1`, the outer loop
   runs `ProcessNode(node, base, &edgeCounter)` advancing `node += (subtree node count)` and `base += 1`
-  (a plain single-rooted trie makes the first call cover the file, so `base≡1`, `childStart[n]=1+preorder_edges(n)`).
+  — the file is a **forest**: every block holds `f2` (block-header `u16[1]`) trees, tree `k`'s node ids live
+  above the previous subtrees, `base = k+1` (`f2` = root count; `Σ outDegree = node_count − f2`, verified on
+  `POL/LID20001` blocks: 8042 nodes / f2=1 → 8041 edges; 8050 / 9 → 8041). A plain trie is the `f2=1` case.
   Using the **BFS prefix sum** `Σ_{k<n} outDegree[k]` instead of this DFS-preorder counter mis-parents nodes
-  and concatenates sibling street names — the earlier bug. Node 0 = root.
-- It is a **plain trie, not a DAWG** — verified on `POL/LID20006` block0: `max_parents=1`, `orphans=0`,
-  `multi_parent=0`. So `name_of[node]` via the unique parent chain is well-defined.
+  and concatenates sibling street names — the earlier bug. Node 0 = first tree's root.
 - **Terminating elements** (`CalculateTerminatingElementIndex` `00cdbf48` → `ProcessSubTreeTEIC` `00cdbe58`):
   a **`element` = a leaf node (`outDegree==0`) with no block-link**; assigned in a specific **DFS**: for each
   node, first its leaf children (in child order), then recurse into its internal children (in child order).
-  `+0x8c[element] = leaf node`; `enGetTerminatingElementIndex` binary-finds the node in `+0x8c`. **The element
-  index = rank in that DFS order** — all per-element columns (position/belonging/flags) are indexed by it.
+  The walk is the same per-visit DFS (the return-value arithmetic drives the forest root jumps:
+  `uVar2 += ret + 1`). **The element index = rank in that DFS order**; the element's NAME is the label string
+  accumulated **along the walk stack** (this is the `NLProcessor` deque string `+0x12c` that
+  `NLInputStep::bSetSelectedEdge` `00cf69d0` appends to on descent and trims on ascent) — NOT a value stored
+  per node id. `+0x8c[element] = leaf node`; `enGetTerminatingElementIndex` binary-finds the node in `+0x8c`.
+  All per-element columns (position/belonging/flags) are indexed by the element rank.
 
 **12.4 Edge labels / names** (`NLEdgeLabelList::Decode` `00cdf2f0`, column **`0x403`**) — two sub-streams:
-- The **raw** sub-stream (code `0x11`, at object `+0x10`) = a **name blob** of `param` bytes = concatenation of
-  per-node labels. The **other** sub-stream (VLE, at `+0x0`) = **absolute per-edge byte offsets** into that blob
-  (`count = node_count−1`, monotonic, `last = blob.len`). Node `n`'s label = `blob[off[n-1] .. off[n]]`
-  (root `n=0` = empty). A node's **name = concatenation of labels root→node** (path labels).
+- The **raw** sub-stream (code `0x11`, at object `+0x30`) = a **name blob** of `param` bytes; the **other**
+  sub-stream = **absolute per-EDGE byte offsets** (`count = Σ outDegree = node_count − f2`). The device's
+  slice is `label[edge e] = blob[off[e] .. off[e+1]]` (`NLEdgeLabelList::operator[]` `00cdf5d4`), where the
+  edge number is the DFS counter at `firstEdge[parent]+i` — **`e`, never the child node id** (differs by the
+  tree count as soon as `f2 > 1`; using the child id shifts labels by one per forest root).
 - Verified on `POL/LID20006` block0: labels are first the alphabet (`" ' 1 2 … A B … Z`, 1 char each, = root's
-  children) then **full-name phrases**. A leaf path spells one street name.
-- **Name variants are separated by `0x09` (tab):** typically `<ASCII-folded> \t <proper-UTF8 w/ diacritics>`
-  (e.g. `"ZOSKA", ULICA BATALIONU \t "ZOŚKA", …`). The display name is the diacritic-bearing variant; the
-  ASCII fold is a fold of it. `decode_name` splits on `0x09` and returns the variant with non-ASCII bytes
-  (else the longest). Both variants appear as text — sometimes one element with an embedded `0x09`, sometimes
-  as two sibling elements. This is the store's alt/main name encoding (the `enGetEntry*Name*` accessors).
+  children) then **full-name phrases**.
+- **Label strings are TAB-separated multi-LINE records (`0x09`).** The accumulated path is the device's
+  *sort/search* string; the **display** form is what remains after cutting the string at the first tab
+  (`vCollectNamesOfCat` `00bf72ec`: `s32GetHorizontalTabPos()` then `deleteCharacters(0, pos+1)`;
+  `vSetStringAndEquivalent` `00ba1e08` keeps line ≥ 2 as the original/diacritic + settlement-number form,
+  line 1 as the ASCII-fold used for sorting/type-in; `<?xml>` starts a description tail that display
+  strips; the path buffer is a C string → also cut at `0x00`). Example stock city: raw
+  `503 NOWODWOR\t08 503 NOWODWÓR` → search key `503 NOWODWOR`, displayed `08 503 NOWODWÓR` (line 1 is a
+  *fold of line 2* incl. the settlement number — the "postal prefix" in stock displays is real data).
+  `decode_name` implements exactly this; `Element.sort_name` keeps the pre-cut line for fidelity.
+- The city UI (`listID 2`) additionally filters by **category set {2, 0x3c}** (`vSetCatFilter`) and per-UI
+  language selection (`enGetEdgeInvalidCategories/-Languages` — per-EDGE `0x405`/`0x406` u16 set columns
+  that `bSetSelectedEdge` subtracts while descending). Our writer emits neither → nothing is ever
+  filtered/invalidated, which is the correct neutral value (empty "invalid" list = edge valid everywhere).
 - Column **`0x8403`** (flags `0x8000`, VLE) = the **charset codebook** (byte-code → character incl. multibyte).
   In `POL/LID20006` labels are literal bytes (UTF-8 decodes correctly), so the codebook is not needed to
   reproduce these names; **UNKNOWN (minor):** when a charset-code mapping would apply.
@@ -783,12 +797,15 @@ numbers = per-street GenAttr `+20000` columns (§11.6); optional exact points in
 **12.8 Reader status.** `src/lid_format/` (Rust, wired into `lid2dump`) implements §12.1–12.6 faithfully (no
 heuristics/filters): container + block table + descriptor TOC (flag sub-streams) + column decoders (§11.4,
 **correct** Simple9 mode table §12.4 and custom `ReadVle`) + `outDegree`/DFS-`childStart` children +
-`CalculateTerminatingElementIndex` element DFS + `0x403` blob/offsets + `0x09` name-variant split +
+`CalculateTerminatingElementIndex` element DFS **with the walk-stack name accumulation** + `0x403` blob/**edge**
+offsets + §12.4 multi-line name cut (C-string / `<?xml>` / first-TAB) +
 `NLPositionAttrVector` (bitmap + rank-compressed PAU) + belonging column. On `POL/LID20006` it decodes
 **883 936 elements / 883 929 with positions / 231 882 unique names**, all real Polish street names with
 diacritics. The former "only remaining UNKNOWN" (the per-block **geo origin**, §12.5) is **RESOLVED**: stored
 coords are deltas from the queried city's position (query-supplied), and `read` also exposes the file-level
-`tNLHPosition` (`NameList.origin`). Verified it is a pure trie (single-parent, all nodes reached).
+`tNLHPosition` (`NameList.origin`). Stock-name garbage (2026-09): the old reader keyed labels by child node-id
+and "picked a variant" by longest/diacritic heuristics; replaced by the device-faithful walk above
+(`debug_trie`/`debug_find` in `lid_format` are the diagnostic tools used to prove it against stock `POL`).
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
@@ -864,9 +881,11 @@ is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matc
    **Still pending:** point-address `PA`, crossing files (+10000), own META writer,
    and on-device acceptance (`NLHnrToTree` against a real card).
 
-> The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**
-> (`0x403` + `0x09` variant split) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all
-> CONFIRMED and reproduced faithfully by `src/lid_format/` (883 936 elements off `POL/LID20006`).
+> The trie **structure** (forest, `f2` trees/block), **element order + walk-stack names**
+> (`CalculateTerminatingElementIndex`), **edge labels** (`0x403` per-EDGE offsets + TAB multi-line display
+> cut per `vCollectNamesOfCat`) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all
+> CONFIRMED and reproduced faithfully by `src/lid_format/` (883 936 elements off `POL/LID20006`; stock
+> `LID20001` city names now clean incl. diacritics and exonym entries).
 
 > Practical note for a converter: if your goal is *navigation*, LID is the optional content layer — the
 > network still loads and routes via RNW→MAP without it. If you need POI search / landmark rendering, the files

@@ -28,6 +28,7 @@ fn main() {
     let mut out: Option<String> = None;
     let mut recursive = false;
     let mut no_strings = false;
+    let mut exact = false;
     let mut filters: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -38,6 +39,7 @@ fn main() {
             }
             "-r" | "--recursive" => recursive = true,
             "--no-strings" => no_strings = true,
+            "--exact" => exact = true,
             "--filter" => {
                 i += 1;
                 filters.extend(
@@ -73,7 +75,7 @@ fn main() {
     }
 
     for t in &targets {
-        match dump_file(t, &filters, no_strings) {
+        match dump_file(t, &filters, no_strings, exact) {
             Ok(v) => files.push(v),
             Err(e) => {
                 eprintln!("error: {}: {e}", t.display());
@@ -108,6 +110,7 @@ fn usage() {
         \t-r, --recursive  recurse into directories\n\
         \t--no-strings     skip the raw ASCII string pool (smaller JSON)\n\
         \t--filter a,b,c   keep name-list elements whose name contains any of these (case-insensitive)\n\
+	--exact           with --filter: match full name instead of substring\n\
         \nDecodes GLOB_POI.DAT / DB_CITY.DAT (SQLite) and LID*/REL* (binary, canonical 0x77-header,\n\
         name-lists, GenAttr incl. env LID2DUMP_BLOCKS=<n|all> deep column decode, REL pair matrices).\n\
         \tAccepts a whole .../LID/CCP/<REGION>/ directory."
@@ -134,7 +137,7 @@ fn collect(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn dump_file(path: &Path, filters: &[String], no_strings: bool) -> Result<Value, String> {
+fn dump_file(path: &Path, filters: &[String], no_strings: bool, exact: bool) -> Result<Value, String> {
     let data = fs::read(path).map_err(|e| format!("read: {e}"))?;
     let base = json!({"path": path.display().to_string(), "size": data.len()});
     let mut obj = match base.as_object().cloned() {
@@ -145,7 +148,7 @@ fn dump_file(path: &Path, filters: &[String], no_strings: bool) -> Result<Value,
     if data.starts_with(b"SQLite format 3") {
         dump_sqlite(path, &mut obj)?;
     } else {
-        dump_binary(&data, &mut obj, filters, no_strings);
+        dump_binary(&data, &mut obj, filters, no_strings, exact);
     }
     Ok(Value::Object(obj))
 }
@@ -236,7 +239,7 @@ fn to_json(v: rusqlite::types::Value) -> Value {
 
 /// Binary LID/REL/PA file: CPRNAV-decompress if needed, canonical 0x77-header identity,
 /// then name-list / GenAttr / REL decode via `lid_format`.
-fn dump_binary(data: &[u8], obj: &mut Map<String, Value>, filters: &[String], no_strings: bool) {
+fn dump_binary(data: &[u8], obj: &mut Map<String, Value>, filters: &[String], no_strings: bool, exact: bool) {
     let (buf, compressed) = if cprnav::is_cprnav(data) {
         match cprnav::decompress(data) {
             Ok(u) => (u, true),
@@ -266,7 +269,11 @@ fn dump_binary(data: &[u8], obj: &mut Map<String, Value>, filters: &[String], no
     let name_keep = |n: &str| {
         filters.is_empty() || {
             let ln = n.to_lowercase();
-            filters.iter().any(|f| ln.contains(f.as_str()))
+            if exact {
+                filters.iter().any(|f| ln == f.as_str())
+            } else {
+                filters.iter().any(|f| ln.contains(f.as_str()))
+            }
         }
     };
     // REL relation matrix (file kind 6): full (src, tgt) pair list.
@@ -303,6 +310,8 @@ fn dump_binary(data: &[u8], obj: &mut Map<String, Value>, filters: &[String], no
                         .map(|(i, e)| json!({
                             "elem": i,
                             "name": e.name,
+                            "sort_name": e.sort_name,
+                            "display": e.name != e.sort_name,
                             "x_pau": e.x_pau,
                             "y_pau": e.y_pau,
                             "has_pos": e.has_pos,
