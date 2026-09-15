@@ -27,6 +27,8 @@ fn main() {
     let mut inputs: Vec<String> = Vec::new();
     let mut out: Option<String> = None;
     let mut recursive = false;
+    let mut no_strings = false;
+    let mut filters: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -35,6 +37,15 @@ fn main() {
                 out = args.get(i).cloned();
             }
             "-r" | "--recursive" => recursive = true,
+            "--no-strings" => no_strings = true,
+            "--filter" => {
+                i += 1;
+                filters.extend(
+                    args.get(i)
+                        .map(|s| s.split(',').map(|p| p.to_lowercase()).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                );
+            }
             "-h" | "--help" => {
                 usage();
                 exit(0);
@@ -62,7 +73,7 @@ fn main() {
     }
 
     for t in &targets {
-        match dump_file(t) {
+        match dump_file(t, &filters, no_strings) {
             Ok(v) => files.push(v),
             Err(e) => {
                 eprintln!("error: {}: {e}", t.display());
@@ -93,9 +104,12 @@ fn main() {
 fn usage() {
     eprintln!(
         "Usage: lid2dump [opts] <file-or-dir>...\n\
-        \t-o FILE        write JSON here (default stdout)\n\
+        \t-o FILE          write JSON here (default stdout)\n\
         \t-r, --recursive  recurse into directories\n\
-        \nDecodes GLOB_POI.DAT / DB_CITY.DAT (SQLite) and LID*.DAT / REL / PA (binary).\n\
+        \t--no-strings     skip the raw ASCII string pool (smaller JSON)\n\
+        \t--filter a,b,c   keep name-list elements whose name contains any of these (case-insensitive)\n\
+        \nDecodes GLOB_POI.DAT / DB_CITY.DAT (SQLite) and LID*/REL* (binary, canonical 0x77-header,\n\
+        name-lists, GenAttr incl. env LID2DUMP_BLOCKS=<n|all> deep column decode, REL pair matrices).\n\
         \tAccepts a whole .../LID/CCP/<REGION>/ directory."
     );
 }
@@ -120,7 +134,7 @@ fn collect(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn dump_file(path: &Path) -> Result<Value, String> {
+fn dump_file(path: &Path, filters: &[String], no_strings: bool) -> Result<Value, String> {
     let data = fs::read(path).map_err(|e| format!("read: {e}"))?;
     let base = json!({"path": path.display().to_string(), "size": data.len()});
     let mut obj = match base.as_object().cloned() {
@@ -131,7 +145,7 @@ fn dump_file(path: &Path) -> Result<Value, String> {
     if data.starts_with(b"SQLite format 3") {
         dump_sqlite(path, &mut obj)?;
     } else {
-        dump_binary(&data, &mut obj);
+        dump_binary(&data, &mut obj, filters, no_strings);
     }
     Ok(Value::Object(obj))
 }
@@ -220,8 +234,9 @@ fn to_json(v: rusqlite::types::Value) -> Value {
     }
 }
 
-/// Binary LID/REL/PA file: CPRNAV-decompress if needed, then ASF header + ASCII strings.
-fn dump_binary(data: &[u8], obj: &mut Map<String, Value>) {
+/// Binary LID/REL/PA file: CPRNAV-decompress if needed, canonical 0x77-header identity,
+/// then name-list / GenAttr / REL decode via `lid_format`.
+fn dump_binary(data: &[u8], obj: &mut Map<String, Value>, filters: &[String], no_strings: bool) {
     let (buf, compressed) = if cprnav::is_cprnav(data) {
         match cprnav::decompress(data) {
             Ok(u) => (u, true),
@@ -237,36 +252,69 @@ fn dump_binary(data: &[u8], obj: &mut Map<String, Value>) {
     obj.insert("kind".into(), json!("asf"));
     obj.insert("cprnav_compressed".into(), json!(compressed));
     obj.insert("uncompressed_size".into(), json!(buf.len()));
-    if buf.len() >= 0x26 {
-        obj.insert("format_tag".into(), json!(u16le(&buf, 0x00)));
-        obj.insert("region_id".into(), json!(u16le(&buf, 0x02)));
-        obj.insert("block_count".into(), json!(u16le(&buf, 0x04)));
-        obj.insert("hdr_size".into(), json!(u32le(&buf, 0x10)));
-        obj.insert("extra_size".into(), json!(u32le(&buf, 0x14)));
+    // Canonical outer header (§11.2): device binds list files by the leading rIdxListID.
+    if buf.len() >= 0x77 {
+        obj.insert("header".into(), json!({
+            "region_ident": u16le(&buf, 0x00),
+            "list_id": u16le(&buf, 0x02),
+            "file_kind": u32le(&buf, 0x0c),
+            "split": u32le(&buf, 0x10),
+            "sub_header_size": u32le(&buf, 0x14),
+            "author_block_canonical": buf[0x18..0x77] == lid_format::header::NL_AUTHOR_BLOCK[..],
+        }));
+    }
+    let name_keep = |n: &str| {
+        filters.is_empty() || {
+            let ln = n.to_lowercase();
+            filters.iter().any(|f| ln.contains(f.as_str()))
+        }
+    };
+    // REL relation matrix (file kind 6): full (src, tgt) pair list.
+    if u32le(&buf, 0x0c) == 6 && buf.len() >= 0x77 + 36 {
+        match lid_format::rel::RelIndex::parse(&buf) {
+            Ok(idx) => {
+                let out = lid_format::rel::get_relations(&buf, &idx, true, 0, idx.d[2])
+                    .unwrap_or_default();
+                obj.insert("rel".into(), json!({
+                    "list_rows": idx.d[0], "list_cols": idx.d[1],
+                    "src_elems": idx.d[2], "tgt_elems": idx.d[3],
+                    "band_stride": [idx.d[4], idx.d[5]], "grid": [idx.d[6], idx.d[7]],
+                    "pair_count": out.len(),
+                    "pairs": out.iter().map(|&(s, t)| json!([s, t])).collect::<Vec<Value>>(),
+                }));
+            }
+            Err(e) => {
+                obj.insert("rel_error".into(), json!(e));
+            }
+        }
     }
     // If this is an ASF name-list (the LID*.DAT address trie), decode it into a
     // per-element gazetteer (names + PAU position deltas + hierarchy) via lid_format.
-    if lid_format::is_name_list(&buf) {
+    if u32le(&buf, 0x0c) != 6 && lid_format::is_name_list(&buf) {
         match lid_format::read(&buf) {
             Ok(nl) => {
                 obj.insert("namelist".into(), json!({
                     "element_count": nl.element_count,
                     "block_count": nl.block_count,
-                    "elements": nl.elements.iter().map(|e| json!({
-                        "name": e.name,
-                        "x_pau": e.x_pau,
-                        "y_pau": e.y_pau,
-                        "has_pos": e.has_pos,
-                        "belonging": e.belonging,
-                    })).collect::<Vec<Value>>(),
+                    "origin": nl.origin,
+                    "filtered": !filters.is_empty(),
+                    "elements": nl.elements.iter().enumerate()
+                        .filter(|(_, e)| name_keep(&e.name))
+                        .map(|(i, e)| json!({
+                            "elem": i,
+                            "name": e.name,
+                            "x_pau": e.x_pau,
+                            "y_pau": e.y_pau,
+                            "has_pos": e.has_pos,
+                            "belonging": e.belonging,
+                        })).collect::<Vec<Value>>(),
                 }));
             }
-            Err(e) => { obj.insert("namelist_error".into(), json!(e)); }
+            Err(e) => {
+                obj.insert("namelist_error".into(), json!(e));
+            }
         }
     } else if lid_format::is_gen_attr(&buf) {
-        // GenAttr (fileID+20000, house-number attributes): its container is NLGenAttrFile,
-        // not NLNameList — report the block/element TOC (per-block element range) rather
-        // than pretending it is a name-list. HNR columns are documented, not yet decoded.
         obj.insert("kind".into(), json!("gen_attr"));
         match lid_format::read_gen_attr(&buf) {
             Ok(ga) => {
@@ -280,39 +328,65 @@ fn dump_binary(data: &[u8], obj: &mut Map<String, Value>) {
                     })).collect::<Vec<Value>>(),
                 });
                 // Opt-in deep decode of block interiors (NLGeneralAttributeBlock descriptors +
-                // attribute-vector streams). Enable with LID2DUMP_BLOCKS=<count>.
+                // attribute-vector streams). Enable with LID2DUMP_BLOCKS=<count|all>.
                 if let Ok(s) = std::env::var("LID2DUMP_BLOCKS") {
-                    let nb: usize = s.parse().unwrap_or(1);
+                    let nb = if s == "all" {
+                        ga.blocks.len()
+                    } else {
+                        s.parse().unwrap_or(1)
+                    };
+                    // Whole-file joined columns (per address element) + per-block stream detail.
+                    let mut to_street = Vec::new();
+                    let mut number = Vec::new();
                     let mut bd = Vec::new();
                     for bi in 0..nb.min(ga.blocks.len()) {
                         match ga.decode_block(&buf, bi) {
-                            Ok(blk) => bd.push(json!({
-                                "block": bi,
-                                "elem_start": blk.elem_start,
-                                "elem_end": blk.elem_end,
-                                "streams": blk.streams.iter().map(|st| json!({
-                                    "col": st.col,
-                                    "flags": st.flags,
-                                    "code": st.code,
-                                    "param": st.param,
-                                    "decoded": if matches!(st.code, 0x01|0x02|0x03)
-                                        { json!({"set_bits_of": st.bits.len(), "set": st.bits.iter().filter(|&&x| x).count()}) }
-                                        else { json!(st.values.iter().copied().take(64).collect::<Vec<u32>>() ) },
-                                })).collect::<Vec<Value>>(),
-                            })),
+                            Ok(blk) => {
+                                let col = |cc: u32, fl: u32| -> Vec<u32> {
+                                    blk.streams
+                                        .iter()
+                                        .find(|x| x.col == cc && x.flags == fl)
+                                        .map(|x| x.values.clone())
+                                        .unwrap_or_default()
+                                };
+                                to_street.extend(col(0x002, 0x8000));
+                                number.extend(col(0x00c, 0x8000));
+                                bd.push(json!({
+                                    "block": bi,
+                                    "elem_start": blk.elem_start,
+                                    "elem_end": blk.elem_end,
+                                    "streams": blk.streams.iter().map(|st| json!({
+                                        "col": st.col,
+                                        "flags": st.flags,
+                                        "code": st.code,
+                                        "param": st.param,
+                                        "decoded": if matches!(st.code, 0x01|0x02|0x03)
+                                            { json!({"set_bits_of": st.bits.len(), "set": st.bits.iter().filter(|&&x| x).count()}) }
+                                            else { json!(st.values.iter().copied().take(64).collect::<Vec<u32>>() ) },
+                                    })).collect::<Vec<Value>>(),
+                                }));
+                            }
                             Err(e) => bd.push(json!({"block": bi, "error": e})),
                         }
                     }
-                    g.as_object_mut().unwrap().insert("decoded_blocks".into(), Value::Array(bd));
+                    g.as_object_mut().unwrap().insert("addr_to_street".into(), json!(to_street));
+                    g.as_object_mut().unwrap().insert("addr_number".into(), json!(number));
+                    if bd.len() <= 200 {
+                        g.as_object_mut().unwrap().insert("decoded_blocks".into(), Value::Array(bd));
+                    }
                 }
                 obj.insert("gen_attr".into(), g);
             }
-            Err(e) => { obj.insert("gen_attr_error".into(), json!(e)); }
+            Err(e) => {
+                obj.insert("gen_attr_error".into(), json!(e));
+            }
         }
     }
-    let strings = ascii_strings(&buf, 4);
-    obj.insert("n_strings".into(), json!(strings.len()));
-    obj.insert("strings".into(), json!(strings));
+    if !no_strings {
+        let strings = ascii_strings(&buf, 4);
+        obj.insert("n_strings".into(), json!(strings.len()));
+        obj.insert("strings".into(), json!(strings));
+    }
 }
 
 fn u16le(b: &[u8], o: usize) -> u16 {
