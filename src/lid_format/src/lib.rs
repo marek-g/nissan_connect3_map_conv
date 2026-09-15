@@ -610,7 +610,6 @@ pub fn is_name_list(b: &[u8]) -> bool {
 /// cross-block naming pass can run over the whole namelist afterwards.
 struct ParsedBlock<'a> {
     node_count: usize,
-    elem_count_b: usize,
     od: Vec<u32>,
     fe: Vec<usize>,
     cs: Vec<usize>,
@@ -897,7 +896,6 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
 
         bp.push(ParsedBlock {
             node_count,
-            elem_count_b,
             od,
             fe,
             cs,

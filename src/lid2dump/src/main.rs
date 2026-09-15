@@ -337,6 +337,12 @@ fn decode_for_export(
         let ga = lid_format::read_gen_attr(&buf).map_err(|e| format!("gen_attr: {e}"))?;
         let mut ex = mk("gen_attr");
         ex.list_id = list_id;
+        // Stock `NLGeneralAttributeBlock` layout (device `SetDataBlock` 00e09b60 column dispatch +
+        // `enGetHnrIndices`/`enGetHnr` 00e0c3a0/00e0d078): col 0xc01 = ValueList<u32> house numbers,
+        // owners = elements of the block range — the 0x4000 existence bits mark owners that carry hnrs,
+        // the 0x8000 sub-stream gives each present owner's start in the flat 0-flag value list. One row
+        // per hnr record; `elem` = file-wide record ordinal (stock has no per-record namelist element).
+        let mut record_base: u32 = 0;
         for bi in 0..ga.blocks.len() {
             let blk = match ga.decode_block(&buf, bi) {
                 Ok(b) => b,
@@ -349,23 +355,54 @@ fn decode_for_export(
                     .map(|x| x.values.clone())
                     .unwrap_or_default()
             };
+            // Legacy layout written by `osm2lid` (our synthetic convention, §11.6b): col 0x002/0x00c
+            // tertiary (0x8000) sub-streams, one slot per element of the block range. Checked FIRST:
+            // osm2lid also emits a 0xc01 column (it carries addr element ids there), so a 0xc01
+            // presence test must never outrank a legacy-shaped block.
             let to_street = stream(0x002, 0x8000);
             let number = stream(0x00c, 0x8000);
-            if to_street.is_empty() && number.is_empty() {
+            if !(to_street.is_empty() && number.is_empty()) {
+                let n = (blk.elem_end - blk.elem_start + 1) as usize;
+                for k in 0..n {
+                    let a = to_street.get(k).copied();
+                    let h = number.get(k).copied();
+                    if a.is_none() && h.is_none() {
+                        continue;
+                    }
+                    ex.hnr.push(sqlite_export::HnrRow {
+                        elem: blk.elem_start + k as u32,
+                        addr_to_street: a,
+                        house_number: h,
+                    });
+                }
                 continue;
             }
-            let n = (blk.elem_end - blk.elem_start + 1) as usize;
-            for k in 0..n {
-                let a = to_street.get(k).copied();
-                let h = number.get(k).copied();
-                if a.is_none() && h.is_none() {
+            let hv = stream(0xc01, 0);
+            if !hv.is_empty() {
+                let bits = blk
+                    .streams
+                    .iter()
+                    .find(|x| x.col == 0xc01 && x.flags == 0x4000)
+                    .map(|x| x.bits.clone())
+                    .unwrap_or_default();
+                let starts = stream(0xc01, 0x8000);
+                let owners: Vec<u32> = (0..bits.len() as u32).filter(|&i| bits[i as usize]).collect();
+                if owners.len() == starts.len() && starts.first().copied() == Some(0) {
+                    for (k, &o) in owners.iter().enumerate() {
+                        let a = starts[k] as usize;
+                        let b = starts.get(k + 1).copied().unwrap_or(hv.len() as u32) as usize;
+                        for &h in hv[a..b.min(hv.len()).max(a)].iter() {
+                            ex.hnr.push(sqlite_export::HnrRow {
+                                elem: record_base,
+                                addr_to_street: Some(blk.elem_start + o),
+                                house_number: Some(h),
+                            });
+                            record_base += 1;
+                        }
+                    }
                     continue;
                 }
-                ex.hnr.push(sqlite_export::HnrRow {
-                    elem: blk.elem_start + k as u32,
-                    addr_to_street: a,
-                    house_number: h,
-                });
+                eprintln!("gen_attr block {bi}: unexpected 0xc01 vector shape, skipped");
             }
         }
         return Ok(Some(ex));

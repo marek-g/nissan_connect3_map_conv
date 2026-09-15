@@ -4,7 +4,8 @@
 //   file    1 row per input file (list_id, kind, country, block anchor, coords_valid)
 //   element 1 row per LID element (raw `name`/`sort_name`, raw PAU deltas) — never rewritten
 //   rel     REL00001-style pair matrices, endpoints resolved to file ids within the run
-//   hnr     GenAttr address attributes (street element id + house number)
+//   hnr     GenAttr house numbers -> street element; stock layout: `elem` = file-wide record ordinal,
+//           street = 0xc01 owner, number = flat value (§11.6b); legacy osm2lid files: elem = addr element
 //   <STEM>__<table>  1:1 mirrors of embedded SQLite tables (GLOB_POI, DB_CITY)
 //   queries bundled, documented SELECT statements (the user's join layer)
 //

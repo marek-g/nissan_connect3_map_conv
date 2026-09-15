@@ -525,21 +525,35 @@ sparse-set / `0x03` sparse-clear, both as delta-VLE over `param` bits). So *emit
 for OSM `addr:housenumber` remains (see §11.8).
 
 **GenAttr *writer* + join model derived from firmware (2026-09, `src/lid_format/src/write.rs` + reader).**
-Ghidra (`enGetHnr 0xe0d078`, `enGetHnrOwnerDescrIndices 0xe0c218`, `enGetOwner 0xe0bdd0`,
-`SetDataBlock 0xe09b60` selector switch `0xe09bb0..`) pins the per-record member layout and the join. A record
-= **one address element** (the `elem_start..=elem_end` range); members read for the HnR lookup:
-`+0x28` VL\<u32\> selector `0xc01` = **per-street list of address-element ids** (existence/ `4000` bitmap,
-`8000` = *cumulative offset* deltas, `0000` = the concatenated ids) — this is the street→addresses inverse the
-UI browses; `+0x7c` selector `0x002` SV\<u32\> (per-addr u32); `+0x260..+0x300` `0xc09..0xc0d` `tBitArray`
-(parity/refuse-interp/interp); `+0x300` `0x00c` `Range<u32>` (the **house number** `from`=`8000`/`to`=`0000`)
-read via `enGetValue(+0x300,…)`; `+0x47c` `0xc12` `Range<u32>` per-addr **owner-descr index** → `enGetHnr-
-OwnerDescrIndices` → `+0x4d0` `0xc13` VL\<u32\> = **per owner-desc the street-elem list** (`enGetOwner`) = the
-record→street join, and `LISA_…` then resolves each street-elem id back to LID2 for the result set. Param rule
-(author): `flag 4000`.param = *domain* (existence bit count), `flag 8000`.param = Σ/total or #exist,
-`flag 0000`.param = #values; each member's *own* `8000` param equals its `4000` popcount. The synthetic
+**Column→vector dispatch — CONFIRMED from `NLGeneralAttributeBlock::SetDataBlock` `00e09b60`** (desc
+`kind & 0xfff` selects the vector member; `kind & 0xf000` the sub-stream): `0xc01` → `+0x28`
+ValueList\<u32\> = **per-owner (elem of the block range = STREET elem ids of the twin name-list) list of
+HOUSE NUMBERS** (`0x4000` existence bitmap over owners, `0x8000` sparse start flat-offsets for present
+owners — popcount-matched, `0` concatenated numbers; `enGetHnrIndices` `00e0c3a0` = flat `[before,count)`
+for a street); `0xc02` → `+0x7c` SV\<u32\> = per-**record** ref (PA point, ascending small ids on stock);
+`0xc03..0xc06` → `+0xb0/+0x104/+0x158/+0x1ac` ValueList\<u8\> = hnr token/addition strings (empty on
+`POL`); `0xc08`/`0xc10`/`0xc14` → `+0x200`/`+0x340`/`+0x47c` Range\<u32\>; `0xc09..0xc0e` →
+`+0x260..+0x2e0` Binaries; `0xc0d` → `+0x300` Binary; `0xc11` → `+0x380` ValueList\<u32\> (per-record
+existence domain = `GetNumberOfExistenceFlags` bound in `enGetHnr`); `0xc12` → `+0x3d4` VL\<u32\>;
+`0xc13` → `+0x428` VL\<pair\>; cols `1..5` → cell vector(s) `+0x4dc`/`+0x530` (`0x001..0x005` CellId).
+`enGetHnr` `00e0d078` writes `NLHnr = { +0 number (0xc01 flat value), +4/+0x10/+8/+0x14 strings,
++0xc ref (0xc02), +0x18 parity status (0xc09+0xc0a+0xc0b+0xc0d bits), +0x1c range (0xc10, -1 default) }`
+— the earlier note claiming `0xc01` carried *address element ids* and `0xc0c` the number range was a pre-
+dispatch guess and is **wrong** (there is no col `0xc` in stock files at all). Stock `POL/LID40006`
+block 0 verifies the shape bit-exactly: 4027-bit owner domain (876 set) ↔ 876 start offsets ↔ 10886 flat
+house numbers; the five parity Bin columns are 10886-bit (per **record**).
+`lid2dump --sqlite` therefore exports stock hnrs as one row per record: `hnr.elem` = file-wide record
+ordinal, `addr_to_street` = `elem_start + owner`, `house_number` = the `0xc01` value (a synthetic
+`osm2lid` file with legacy `0x002`/`0x00c` tertiary rows keeps the old per-element shape — the legacy
+branch wins any file carrying those columns). Param rule (author): `flag 4000`.param = *domain* (existence
+bit count), `flag 8000`.param = Σ/total or #exist, `flag 0000`.param = #values; each member's *own* `8000`
+param equals its `4000` popcount. The synthetic
 `#[test] gen_attr_writer_roundtrip_device_model` writes 2 tiling blocks and asserts, on re-parse,
 `rebuild_all` byte-equality **and** the enGetHnr/enGetOwner-style member lookups return the exact encoded
-street→addr / addr→number / addr→street answers. **Still needs** the OSM-→element join in `osm2lid`: map each
+street→addr / addr→number / addr→street answers. **Writer TODO (unmasked by this dispatch):** the synthetic
+`osm2lid` GenAttr columns are the old guess-layout and do NOT match the device reading above — rewrite it
+to `0xc01` numbers-per-street + `0xc02` refs + `0xc09..0xc0d` per-record parity before the card test.
+**Still needs** the OSM-→element join in `osm2lid`: map each
 `addr:housenumber` point is now wired: `osm2lid` collects those objects, joins them to **the street**
 `LID20006` element named by `addr:street`, and feeds `BlockData{0xc01 street→addr elem, 0x002 addr→street
 Range, 0x00c number Range(from=to=num), 0xc0a parity bits}` to `write_gen_attr_file` (§11.6b end / §12.10).
