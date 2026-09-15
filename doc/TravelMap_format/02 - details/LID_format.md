@@ -835,8 +835,12 @@ where the file anchor honestly applies (`coords_valid`), raw PAU deltas always s
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
-TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now writes **all three** address
-files (unit tests + `malopolskie` fixtures):
+TOC + raw/VLE column streams — the exact bytes `read` consumes. Blocks are self-contained (one tree each →
+header `f2 = 1`, stock always has `f2 ≥ 1`; the device's `node_count − f2` edge-count arithmetic depends on
+it), the cross-block `0x402` link map is **not used** by the writer, and both link sub-stream rows are
+emitted empty — exactly like stock, which carries the pair in **every** block (even the `LID20000`
+gazetteer, which itself links 8–38 times per block and starts trees `f2` up to 30). `osm2lid` now writes
+**all three** address files (unit tests + `malopolskie` fixtures):
 
 * **streets** (`LID20006.DAT`): one element per unique highway `name` at its way centroid — **city-grouped
   blocks** with coordinates stored `position − city_position` (nearest `place=` node per street, §12.5), so

@@ -1401,6 +1401,7 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     let descs: Vec<(u16, u16, &[u8], u32)> = vec![
         (0x0401, 0x11, &od_bytes, nc as u32),     // outDegree (raw u16)
         (0x4402, 0x01, &bl_bits, nc as u32),      // block-link bitmap (raw bits, flags 0x4000)
+        (0x0402, 0x14, &[] as &[u8], 0),          // block-link targets: k=0 pairs (stock emits both rows, even empty)
         (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob (raw bytes)
         (0x4403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (VLE, flags 0x4000)
         (pos_wf, pos_code, pos_bytes, elem_count as u32), // has-position sub-stream (flags 0x4000, tie off)
@@ -1411,7 +1412,7 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     let hdr_sz = 8usize + descs.len() * 12;
     let mut block: Vec<u8> = Vec::new();
     block = put_u16(block, nc as u16);
-    block = put_u16(block, 0);
+    block = put_u16(block, 1); // f2 = forest root count: each writer block is ONE self-contained trie
     block = put_u16(block, elem_count as u16);
     block = put_u16(block, descs.len() as u16);
     let mut cur = hdr_sz;
