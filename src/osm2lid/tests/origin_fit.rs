@@ -32,7 +32,7 @@ fn position_streams_probe() {
 
 // (folded street-name substring, truth lon, lat) — streets unique to one city.
 const ANCHORS: [(&str, f64, f64); 8] = [
-    ("JEROZOLIMSK", 21.0010, 52.2213), // Warszawa, Aleje Jerozolimskie
+    ("JEROZOLIMSK", 21.0010, 52.2213),  // Warszawa, Aleje Jerozolimskie
     ("MARSZALKOWSK", 21.0100, 52.2290), // Warszawa
     ("NOWY SWIAT", 21.0120, 52.2326),   // Warszawa
     ("TUMSKA", 21.0190, 52.2420),       // Warszawa
@@ -63,7 +63,9 @@ fn fit_file(file: &str) {
     let mut elem_to_block: Vec<u16> = Vec::with_capacity(nl.elements.len());
     for bi in 0..block_count {
         let bs = u32(b, sec1 + bi * 4) as usize;
-        if bs + 8 > n { break }
+        if bs + 8 > n {
+            break;
+        }
         let e = u16(b, bs + 4) as usize;
         elem_to_block.resize(elem_to_block.len() + e, bi as u16);
     }
@@ -72,38 +74,71 @@ fn fit_file(file: &str) {
     for i in 0..7 {
         sec[i] = (b[hdr + 0x18 + i * 5] as u32, u32(b, hdr + 0x18 + i * 5 + 1));
     }
-    println!("== {file}: block_count={block_count} origin=({ox},{oy}) secs={}",
-        sec.iter().map(|(c, o)| format!("[{c:#03x}@{o:#x}]")).collect::<Vec<_>>().join(""));
-    for (cnti, cnt) in [("u16@hdr+0", u16(b, hdr) as usize), ("u16@hdr+2", u16(b, hdr + 2) as usize),
-                        ("u16@hdr+4", u16(b, hdr + 4) as usize), ("u16@hdr+6", u16(b, hdr + 6) as usize),
-                        ("u16@hdr+8", u16(b, hdr + 8) as usize)] {
+    println!(
+        "== {file}: block_count={block_count} origin=({ox},{oy}) secs={}",
+        sec.iter()
+            .map(|(c, o)| format!("[{c:#03x}@{o:#x}]"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    for (cnti, cnt) in [
+        ("u16@hdr+0", u16(b, hdr) as usize),
+        ("u16@hdr+2", u16(b, hdr + 2) as usize),
+        ("u16@hdr+4", u16(b, hdr + 4) as usize),
+        ("u16@hdr+6", u16(b, hdr + 6) as usize),
+        ("u16@hdr+8", u16(b, hdr + 8) as usize),
+    ] {
         println!("   {cnti}={cnt}");
     }
     // decode candidate per-block vectors with the several plausible counts
     let mut vecs: Vec<Vec<u32>> = Vec::new();
-    for &(si, cnt) in &[(2usize, u16(b, hdr + 2) as usize), (2, u16(b, hdr + 4) as usize),
-                        (3, u16(b, hdr + 2) as usize), (3, u16(b, hdr + 4) as usize),
-                        (0, u16(b, hdr + 4) as usize)] {
+    for &(si, cnt) in &[
+        (2usize, u16(b, hdr + 2) as usize),
+        (2, u16(b, hdr + 4) as usize),
+        (3, u16(b, hdr + 2) as usize),
+        (3, u16(b, hdr + 4) as usize),
+        (0, u16(b, hdr + 4) as usize),
+    ] {
         let end = n;
         let (v, _) = lid_format::decode_u32_probe(b, sec[si].0, sec[si].1 as usize, end, cnt);
-        println!("   sec{si} cnt{cnt} code={:#03x} first8={:?}", sec[si].0, &v[..v.len().min(8)]);
+        println!(
+            "   sec{si} cnt{cnt} code={:#03x} first8={:?}",
+            sec[si].0,
+            &v[..v.len().min(8)]
+        );
         vecs.push(v);
     }
     // per-anchor per-block residuals
     let km = |v: i64| v as f64 * 111.32 / PAU;
-    println!("   elem_to_block len={} elements={}", elem_to_block.len(), nl.elements.len());
+    println!(
+        "   elem_to_block len={} elements={}",
+        elem_to_block.len(),
+        nl.elements.len()
+    );
     let mut seen = std::collections::HashMap::<(String, u16), (i64, i64)>::new();
     for (pat, lon, lat) in ANCHORS {
         let p = fold(pat);
-        for (i, e) in nl.elements.iter().enumerate().filter(|(_, e)| e.has_pos && fold(&e.name).contains(&p)) {
-            if i >= elem_to_block.len() { continue }
+        for (i, e) in nl
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.has_pos && fold(&e.name).contains(&p))
+        {
+            if i >= elem_to_block.len() {
+                continue;
+            }
             let blk = elem_to_block[i];
-            let err = ((lon * PAU) as i64 - ox as i64 - e.x_pau as i64,
-                       (lat * PAU) as i64 - oy as i64 - e.y_pau as i64);
+            let err = (
+                (lon * PAU) as i64 - ox as i64 - e.x_pau as i64,
+                (lat * PAU) as i64 - oy as i64 - e.y_pau as i64,
+            );
             *seen.entry((pat.to_string(), blk)).or_insert(err) = err;
         }
     }
-    let mut rows: Vec<(String, u16, i64, i64)> = seen.into_iter().map(|((p, blk), (ex, ey))| (p, blk, ex, ey)).collect();
+    let mut rows: Vec<(String, u16, i64, i64)> = seen
+        .into_iter()
+        .map(|((p, blk), (ex, ey))| (p, blk, ex, ey))
+        .collect();
     rows.sort();
     for (p, blk, ex, ey) in rows.iter().take(10) {
         println!("   {p} blk{blk}: err=({:+.0},{:+.0})km", km(*ex), km(*ey));
@@ -114,28 +149,46 @@ fn fit_file(file: &str) {
         let p = fold(pat);
         let mut acc = (0i64, 0i64);
         let mut cnt = 0i64;
-        for e in nl.elements.iter().filter(|e| e.has_pos && fold(&e.name).contains(&p)) {
+        for e in nl
+            .elements
+            .iter()
+            .filter(|e| e.has_pos && fold(&e.name).contains(&p))
+        {
             // stored deltas are pos-city => city ~= truth - delta(=x_pau)
             acc.0 += (lon * PAU) as i64 - e.x_pau as i64 - ox as i64;
             acc.1 += (lat * PAU) as i64 - e.y_pau as i64 - oy as i64;
             cnt += 1;
         }
-        if cnt > 0 { city.insert(pat.to_string(), (acc.0 / cnt + ox as i64, acc.1 / cnt + oy as i64)); }
+        if cnt > 0 {
+            city.insert(
+                pat.to_string(),
+                (acc.0 / cnt + ox as i64, acc.1 / cnt + oy as i64),
+            );
+        }
     }
     for (p, (cx, cy)) in &city {
         let mut hits = Vec::new();
         for off in (0..n - 8).step_by(4) {
-            if u32(b, off) as i64 - cx < 0 { continue }
+            if u32(b, off) as i64 - cx < 0 {
+                continue;
+            }
             let dx = (u32(b, off) as i64 - cx).abs();
             let dy = (u32(b, off + 4) as i64 - cy).abs();
-            if dx < cx / 500 && dy < cy / 500 { hits.push((off, dx, dy)) }
+            if dx < cx / 500 && dy < cy / 500 {
+                hits.push((off, dx, dy))
+            }
         }
         // also try (Y,X) order and +origin-relative encodings
-        println!("   city {p} ({},{}) = ({:.4},{:.4}) hits(X,Y)={:?}", cx, cy, *cx as f64 / PAU, *cy as f64 / PAU,
-            &hits[..hits.len().min(5)]);
+        println!(
+            "   city {p} ({},{}) = ({:.4},{:.4}) hits(X,Y)={:?}",
+            cx,
+            cy,
+            *cx as f64 / PAU,
+            *cy as f64 / PAU,
+            &hits[..hits.len().min(5)]
+        );
     }
 }
-
 
 fn fold(s: &str) -> String {
     s.to_uppercase()
@@ -157,7 +210,6 @@ fn fold(s: &str) -> String {
         .collect()
 }
 
-
 fn probe_file(file: &str, b: &[u8]) {
     let hdr = u32(b, 0x10) as usize;
     let flags = u32(b, hdr + 0x0c);
@@ -166,8 +218,11 @@ fn probe_file(file: &str, b: &[u8]) {
     let sec1 = u32(b, hdr + 0x18 + 1 * 5 + 1) as usize; // 7x{u8 code,u32 off}: entry1 off
     let block_count = u32(b, hdr + 4) as usize;
     let n = b.len();
-    println!("== {file}: n={n} flags={flags:#08x} origin=({ox},{oy}) = ({:.4},{:.4}) sec1@{sec1:#x}",
-        ox as f64 / PAU, oy as f64 / PAU);
+    println!(
+        "== {file}: n={n} flags={flags:#08x} origin=({ox},{oy}) = ({:.4},{:.4}) sec1@{sec1:#x}",
+        ox as f64 / PAU,
+        oy as f64 / PAU
+    );
 
     let mut offs = Vec::with_capacity(block_count);
     for i in 0..block_count.min(600) {
@@ -181,20 +236,43 @@ fn probe_file(file: &str, b: &[u8]) {
     for bi in 0..offs.len() {
         let bs = offs[bi];
         let be = if bi + 1 < offs.len() { offs[bi + 1] } else { n };
-        if bs + 8 > n { break }
+        if bs + 8 > n {
+            break;
+        }
         let elem_count_b = u16(b, bs + 4) as usize;
         let num_desc = u16(b, bs + 6) as usize;
         let mut d: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // kind,flags,code,off,param
         let mut p = bs + 8;
         for _ in 0..num_desc {
-            if p + 12 > be { break }
+            if p + 12 > be {
+                break;
+            }
             let k = u16(b, p) as u32;
-            d.push((k & 0xfff, k & 0xf000, u16(b, p + 2) as u32, u32(b, p + 4), u32(b, p + 8)));
+            d.push((
+                k & 0xfff,
+                k & 0xf000,
+                u16(b, p + 2) as u32,
+                u32(b, p + 4),
+                u32(b, p + 8),
+            ));
             p += 12;
         }
-        let lenof = |i: usize| if i + 1 < d.len() { (d[i + 1].3 as usize).saturating_sub(d[i].3 as usize) } else { be - bs };
-        let r407: Vec<usize> = d.iter().enumerate().filter(|(_, x)| x.0 == 0x407).map(|(i, _)| i).collect();
-        if r407.is_empty() || elem_count_b == 0 { continue }
+        let lenof = |i: usize| {
+            if i + 1 < d.len() {
+                (d[i + 1].3 as usize).saturating_sub(d[i].3 as usize)
+            } else {
+                be - bs
+            }
+        };
+        let r407: Vec<usize> = d
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.0 == 0x407)
+            .map(|(i, _)| i)
+            .collect();
+        if r407.is_empty() || elem_count_b == 0 {
+            continue;
+        }
         if dumped < 3 {
             for &i in &r407 {
                 let (k, f, c, o, pm) = d[i];
@@ -203,8 +281,16 @@ fn probe_file(file: &str, b: &[u8]) {
             dumped += 1;
         }
         // bitmap row = flags 0x4000 (or first), coords row = flags 0
-        let brows = d.iter().enumerate().find(|(_, x)| x.0 == 0x407 && x.1 == 0x4000).map(|(i, _)| i);
-        let crows = d.iter().enumerate().find(|(_, x)| x.0 == 0x407 && x.1 == 0).map(|(i, _)| i);
+        let brows = d
+            .iter()
+            .enumerate()
+            .find(|(_, x)| x.0 == 0x407 && x.1 == 0x4000)
+            .map(|(i, _)| i);
+        let crows = d
+            .iter()
+            .enumerate()
+            .find(|(_, x)| x.0 == 0x407 && x.1 == 0)
+            .map(|(i, _)| i);
         let Some(ci) = crows else { continue };
         let (bcode, boff, blen, bparam) = match brows {
             Some(bi2) => (d[bi2].2, d[bi2].3 as usize, lenof(bi2), d[bi2].4),
@@ -212,26 +298,45 @@ fn probe_file(file: &str, b: &[u8]) {
         };
         let (ccode, coff, clen) = (d[ci].2, d[ci].3 as usize, lenof(ci));
         // bitmap: device caps by len; also probe self-delimited cursor
-        let (bmap, _) = lid_format::bitfield_probe(b, bcode, bs + boff, bs + boff + blen, elem_count_b);
+        let (bmap, _) =
+            lid_format::bitfield_probe(b, bcode, bs + boff, bs + boff + blen, elem_count_b);
         let (bmap_full, cur_full) = if brows.is_some() {
             lid_format::bitfield_probe(b, bcode, bs + boff, be, elem_count_b)
-        } else { (vec![true; elem_count_b], bs + boff) };
+        } else {
+            (vec![true; elem_count_b], bs + boff)
+        };
         let nset = bmap.iter().filter(|x| **x).count();
         let nset_f = if brows.is_some() { nset } else { elem_count_b };
         // variant A: coords at own off, span-capped (current lib rule)
-        let (va, _) = lid_format::decode_u32_probe(b, ccode, bs + coff, bs + coff + clen, 2 * nset_f.min(elem_count_b));
+        let (va, _) = lid_format::decode_u32_probe(
+            b,
+            ccode,
+            bs + coff,
+            bs + coff + clen,
+            2 * nset_f.min(elem_count_b),
+        );
         // variant C: coords starting right AFTER the self-delimited bitmap
-        let (vc, _) = lid_format::decode_u32_probe(b, ccode, cur_full.max(bs + coff), be, 2 * nset_f.min(elem_count_b));
+        let (vc, _) = lid_format::decode_u32_probe(
+            b,
+            ccode,
+            cur_full.max(bs + coff),
+            be,
+            2 * nset_f.min(elem_count_b),
+        );
         let count_inpl = |v: &[u32]| -> usize {
             let mut r = 0usize;
             let mut rank = 0usize;
             for e in 0..elem_count_b {
                 let hp = if brows.is_some() { bmap[e] } else { true };
-                if !hp || rank * 2 + 1 >= v.len() { continue }
+                if !hp || rank * 2 + 1 >= v.len() {
+                    continue;
+                }
                 rank += 1;
                 let lon = (ox as i64 + v[rank * 2 - 2] as i64) as f64 / PAU;
                 let lat = (oy as i64 + v[rank * 2 - 1] as i64) as f64 / PAU;
-                if in_pl(lon, lat) { r += 1 }
+                if in_pl(lon, lat) {
+                    r += 1
+                }
             }
             r
         };

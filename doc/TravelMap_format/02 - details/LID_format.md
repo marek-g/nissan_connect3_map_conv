@@ -53,7 +53,7 @@ Special (non-numbered) files, one set per region:
 | `META0000.DAT` | 196 KB | raw binary | metadata (first) — **[PARTIAL]** §7 |
 | `META9999.DAT` | 45 KB | raw binary | metadata (last) — carries the common container header |
 | `MINITILE.DAT` | 1.2 MB | raw + text | mini-tile overview + text/char resources — **[PARTIAL]** §4 |
-| `RELnnnnn.DAT` | 6 files, 11 MB | raw binary | relations (large) — **[PARTIAL]** §4 |
+| `RELnnnnn.DAT` | 6 files, 11 MB | raw binary | relations (sparse blocked CSR matrix) — **[DECODED]** §11.7 |
 
 ---
 
@@ -562,9 +562,29 @@ pattern semantics are the last thing not pinned (the on-device matcher cannot be
 - `PA` (fileType 0x18, `NLPABlock::SetDataBlock` `00e0f0b4` / `bDecodeLists` `00e0f824`): columns
   owner-street-elem (`0xd04` SimpleList<u32>), flags (`0xd05/6`), **HNR value** (SimpleList<u8>), and an exact
   `NLPositionAttrVector` → resolves a house number to a real coordinate (no interpolation).
-- `REL` (fileType 0x16): a **relation matrix** (`NLRelMatrixFile` `00e11874`), logically
-  `multimap<(source_elem, target_elem, type)>`; city→street and city→district(type 2). Exact disk bytes
-  still **INFERRED** (matrix sub-header/block `00e11874`/`00e10fbc` to pin).
+- `REL` (fileType 0x16, `LISA_tclDataManager::bGetFileNameFromDataAddress` `00bc4dd0`; +90000 variant for
+  cross-domain): a **sparse blocked relation matrix**. `NLRelMatrixFile::DecodeSubHeader` `00e11874` reads
+  **9 × u32** at the region start (file `u32@0x10` = header size, `u32@0x14` = region size):
+  `d0, d1` = the two list ids related (samples: `REL00000` d0=2; `REL00004`: `d0=129, d1=12`),
+  `d2` = source element count, `d3` = target element count (REL00004: 194118 ← LID20000, 412392 ← LID20004),
+  `d4, d5` = tile element extents (row/col), `d6, d7` = index-grid dims (`< 0x10000`, both mandatory),
+  `d8` (@+0xb8) = region-end anchor. Then a **`d6 × d7` u32 tile-offset matrix** (column index =
+  `d6*colGridBlock + rowGridBlock`); region size validated = `(matrix_len + 9)*4` + tiles.
+  `NLRelMatrixDescr::bCheckAndCalculate` `00e11564` derives tile-grid counts
+  (`+0x20..+0x34`). `enDetermineDataBlocksByType` `00e11ab8` converts an element interval into
+  `{offset,size}` tile descriptors (`size = next_cell − cell`, last wraps via `d8`) — access type 1 = by
+  rows (element → its targets), type 2 = by columns (**city→street = type 2 with rows=cities? — writer
+  must emit both directions as the per-query access type dictates**).
+- **Tile payload (CONFIRMED, `NLRelMatrixBlock::enGetRelationsByType` `00e11310`)**: a tile is
+  **two u16 parts**: `rowsInTile × colsInTile` u16 **cell count-table** (validated: `table[0] ==
+  rows*cols` and a non-decreasing CSR of cell offsets), then the referenced u16 **value lists** at
+  `tile + table[cell]*2` — each non-empty cell = the row/col ids related to the tile's row/col element.
+  `enGetRowValues`/`enGetColumnValues` read forward from `table[cell]` until `table[cell+1]`.
+  Empty matrix cells → matrix offset 0/adjacent (writer must confirm the "no tile" encoding empirically).
+- **Writer recipe for city→street**: rows = cities (or districts), cols = streets (of that file pair),
+  u16 counts+values CSR as above, tile grid per `tile_elems` fields (≥ 1 relation per tile), matrix index
+  entry per used tile. **POSTILES.DAT** = fileID `0x17` (`NLPOIPosSubHeader` `00e10edc`, decode
+  `00e10d90`) — needed for POI tile search, not for the address phone-book path.
 
 ### 11.8 Converter verdict (CONFIRMED for the address path)
 
@@ -688,12 +708,17 @@ the sub-header (`hdr+0x0c` bit `0x0008_0000` = present, `hdr+0x10/0x14` = `X,Y`;
 region's SW corner ≈ 14.12°,49.10°; `LID20000` sets the bit but stores `-1/-1` = "no positions"). It is the
 anchor used by flows **without** a city context (e.g. the settlement gazetteer), so the **writer contract** is:
 one city per block, elements stored as `pos − that_city_position` (the coordinate the device resolves for the
-city), file header = region corner.
+city), file header = region corner. The low bits of `hdr+0x0c` are per-file *flavor* hints (`0x000001`,
+`0x000002`, `0x000013`, `0x00001d` across `POL/LID20000..5`); only bit `0x0008_0000` governs whether the
+coordinate fields are honored, and `LID20000` (gazetteer) is the "no coordinates" flavor.
 
 **12.6 Hierarchy (city↔street) + element properties** — CONFIRMED accessors, indexed by `element_index`:
 - **belonging name** = parent/city element: `enGetEntryBelongingNameMainElementIndex` `00cdba88` →
   `NLSingleValueAttrVector<u32>` @`+0x328` (column **`0x40c`**: `flags0`=bitmap "has-belonging",
-  `flags0x4000`=values).
+  `flags0x4000`=values). The value is a **block-local terminating-element id** (the device indexes all
+  element columns by the per-block index from `CalculateTerminatingElementIndex`). Stock `POL/LID20000/4/6`
+  set the column on **zero** elements (probe `osm2lid/tests/belonging_probe.rs`) — the city grouping lives in
+  the query context + the +20000 street join instead, so a writer may leave it empty exactly like stock.
 - per-element flags: `bIsEntryValidDestination` / `bHasEntryCrossing` / **`bHasEntryHouseNumber`** /
   `bHasEntryPointAddresses` / `bHasEntryCells` / `…DetailedDescription` (bitvector columns; `enGetEntryCharacterStatus`
   → column `0x415` `NLBinListAttrVector`).
@@ -723,11 +748,13 @@ numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and 
 TOC + raw/VLE column streams — the exact bytes `read` consumes. `osm2lid` now writes **all three** address
 files (unit tests + `malopolskie` fixtures):
 
-* **streets** (`LID20006.DAT`): one element per unique highway `name` at its way centroid, absolute PAU,
-  block origin 0 — **8828 names → 14 blocks → 8828 elements back**. NOTE (§12.5): device-correct output needs
-  **city-grouped blocks** with positions stored **relative to the owning city's position** — currently the
-  writer emits absolute PAU with a null origin, so rework pending.
-* **cities/settlements** (`LID20000.DAT`): one element per unique OSM `place=` name — **10482 names → 12
+* **streets** (`LID20006.DAT`): one element per unique highway `name` at its way centroid — **city-grouped
+  blocks** with coordinates stored `position − city_position` (nearest `place=` node per street, §12.5), so
+  the device's city-relative decode reconstructs the absolute position exactly; the street **element ids**
+  for the GenAttr join are read back from the encoded file's terminating-element DFS order
+  (`write_name_list_idx`). **8828 names → 14+ blocks → 8828 elements back**.
+* **cities/settlements** (`LID20000.DAT`): one element per unique OSM `place=` name, written **without any
+  coordinates** (stock gazetteer flavor: empty `0x407` streams, origin `-1/-1`) — **10482 names → 12
   blocks → 10482 elements back**, diacritics intact.
 
 **12.10 House-number GenAttr writer (`LID40006.DAT`).** Same crate, different container (§11.6b). `osm2lid`
@@ -743,9 +770,9 @@ the froms so their decode-cumulatives are exact, `0000`=raw-u32 tos), and `0xc0a
 **parity** (even-number bit ride in the column's existence bitmap). Validation is offline (no card in the
 loop): `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle over `POL/LID40006` + device read-model
 round-trip) and `osm2lid/tests/genattr.rs`, which runs the real binary on a tiny fixture and re-reads every
-column with `read_gen_attr`/`decode_block`. **Still pending:** `PA`, `REL`, crossing files (+10000), and the
-city-grouped / city-relative positions in `encode` (§12.5); the on-device `NLHnrToTree` matcher itself cannot
-be run here.
+column with `read_gen_attr`/`decode_block` (it also pins the §12.5 city-relative coordinates and the
+element-order street ids). **Still pending:** `PA`, crossing files (+10000), and writing `REL` (its container
+is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matcher itself cannot be run here.
 
 > **Corrected decoder notes (were wrong in earlier revisions):**
 > - **Simple9 mode→(count,bits)** (from `DecodeSimple9` `00cdc3bc`/`00cdc908`, values LSB-first, mode nibble
@@ -783,8 +810,9 @@ be run here.
    multi-block, §12.9): OSM highway `name` → `LID20006.DAT` and OSM `place=` → `LID20000.DAT`, both validated
    by full round-trip, **plus the house-number GenAttr `+20000` file** (`LID40006.DAT`, §11.6/§11.6b,
    OSM `addr:housenumber` → street-joined records, validated by `osm2lid/tests/genattr.rs`).
-   **Still pending:** point-address `PA` / `REL`, crossing files (+10000),
-   and the city-grouped / city-relative position encoding in `encode` (§12.5).
+   **Still pending:** point-address `PA` / tile payload **`REL` generator** (container now *decoded* §11.7,
+   generation not implemented), crossing files (+10000),
+   and on-device acceptance (`NLHnrToTree` against a real card).
 
 > The trie **structure**, **element order** (`CalculateTerminatingElementIndex`), **edge labels/names**
 > (`0x403` + `0x09` variant split) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all

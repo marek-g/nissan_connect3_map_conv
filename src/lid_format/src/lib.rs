@@ -23,14 +23,30 @@ pub fn pau_to_deg(v: i32) -> f64 {
 }
 
 fn u16(b: &[u8], o: usize) -> u32 {
-    if o + 2 > b.len() { 0 } else { u16::from_le_bytes([b[o], b[o + 1]]) as u32 }
+    if o + 2 > b.len() {
+        0
+    } else {
+        u16::from_le_bytes([b[o], b[o + 1]]) as u32
+    }
 }
 fn u32(b: &[u8], o: usize) -> u32 {
-    if o + 4 > b.len() { 0 } else { u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) }
+    if o + 4 > b.len() {
+        0
+    } else {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
 }
 
-fn put_u16(v: Vec<u8>, x: u16) -> Vec<u8> { let mut v = v; v.extend_from_slice(&x.to_le_bytes()); v }
-fn put_u32(v: Vec<u8>, x: u32) -> Vec<u8> { let mut v = v; v.extend_from_slice(&x.to_le_bytes()); v }
+fn put_u16(v: Vec<u8>, x: u16) -> Vec<u8> {
+    let mut v = v;
+    v.extend_from_slice(&x.to_le_bytes());
+    v
+}
+fn put_u32(v: Vec<u8>, x: u32) -> Vec<u8> {
+    let mut v = v;
+    v.extend_from_slice(&x.to_le_bytes());
+    v
+}
 
 /// Encode one integer with the custom `ReadVle` (`00cdb218`) stream format (inverse of `Cur::vle`).
 /// value = final_byte + 128*(bijective-base-128 continuation chunks); continuations are high-bit-set
@@ -138,57 +154,150 @@ fn decode_u32(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u3
 
 /// RE-harness probe: same as `decode_u32` but also returns the byte cursor after the last value.
 #[doc(hidden)]
-pub fn decode_u32_probe(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<u32>, usize) {
+pub fn decode_u32_probe(
+    b: &[u8],
+    code: u32,
+    start: usize,
+    end: usize,
+    n: usize,
+) -> (Vec<u32>, usize) {
     decode_u32_c(b, code, start, end, n)
 }
 
 fn decode_u32_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<u32>, usize) {
-    let mut c = Cur { b, p: start, end: end.min(b.len()) };
+    let mut c = Cur {
+        b,
+        p: start,
+        end: end.min(b.len()),
+    };
     let mut out = Vec::with_capacity(n.min(1_000_000));
     match code {
-        0x11 => for _ in 0..n { if c.eof() { break } out.push(c.ru32()) },
-        0x14 => for _ in 0..n { if c.eof() { break } out.push(c.vle()) },
-        0x16 => { let mut acc = 0i64; for _ in 0..n { if c.eof() { break } acc += c.vle() as i64; out.push(acc as u32) } }
+        0x11 => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.ru32())
+            }
+        }
+        0x14 => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.vle())
+            }
+        }
+        0x16 => {
+            let mut acc = 0i64;
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                acc += c.vle() as i64;
+                out.push(acc as u32)
+            }
+        }
         0x18 => out = c.simple9(n, 28),
         0x13 => {
             // bitmask -> set-bit indices
-            let mut i = 0usize; let mut idx = 0u32;
+            let mut i = 0usize;
+            let mut idx = 0u32;
             while !c.eof() && i < n {
-                let by = c.b[c.p]; c.p += 1;
+                let by = c.b[c.p];
+                c.p += 1;
                 for k in 0..8 {
-                    if by & (1 << k) != 0 { if i >= n { break } out.push(idx); i += 1 }
+                    if by & (1 << k) != 0 {
+                        if i >= n {
+                            break;
+                        }
+                        out.push(idx);
+                        i += 1
+                    }
                     idx += 1;
                 }
             }
         }
         0x12 | 0x15 => {
-            let mut i = 0usize; let mut val = 0u32;
+            let mut i = 0usize;
+            let mut val = 0u32;
             while !c.eof() && i < n {
                 let cnt = if code == 0x12 { c.ru32() } else { c.vle() };
-                while val < cnt && i < n { out.push(val); val += 1; i += 1 }
+                while val < cnt && i < n {
+                    out.push(val);
+                    val += 1;
+                    i += 1
+                }
             }
         }
         0x17 => {
-            let mut i = 0usize; let mut val = 0u32; let mut tgt = 0u32;
+            let mut i = 0usize;
+            let mut val = 0u32;
+            let mut tgt = 0u32;
             while !c.eof() && i < n {
                 tgt = tgt.wrapping_add(c.vle());
-                while val < tgt && i < n { out.push(val); val += 1; i += 1 }
+                while val < tgt && i < n {
+                    out.push(val);
+                    val += 1;
+                    i += 1
+                }
             }
         }
-        _ => for _ in 0..n { if c.eof() { break } out.push(c.ru32()) },
+        _ => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.ru32())
+            }
+        }
     }
     (out, c.p)
 }
 
 fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
-    let mut c = Cur { b, p: start, end: end.min(b.len()) };
+    let mut c = Cur {
+        b,
+        p: start,
+        end: end.min(b.len()),
+    };
     let mut out = Vec::with_capacity(n.min(1_000_000));
     match code {
-        0x11 => for _ in 0..n { if c.eof() { break } out.push(c.ru16()) },
-        0x14 => for _ in 0..n { if c.eof() { break } out.push(c.vle()) },
-        0x16 => { let mut acc = 0i64; for _ in 0..n { if c.eof() { break } acc += c.vle() as i64; out.push((acc & 0xffff) as u32) } }
+        0x11 => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.ru16())
+            }
+        }
+        0x14 => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.vle())
+            }
+        }
+        0x16 => {
+            let mut acc = 0i64;
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                acc += c.vle() as i64;
+                out.push((acc & 0xffff) as u32)
+            }
+        }
         0x18 => out = c.simple9(n, 16),
-        _ => for _ in 0..n { if c.eof() { break } out.push(c.ru16()) },
+        _ => {
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                out.push(c.ru16())
+            }
+        }
     }
     out
 }
@@ -200,7 +309,13 @@ pub(crate) fn bitfield(b: &[u8], code: u32, start: usize, end: usize, n: usize) 
 
 /// RE-harness probe: same as `bitfield` but also returns the byte cursor after the last read.
 #[doc(hidden)]
-pub fn bitfield_probe(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<bool>, usize) {
+pub fn bitfield_probe(
+    b: &[u8],
+    code: u32,
+    start: usize,
+    end: usize,
+    n: usize,
+) -> (Vec<bool>, usize) {
     bitfield_c(b, code, start, end, n)
 }
 
@@ -209,9 +324,45 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
     let end = end.min(b.len());
     let mut cur = start;
     match code {
-        0x01 => { for i in 0..n { let q = start + (i >> 3); if q >= end { break } bits[i] = b[q] >> (i & 7) & 1 != 0 } cur = (start + (n + 7) / 8).min(end); }
-        0x02 => { let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = true } } cur = c.p; }
-        0x03 => { bits = vec![true; n]; let mut c = Cur { b, p: start, end }; let mut acc = 0u32; for _ in 0..n { if c.eof() { break } acc += c.vle(); if (acc as usize) < n { bits[acc as usize] = false } } cur = c.p; }
+        0x01 => {
+            for i in 0..n {
+                let q = start + (i >> 3);
+                if q >= end {
+                    break;
+                }
+                bits[i] = b[q] >> (i & 7) & 1 != 0
+            }
+            cur = (start + (n + 7) / 8).min(end);
+        }
+        0x02 => {
+            let mut c = Cur { b, p: start, end };
+            let mut acc = 0u32;
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                acc += c.vle();
+                if (acc as usize) < n {
+                    bits[acc as usize] = true
+                }
+            }
+            cur = c.p;
+        }
+        0x03 => {
+            bits = vec![true; n];
+            let mut c = Cur { b, p: start, end };
+            let mut acc = 0u32;
+            for _ in 0..n {
+                if c.eof() {
+                    break;
+                }
+                acc += c.vle();
+                if (acc as usize) < n {
+                    bits[acc as usize] = false
+                }
+            }
+            cur = c.p;
+        }
         _ => {}
     }
     (bits, cur)
@@ -221,10 +372,11 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
 pub struct Element {
     pub category: u16,
     pub name: String,
-    pub x_pau: i32, // origin-relative; absolute = block origin + x_pau (origin resolution pending)
+    pub x_pau: i32, // stored delta: absolute = queried-city (or file `origin`) + (x_pau, y_pau) (§12.5)
     pub y_pau: i32,
     pub has_pos: bool,
-    pub belonging: u32, // city/parent element index (0xffffffff = none)
+    pub belonging: u32, // parent-city element id *within the same block* (device id space); 0xffffffff = none.
+                        // Stock POL name-lists set it nowhere (probe `belonging_probe`); kept for fidelity.
 }
 
 /// The whole decoded name-list of a `LID*.DAT` block-container.
@@ -233,8 +385,11 @@ pub struct NameList {
     pub block_count: usize,
     pub elements: Vec<Element>,
     /// File position origin (PAU) = the `tNLHPosition` the sub-header carries (`hdr+0x10/+0x14`, gated by
-    /// bit16 of `hdr+0x0c`) that every element's X/Y delta is added to. `None` = sub-header says the file
-    /// carries no origins (both fields -1, e.g. POL cities `LID20000` — those get positions elsewhere).
+    /// bit `0x0008_0000` of `hdr+0x0c`); street tiles use it only when no city context exists, street
+    /// coordinates are otherwise relative to the *queried city* (see §12.5). `None` = "-1/-1" = the file
+    /// carries no origins (POL city gazetteer `LID20000`).
+    /// `hdr+0x0c`'s low bits (`0x13`/`0x01`/`0x1d`/`0` on stock POL) are file-flavor hints; the decoder
+    /// only honors bit `0x0008_0000`.
     pub origin: Option<(i32, i32)>,
 }
 
@@ -261,7 +416,9 @@ pub struct GenAttrIndex {
 fn gen_attr_toc(b: &[u8]) -> Option<(u32, Vec<GenAttrTocEntry>)> {
     let n = b.len();
     let hdr = u32(b, 0x10) as usize;
-    if hdr + 24 > n { return None }
+    if hdr + 24 > n {
+        return None;
+    }
     // sub-header: `u32 elem_count, u32 this+4, u32 toc_count, u32 block_count`, then toc_count
     // NLBlockTocEntry {u32 elem_start, u32 elem_end, u32 block_off} (NLGenAttrFile 0xe0e3d0).
     let elem_count = u32(b, hdr);
@@ -272,13 +429,21 @@ fn gen_attr_toc(b: &[u8]) -> Option<(u32, Vec<GenAttrTocEntry>)> {
     let mut p = hdr + 16;
     let mut blocks: Vec<GenAttrTocEntry> = Vec::with_capacity((toccount as usize).min(n / 12));
     for i in 0..toccount {
-        if p + 12 > n { break }
+        if p + 12 > n {
+            break;
+        }
         let (a, c, o) = (u32(b, p), u32(b, p + 4), u32(b, p + 8));
         p += 12;
         // element ranges must tile contiguously & ascending (first starts at 0, ends at elem_count-1)
         let contiguous = i == 0 || a == blocks[i as usize - 1].elem_end + 1;
-        if !contiguous || a > c || c >= elem_count { break }
-        blocks.push(GenAttrTocEntry { elem_start: a, elem_end: c, block_off: o });
+        if !contiguous || a > c || c >= elem_count {
+            break;
+        }
+        blocks.push(GenAttrTocEntry {
+            elem_start: a,
+            elem_end: c,
+            block_off: o,
+        });
     }
     // accept only a full tiling of [0, elem_count) — the strong signal that distinguishes GenAttr
     if blocks.is_empty()
@@ -299,7 +464,10 @@ pub fn is_gen_attr(b: &[u8]) -> bool {
 /// Parse a GenAttr file index. Use this for `LID4nnnn.DAT` (fileID+20000), never `read`.
 pub fn read_gen_attr(b: &[u8]) -> Result<GenAttrIndex, String> {
     gen_attr_toc(b)
-        .map(|(element_count, blocks)| GenAttrIndex { element_count, blocks })
+        .map(|(element_count, blocks)| GenAttrIndex {
+            element_count,
+            blocks,
+        })
         .ok_or_else(|| "not a GenAttr file (TOC element ranges do not tile)".into())
 }
 
@@ -310,10 +478,10 @@ pub fn read_gen_attr(b: &[u8]) -> Result<GenAttrIndex, String> {
 /// codecs (Simple9 / VLE / bitmap / delta) used by the name-list reader.
 #[derive(Debug, Clone)]
 pub struct GenAttrStream {
-    pub col: u32,    // kind & 0xfff  (0xc01..0xc14 = HNR attribute vectors; 0x001..0x005 = CellId)
-    pub flags: u32,  // kind & 0xf000 (0 = values, 0x4000 = secondary, 0x8000 = tertiary sub-stream)
-    pub code: u32,   // codec id: 0x01/0x02/0x03 = bitmap; 0x11 raw; 0x14 Simple9; 0x16 delta; 0x18 Simple9-u32
-    pub param: u32,  // element/value count this stream decodes to (or bit count for a bitmap)
+    pub col: u32, // kind & 0xfff  (0xc01..0xc14 = HNR attribute vectors; 0x001..0x005 = CellId)
+    pub flags: u32, // kind & 0xf000 (0 = values, 0x4000 = secondary, 0x8000 = tertiary sub-stream)
+    pub code: u32, // codec id: 0x01/0x02/0x03 = bitmap; 0x11 raw; 0x14 Simple9; 0x16 delta; 0x18 Simple9-u32
+    pub param: u32, // element/value count this stream decodes to (or bit count for a bitmap)
     pub values: Vec<u32>,
     pub bits: Vec<bool>,
 }
@@ -334,15 +502,29 @@ impl GenAttrIndex {
         let e = *self.blocks.get(bi).ok_or("block index out of range")?;
         let n = b.len();
         let bs = e.block_off as usize;
-        let be = if bi + 1 < self.blocks.len() { self.blocks[bi + 1].block_off as usize } else { n };
-        if bs + 2 > n { return Err("truncated GenAttr block".into()) }
+        let be = if bi + 1 < self.blocks.len() {
+            self.blocks[bi + 1].block_off as usize
+        } else {
+            n
+        };
+        if bs + 2 > n {
+            return Err("truncated GenAttr block".into());
+        }
         let num_desc = u16(b, bs) as usize;
         let mut descs: Vec<Desc> = Vec::with_capacity(num_desc);
         let mut p = bs + 2;
         for _ in 0..num_desc {
-            if p + 12 > be { break }
+            if p + 12 > be {
+                break;
+            }
             let k = u16(b, p);
-            descs.push(Desc { kind: k & 0xfff, flags: k & 0xf000, code: u16(b, p + 2), off: u32(b, p + 4), param: u32(b, p + 8) });
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
             p += 12;
         }
         // Device-exact stream span (`SetDataBlock` @0xe09b60): each descriptor's byte region is
@@ -352,21 +534,39 @@ impl GenAttrIndex {
         // (which over-reads the first descriptor of an equal-`off` pair).
         let offs: Vec<u32> = descs.iter().map(|d| d.off).collect();
         let span_end = |i: usize| -> usize {
-            if i + 1 < offs.len() { bs + offs[i + 1] as usize } else { be }
+            if i + 1 < offs.len() {
+                bs + offs[i + 1] as usize
+            } else {
+                be
+            }
         };
         let mut streams = Vec::with_capacity(descs.len());
         for (i, d) in descs.iter().enumerate() {
             let (s, en) = (bs + d.off as usize, span_end(i));
             let is_bitmap = matches!(d.code, 0x01 | 0x02 | 0x03); // existence sub-streams only
-            let count = (d.param as usize).min((en - s).min(huge_len(en)) * 32).min(64_000_000);
+            let count = (d.param as usize)
+                .min((en - s).min(huge_len(en)) * 32)
+                .min(64_000_000);
             let (values, bits) = if is_bitmap {
                 (vec![], bitfield(b, d.code, s, en, count))
             } else {
                 (decode_u32(b, d.code, s, en, count), vec![])
             };
-            streams.push(GenAttrStream { col: d.kind, flags: d.flags, code: d.code, param: d.param, values, bits });
+            streams.push(GenAttrStream {
+                col: d.kind,
+                flags: d.flags,
+                code: d.code,
+                param: d.param,
+                values,
+                bits,
+            });
         }
-        Ok(GenAttrBlock { elem_start: e.elem_start, elem_end: e.elem_end, block_off: e.block_off, streams })
+        Ok(GenAttrBlock {
+            elem_start: e.elem_start,
+            elem_end: e.elem_end,
+            block_off: e.block_off,
+            streams,
+        })
     }
 }
 
@@ -375,9 +575,8 @@ fn huge_len(en: usize) -> usize {
     en.saturating_sub(0) / 8 + 1
 }
 
-
 struct Desc {
-    kind: u32, // kind & 0xfff
+    kind: u32,  // kind & 0xfff
     flags: u32, // kind & 0xf000
     code: u32,
     off: u32,
@@ -388,8 +587,12 @@ pub fn is_name_list(b: &[u8]) -> bool {
     // ASF name-list header: u32@0x10 = header size (a smallish sane value),
     // sub-header begins with a plausible element count. A GenAttr file is a *different*
     // container (`NLGenAttrFile`); never treat it as a name-list (that produced garbage).
-    if b.len() < 0x100 { return false }
-    if is_gen_attr(b) { return false }
+    if b.len() < 0x100 {
+        return false;
+    }
+    if is_gen_attr(b) {
+        return false;
+    }
     let hdr = u32(b, 0x10);
     let extra = u32(b, 0x14);
     hdr > 0x26 && hdr < 0x1000 && extra < 0x10_0000 && u32(b, hdr as usize) > 0
@@ -399,14 +602,18 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     let b = b_in;
     let n = b.len();
     let hdr = u32(b, 0x10) as usize;
-    if hdr + 60 > n { return Err("truncated ASF header".into()) }
+    if hdr + 60 > n {
+        return Err("truncated ASF header".into());
+    }
     let elem_count = u32(b, hdr);
     let block_count = u16(b, hdr + 4) as usize; // section/vector count of block table
-    // 7 sections at hdr+24: (u8 code, u32 file-absolute offset)
+                                                // 7 sections at hdr+24: (u8 code, u32 file-absolute offset)
     let mut sec = [(0u8, 0u32); 7];
     for i in 0..7 {
         let p = hdr + 24 + i * 5;
-        if p + 5 > n { break }
+        if p + 5 > n {
+            break;
+        }
         sec[i] = (b[p], u32(b, p + 1));
     }
     // section 1 (raw u32) holds block file-offsets; count = block_count.
@@ -414,7 +621,9 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     let mut block_off = Vec::with_capacity(block_count);
     for i in 0..block_count {
         let o = boff_base + i * 4;
-        if o + 4 > n { break }
+        if o + 4 > n {
+            break;
+        }
         block_off.push(u32(b, o) as usize);
     }
     if block_off.is_empty() {
@@ -425,20 +634,36 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
 
     for bi in 0..block_off.len() {
         let bs = block_off[bi];
-        let be = if bi + 1 < block_off.len() { block_off[bi + 1] } else { n };
-        if bs + 8 > n { break }
+        let be = if bi + 1 < block_off.len() {
+            block_off[bi + 1]
+        } else {
+            n
+        };
+        if bs + 8 > n {
+            break;
+        }
         let node_count = u16(b, bs) as usize;
         let _f2 = u16(b, bs + 2);
         let elem_count_b = u16(b, bs + 4) as usize;
         let num_desc = u16(b, bs + 6) as usize;
-        if node_count == 0 { continue }
+        if node_count == 0 {
+            continue;
+        }
 
         let mut descs: Vec<Desc> = Vec::with_capacity(num_desc);
         let mut p = bs + 8;
         for _ in 0..num_desc {
-            if p + 12 > be { break }
+            if p + 12 > be {
+                break;
+            }
             let k = u16(b, p);
-            descs.push(Desc { kind: k & 0xfff, flags: k & 0xf000, code: u16(b, p + 2), off: u32(b, p + 4), param: u32(b, p + 8) });
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
             p += 12;
         }
         // Data span of a descriptor row = [off[i], off[i+1]) in DESCRIPTOR-ROW order; the last row runs
@@ -447,7 +672,9 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // the earlier offset-based "next larger off" rule mis-attributed a column's bytes to its
         // neighbours whenever several zero-length rows tied (visible garbage on sections of LID20000).
         let span_end = |d: &Desc| -> usize {
-            let row = descs.iter().position(|x| x.kind == d.kind && x.flags == d.flags && x.off == d.off)
+            let row = descs
+                .iter()
+                .position(|x| x.kind == d.kind && x.flags == d.flags && x.off == d.off)
                 .unwrap_or(0);
             if row + 1 < descs.len() {
                 (bs + descs[row + 1].off as usize).max(bs + d.off as usize)
@@ -463,7 +690,13 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // out-degree column 0x401 (u16)
         let od = match get(0x401, 0) {
             Some(d) => {
-                let mut v = decode_u16(b, d.code, bs + d.off as usize, span_end(d), d.param as usize);
+                let mut v = decode_u16(
+                    b,
+                    d.code,
+                    bs + d.off as usize,
+                    span_end(d),
+                    d.param as usize,
+                );
                 v.resize(node_count, 0);
                 v
             }
@@ -487,7 +720,9 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                     let c0 = cs[n];
                     for i in (0..od[n] as usize).rev() {
                         let c = c0 + i;
-                        if c < node_count { stack.push(c); }
+                        if c < node_count {
+                            stack.push(c);
+                        }
                     }
                 }
                 node += consumed;
@@ -517,16 +752,32 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             let bs0 = bs + bd.off as usize;
             blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
             if let Some(offd) = c403.iter().copied().find(|d| d.code != 0x11) {
-                loff = decode_u32(b, offd.code, bs + offd.off as usize, span_end(offd), offd.param as usize);
+                loff = decode_u32(
+                    b,
+                    offd.code,
+                    bs + offd.off as usize,
+                    span_end(offd),
+                    offd.param as usize,
+                );
             }
         } else if let Some(bd) = c403.first() {
             let bs0 = bs + bd.off as usize;
             blob = &b[bs0.min(n)..(bs0 + bd.param as usize).min(n)];
         }
         let label = |node: usize| -> &[u8] {
-            if node == 0 { return &blob[..0] }
-            let a = if node - 1 < loff.len() { loff[node - 1] as usize } else { blob.len() };
-            let bb = if node < loff.len() { loff[node] as usize } else { blob.len() };
+            if node == 0 {
+                return &blob[..0];
+            }
+            let a = if node - 1 < loff.len() {
+                loff[node - 1] as usize
+            } else {
+                blob.len()
+            };
+            let bb = if node < loff.len() {
+                loff[node] as usize
+            } else {
+                blob.len()
+            };
             let a = a.min(blob.len());
             let bb = bb.max(a).min(blob.len());
             &blob[a..bb]
@@ -545,9 +796,15 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             None => vec![],
         };
         // belonging-name (city): col 0x40c -> bitmap (flags0) + COMPRESSED values (flags 0x4000)
-        let belongs_flag = match get(0x40c, 0) { Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d), elem_count_b), None => vec![false; elem_count_b] };
+        let belongs_flag = match get(0x40c, 0) {
+            Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d), elem_count_b),
+            None => vec![false; elem_count_b],
+        };
         let nbel = belongs_flag.iter().filter(|&&x| x).count();
-        let belongs_vals = match get(0x40c, 0x4000) { Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), nbel), None => vec![] };
+        let belongs_vals = match get(0x40c, 0x4000) {
+            Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), nbel),
+            None => vec![],
+        };
 
         // Name accumulation over the trie: node's name = parent's name + its incoming-edge label.
         // Iterate every node as a potential root (forest-safe); children(n) = [childStart[n] ..).
@@ -555,14 +812,18 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         let mut seen = vec![false; node_count];
         let mut stack: Vec<usize> = Vec::new();
         for r in 0..node_count {
-            if seen[r] { continue }
+            if seen[r] {
+                continue;
+            }
             seen[r] = true;
             stack.push(r);
             while let Some(node) = stack.pop() {
                 let base = cs[node];
                 for i in 0..od[node] as usize {
                     let c = base + i;
-                    if c >= node_count || seen[c] { continue }
+                    if c >= node_count || seen[c] {
+                        continue;
+                    }
                     seen[c] = true;
                     let mut s = name_of[node].clone();
                     s.extend_from_slice(label(c));
@@ -586,16 +847,31 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             let (x, y) = if hp {
                 let k = pos_rank * 2;
                 pos_rank += 1;
-                if k + 1 < coords.len() { (coords[k] as i32, coords[k + 1] as i32) } else { (0, 0) }
-            } else { (0, 0) };
+                if k + 1 < coords.len() {
+                    (coords[k] as i32, coords[k + 1] as i32)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
             let belonging = if belongs_flag.get(ei).copied().unwrap_or(false) {
                 let v = belongs_vals.get(bel_rank).copied().unwrap_or(0xffff_ffff);
                 bel_rank += 1;
                 v
-            } else { 0xffff_ffff };
-            if name.trim().is_empty() { continue }
+            } else {
+                0xffff_ffff
+            };
+            if name.trim().is_empty() {
+                continue;
+            }
             elements.push(Element {
-                category: 0, name, x_pau: x, y_pau: y, has_pos: hp, belonging,
+                category: 0,
+                name,
+                x_pau: x,
+                y_pau: y,
+                has_pos: hp,
+                belonging,
             });
         }
     }
@@ -604,9 +880,20 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     // the -1/-1 pair = "file carries no positions" (LID20000 has the flag set but stores -1/-1).
     let origin = if (u32(b, hdr + 0x0c) & 0x0008_0000) != 0 {
         let (x, y) = (u32(b, hdr + 0x10) as i32, u32(b, hdr + 0x14) as i32);
-        if x == -1 || y == -1 { None } else { Some((x, y)) }
-    } else { None };
-    Ok(NameList { element_count: elem_count, block_count: block_off.len(), elements, origin })
+        if x == -1 || y == -1 {
+            None
+        } else {
+            Some((x, y))
+        }
+    } else {
+        None
+    };
+    Ok(NameList {
+        element_count: elem_count,
+        block_count: block_off.len(),
+        elements,
+        origin,
+    })
 }
 
 /// Element order exactly mirroring `NLAsfBlock::CalculateTerminatingElementIndex` +
@@ -614,7 +901,13 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
 /// assigned DFS — for each node, first its leaf children (in child order), then recurse into its
 /// internal children (in child order). Implemented with an explicit stack (deep tries overflow the
 /// native call stack otherwise).
-fn collect_terms(od: &[u32], cs: &[usize], blocklink: &[bool], node_count: usize, out: &mut Vec<usize>) {
+fn collect_terms(
+    od: &[u32],
+    cs: &[usize],
+    blocklink: &[bool],
+    node_count: usize,
+    out: &mut Vec<usize>,
+) {
     let mut done = vec![false; node_count];
     let mut stack: Vec<usize> = Vec::new();
     let mut start = 0usize;
@@ -656,7 +949,12 @@ fn decode_name(raw: &[u8]) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| match std::str::from_utf8(s) {
             Ok(t) => t.trim().to_string(),
-            Err(_) => s.iter().map(|&c| c as char).collect::<String>().trim().to_string(),
+            Err(_) => s
+                .iter()
+                .map(|&c| c as char)
+                .collect::<String>()
+                .trim()
+                .to_string(),
         })
         .collect();
     if segs.len() <= 1 {
@@ -670,13 +968,18 @@ fn decode_name(raw: &[u8]) -> String {
 
 // --------------------------------------------------------------------------- writer (encoder)
 
-/// One name-list entry for the writer: a display-name label and a position (PAU; treated as
-/// absolute, block origin = 0). Names must not contain byte `0x00`.
+/// One name-list entry for the writer: a display-name label, its **absolute** position (PAU) and the
+/// position of the **owning city** (`city`). Positions are stored the way the device expects (§12.5):
+/// entries are grouped into blocks **by city**, and inside a block each coordinate is written as a
+/// `position − city` delta — the device adds the *queried city's* position back at load time. `city:
+/// None` (e.g. the settlement gazetteer `LID20000`, which stock keeps coordinate-free) writes no positions
+/// and a `-1/-1` file origin. Names must not contain byte `0x00`.
 #[derive(Debug, Clone)]
 pub struct NameEntry {
     pub label: String,
     pub x_pau: i32,
     pub y_pau: i32,
+    pub city: Option<(i32, i32)>,
 }
 
 struct TrieNode {
@@ -690,24 +993,64 @@ const MAX_NODES_PER_BLOCK: usize = 10_000;
 /// Encode name entries into an ASF `LID*` name-list file (a plain trie, possibly multi-block),
 /// the exact byte format `read()` parses back. This is the round-trip oracle for the converter:
 /// `read(&encode(&entries)).elements` reproduces the `(name, position)` multiset.
+///
+/// Position handling follows the device (§12.5): entries that carry an owning `city` are grouped into
+/// blocks **per city** and stored as `position − city` deltas (the device adds the queried city back);
+/// the file header then advertises the region's SW corner as its file-level anchor (flags `0x0008_0001`).
+/// Entries without a city (the settlement gazetteer) are stored without any coordinate stream (flags
+/// `0x0008_0000`, origin `-1/-1`) — exactly like the stock `LID20000`.
 pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
-    // --- chunk entries so each block's trie stays under MAX_NODES_PER_BLOCK ---
-    let mut chunks: Vec<&[NameEntry]> = Vec::new();
-    let mut start = 0usize;
-    while start < entries.len() {
-        let (mut i, mut est) = (start, 1usize);
-        while i < entries.len() {
-            let add = entries[i].label.len() + 1; // upper bound (no prefix sharing)
-            if i > start && est + add > MAX_NODES_PER_BLOCK { break }
-            est += add;
-            i += 1;
+    let with_city = entries.iter().any(|e| e.city.is_some());
+
+    // --- group by city (first-seen order), then chunk each city under MAX_NODES_PER_BLOCK ---
+    let mut groups: Vec<(Option<(i32, i32)>, Vec<&NameEntry>)> = Vec::new();
+    for e in entries {
+        if let Some(g) = groups.iter_mut().find(|(c, _)| *c == e.city) {
+            g.1.push(e);
+        } else {
+            groups.push((e.city, vec![e]));
         }
-        chunks.push(&entries[start..i]);
-        start = i;
+    }
+    let mut chunks: Vec<(Option<(i32, i32)>, Vec<NameEntry>)> = Vec::new(); // (anchor, entries)
+    for (anchor, ge) in groups {
+        let mut start = 0usize;
+        while start < ge.len() {
+            let (mut i, mut est) = (start, 1usize);
+            while i < ge.len() {
+                let add = ge[i].label.len() + 1; // upper bound (no prefix sharing)
+                if i > start && est + add > MAX_NODES_PER_BLOCK {
+                    break;
+                }
+                est += add;
+                i += 1;
+            }
+            chunks.push((
+                anchor,
+                ge[start..i]
+                    .iter()
+                    .map(|e| (*e).clone())
+                    .collect::<Vec<NameEntry>>(),
+            ));
+            start = i;
+        }
     }
 
-    let blocks: Vec<(Vec<u8>, usize)> = chunks.iter().map(|c| build_block(c)).collect();
+    let blocks: Vec<(Vec<u8>, usize)> = chunks
+        .iter()
+        .map(|(anchor, c)| build_block(*anchor, c))
+        .collect();
     let total_elem: usize = blocks.iter().map(|(_, e)| *e).sum();
+
+    // --- file-level anchor: region SW corner (stock convention) / -1,-1 when no positions ---
+    let corner: (i32, i32) = if with_city {
+        (
+            entries.iter().map(|e| e.x_pau).min().unwrap_or(0),
+            entries.iter().map(|e| e.y_pau).min().unwrap_or(0),
+        )
+    } else {
+        (-1, -1)
+    };
+    let flags: u32 = if with_city { 0x0008_0001 } else { 0x0008_0000 };
 
     // --- container: header @0x40, then block table (u32 block starts), then blocks ---
     let hdr = 0x40u32;
@@ -720,8 +1063,14 @@ pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
     f[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // extra
     let mut sh: Vec<u8> = Vec::new();
     sh = put_u32(sh, total_elem as u32); // element_count (global)
-    for i in 0..6 { sh = put_u16(sh, if i == 0 { blocks.len() as u16 } else { 0 }) } // [0]=block count
-    sh = put_u32(sh, 0); sh = put_u32(sh, 0);
+    for i in 0..6 {
+        sh = put_u16(sh, if i == 0 { blocks.len() as u16 } else { 0 })
+    } // [0]=block count
+      // overwrite the two trailing u16 of that run (sub-header u32 @+0x0c) with the position flags
+    let fl = sh.len() - 4;
+    sh[fl..fl + 4].copy_from_slice(&flags.to_le_bytes());
+    sh = put_u32(sh, corner.0 as u32);
+    sh = put_u32(sh, corner.1 as u32); // file-level tNLHPosition (PAU)
     for i in 0..7 {
         let code = if i == 1 { 0x11u8 } else { 0u8 };
         let off = if i == 1 { table_at as u32 } else { 0u32 };
@@ -733,14 +1082,23 @@ pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
     // block-offset table (absolute file offsets)
     let mut offs: Vec<u32> = Vec::with_capacity(blocks.len());
     let mut pos = first_block_at;
-    for (blk, _) in &blocks { offs.push(pos as u32); pos += blk.len(); }
-    for &o in &offs { f = put_u32(f, o); }
-    for (blk, _) in &blocks { f.extend_from_slice(blk); }
+    for (blk, _) in &blocks {
+        offs.push(pos as u32);
+        pos += blk.len();
+    }
+    for &o in &offs {
+        f = put_u32(f, o);
+    }
+    for (blk, _) in &blocks {
+        f.extend_from_slice(blk);
+    }
     f
 }
 
-/// Build one block (a plain-trie name-list) for a chunk of entries; returns (bytes, element_count).
-fn build_block(entries: &[NameEntry]) -> (Vec<u8>, usize) {
+/// Build one block (a plain-trie name-list) for a chunk of entries. `anchor` = the city position the
+/// stored coordinates are relative to (`None` = no coordinates at all, gazetteer flavor). Returns
+/// (bytes, element_count).
+fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, usize) {
     // --- build trie (byte edges; every name terminated with 0x00 so it is a leaf) ---
     let mut nodes: Vec<TrieNode> = vec![TrieNode { child: Vec::new() }];
     let mut leaf_of = vec![0usize; entries.len()];
@@ -749,7 +1107,10 @@ fn build_block(entries: &[NameEntry]) -> (Vec<u8>, usize) {
         for &b in e.label.as_bytes().iter().chain(std::iter::once(&0u8)) {
             let mut nxt = None;
             for &(eb, ch) in nodes[h].child.iter() {
-                if eb == b { nxt = Some(ch); break }
+                if eb == b {
+                    nxt = Some(ch);
+                    break;
+                }
             }
             let ch = match nxt {
                 Some(c) => c,
@@ -800,7 +1161,13 @@ fn build_block(entries: &[NameEntry]) -> (Vec<u8>, usize) {
     // --- element order (terminating-leaf DFS) so coords index by element_index ---
     let no_block = vec![false; nc];
     let mut term: Vec<usize> = Vec::with_capacity(entries.len());
-    collect_terms(&outdeg.iter().map(|&x| x as u32).collect::<Vec<u32>>(), &cs, &no_block, nc, &mut term);
+    collect_terms(
+        &outdeg.iter().map(|&x| x as u32).collect::<Vec<u32>>(),
+        &cs,
+        &no_block,
+        nc,
+        &mut term,
+    );
     let elem_count = term.len();
 
     // --- edge-label blob + absolute offsets (code 0x14 VLE) ---
@@ -811,32 +1178,61 @@ fn build_block(entries: &[NameEntry]) -> (Vec<u8>, usize) {
         blob.extend_from_slice(&label_id[id]);
     }
 
-    // --- coordinates in element order (raw u32 interleaved, origin = 0) ---
-    let mut coords: Vec<u8> = Vec::with_capacity(elem_count * 8);
-    for &id in &term {
-        let ei = id_to_leaf[id];
-        let (x, y) = if ei != usize::MAX { (entries[ei].x_pau as u32, entries[ei].y_pau as u32) } else { (0, 0) };
-        coords = put_u32(coords, x);
-        coords = put_u32(coords, y);
+    // --- coordinates in element order: raw u32 interleaved `position - city` (stock flavor §12.5), or
+    //     the gazetteer flavor: no coordinate stream at all (stock LID20000 = empty 0x407 streams) ---
+    let mut coords: Vec<u8> = Vec::with_capacity(if anchor.is_some() { elem_count * 8 } else { 0 });
+    if anchor.is_some() {
+        for &id in &term {
+            let ei = id_to_leaf[id];
+            let (x, y) = if ei != usize::MAX {
+                let a = anchor.unwrap();
+                (
+                    entries[ei].x_pau as i32 - a.0,
+                    entries[ei].y_pau as i32 - a.1,
+                )
+            } else {
+                (0, 0)
+            };
+            coords = put_u32(coords, x as u32);
+            coords = put_u32(coords, y as u32);
+        }
     }
 
     // --- numeric/flag streams ---
     let mut od_bytes: Vec<u8> = Vec::with_capacity(nc * 2);
-    for &d in &outdeg { od_bytes = put_u16(od_bytes, d) }
-    let loff_bytes: Vec<u8> = loff.iter().fold(Vec::new(), |acc, &o| { let mut a = acc; a.extend_from_slice(&vle_encode(o)); a });
+    for &d in &outdeg {
+        od_bytes = put_u16(od_bytes, d)
+    }
+    let loff_bytes: Vec<u8> = loff.iter().fold(Vec::new(), |acc, &o| {
+        let mut a = acc;
+        a.extend_from_slice(&vle_encode(o));
+        a
+    });
     let bl_bits = vec![0u8; (nc + 7) / 8]; // block-link bitmap: none
-    let pos_bits = vec![0xFFu8; (elem_count + 7) / 8]; // all elements have a position
     let bel_bits = vec![0u8; (elem_count + 7) / 8]; // belonging: none
 
     // --- assemble block: 8B header + descriptors + data (offsets block-relative) ---
+    // Stock position flavor (§12.5): the existence row is a *zero-length* bitmap sub-stream with count
+    // `elem_count` — code 0x03 (sparse-clear) reads as "every element has a position", 0x02 (sparse-set)
+    // as "none do"; either way its `off` equals the coordinate row's `off`.
+    let (pos_wf, pos_code, pos_bytes): (u16, u16, &[u8]) = if anchor.is_some() {
+        (0x4407, 0x03, &[] as &[u8])
+    } else {
+        (0x4407, 0x02, &[] as &[u8])
+    };
+    let (coord_code, coord_param): (u16, u32) = if anchor.is_some() {
+        (0x11, (elem_count * 2) as u32)
+    } else {
+        (0x11, 0)
+    };
     let descs: Vec<(u16, u16, &[u8], u32)> = vec![
-        (0x0401, 0x11, &od_bytes, nc as u32),        // outDegree (raw u16)
-        (0x4402, 0x01, &bl_bits, nc as u32),         // block-link bitmap (raw bits, flags 0x4000)
-        (0x0403, 0x11, &blob, blob.len() as u32),    // edge-label blob (raw bytes)
+        (0x0401, 0x11, &od_bytes, nc as u32),     // outDegree (raw u16)
+        (0x4402, 0x01, &bl_bits, nc as u32),      // block-link bitmap (raw bits, flags 0x4000)
+        (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob (raw bytes)
         (0x4403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (VLE, flags 0x4000)
-        (0x4407, 0x01, &pos_bits, elem_count as u32),// has-position bitmap (flags 0x4000)
-        (0x0407, 0x11, &coords, (elem_count * 2) as u32), // coords interleaved X,Y (raw u32)
-        (0x040c, 0x01, &bel_bits, elem_count as u32),// belonging bitmap
+        (pos_wf, pos_code, pos_bytes, elem_count as u32), // has-position sub-stream (flags 0x4000, tie off)
+        (0x0407, coord_code, &coords, coord_param), // coords interleaved X,Y (raw u32) or empty
+        (0x040c, 0x01, &bel_bits, elem_count as u32), // belonging bitmap
     ];
 
     let hdr_sz = 8usize + descs.len() * 12;
@@ -870,7 +1266,8 @@ mod tests {
     fn synth_gen_attr(elem_count: u32, per_block: u32) -> Vec<u8> {
         let hdr = 0x77usize;
         let mut b = vec![0u8; hdr];
-        b[0] = 0x02; b[1] = 0x04; // region
+        b[0] = 0x02;
+        b[1] = 0x04; // region
         b[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
         let toccount = elem_count.div_ceil(per_block);
         b.extend_from_slice(&elem_count.to_le_bytes());
@@ -894,12 +1291,18 @@ mod tests {
     fn gen_attr_toc_parses_and_tiles() {
         let b = synth_gen_attr(20000, 7904);
         assert!(is_gen_attr(&b));
-        assert!(!is_name_list(&b), "GenAttr must not be mistaken for a name-list");
+        assert!(
+            !is_name_list(&b),
+            "GenAttr must not be mistaken for a name-list"
+        );
         let ga = read_gen_attr(&b).unwrap();
         assert_eq!(ga.element_count, 20000);
         assert_eq!(ga.blocks[0].elem_start, 0);
         assert_eq!(ga.blocks.last().unwrap().elem_end, 19999);
-        assert!(ga.blocks.windows(2).all(|w| w[0].elem_end + 1 == w[1].elem_start));
+        assert!(ga
+            .blocks
+            .windows(2)
+            .all(|w| w[0].elem_end + 1 == w[1].elem_start));
     }
 
     #[test]
@@ -921,7 +1324,7 @@ mod tests {
         let bs = 0x1000usize;
         b.resize(bs + 0x40, 0xAA);
         b[bs..bs + 2].copy_from_slice(&2u16.to_le_bytes()); // num_desc
-        // desc0: kind 0x0c09 (col 0xc09, flags 0), code 0x01 raw bitmap, off 0x20, param 8 bits
+                                                            // desc0: kind 0x0c09 (col 0xc09, flags 0), code 0x01 raw bitmap, off 0x20, param 8 bits
         b[bs + 2..bs + 4].copy_from_slice(&0x0c09u16.to_le_bytes());
         b[bs + 4..bs + 6].copy_from_slice(&0x0001u16.to_le_bytes());
         b[bs + 6..bs + 10].copy_from_slice(&0x20u32.to_le_bytes());
@@ -942,7 +1345,10 @@ mod tests {
         assert_eq!(blk.streams.len(), 2);
         let bm = blk.streams.iter().find(|s| s.col == 0xc09).unwrap();
         assert_eq!(bm.bits.len(), 8);
-        assert_eq!(bm.bits, vec![true, false, true, false, false, true, false, false]);
+        assert_eq!(
+            bm.bits,
+            vec![true, false, true, false, false, true, false, false]
+        );
         let vs = blk.streams.iter().find(|s| s.col == 0xc01).unwrap();
         assert_eq!(vs.values, vec![10, 20, 30, 40]);
     }
@@ -961,7 +1367,10 @@ mod tests {
         let par = blk.streams.iter().find(|s| s.col == 0xc09).unwrap();
         assert_eq!(par.bits.len(), 10886);
         let set = par.bits.iter().filter(|&&x| x).count();
-        assert!(set > 4000 && set < 8000, "parity density implausible: {set}");
+        assert!(
+            set > 4000 && set < 8000,
+            "parity density implausible: {set}"
+        );
     }
 
     #[test]
@@ -989,23 +1398,56 @@ mod tests {
         use crate::write::{write_gen_attr_file, BlockData, ColData};
         // block0: elems 0..1 (addrs 0,1); street-list = 2 streets -> addrs {0,1}/{2,3-per-blk0:false}.
         let mk = |e0: u32, e1: u32, addr0: u32, addr1: u32| BlockData {
-            elem_start: e0, elem_end: e1,
+            elem_start: e0,
+            elem_end: e1,
             cols: vec![
                 // +0x28 (0xc01) street -> addr list. street0 owns both addrs, street1 none.
-                ColData { selector: 0xc01, domain: 2, exists: vec![true, false],
-                          counts: vec![2], values: vec![addr0, addr1],
-                          code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+                ColData {
+                    selector: 0xc01,
+                    domain: 2,
+                    exists: vec![true, false],
+                    counts: vec![2],
+                    values: vec![addr0, addr1],
+                    code_8000: 0x16,
+                    code_0000: 0x14,
+                    range_from_to: None,
+                },
                 // +0x4d0 (0xc13) owner-descr -> street-desc list (addr idx = owner-descr, 1:1).
-                ColData { selector: 0xc13, domain: 2, exists: vec![true, true],
-                          counts: vec![1, 2], values: vec![0, 1],
-                          code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+                ColData {
+                    selector: 0xc13,
+                    domain: 2,
+                    exists: vec![true, true],
+                    counts: vec![1, 2],
+                    values: vec![0, 1],
+                    code_8000: 0x16,
+                    code_0000: 0x14,
+                    range_from_to: None,
+                },
                 // +0x300 (0x00c) Range<u32> number per addr.
-                ColData { selector: 0x00c, domain: 2, exists: vec![true, true],
-                          counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x11,
-                          range_from_to: Some((vec![addr0 * 10, addr1 * 10], vec![addr0 * 10, addr1 * 10])) },
+                ColData {
+                    selector: 0x00c,
+                    domain: 2,
+                    exists: vec![true, true],
+                    counts: vec![],
+                    values: vec![],
+                    code_8000: 0x16,
+                    code_0000: 0x11,
+                    range_from_to: Some((
+                        vec![addr0 * 10, addr1 * 10],
+                        vec![addr0 * 10, addr1 * 10],
+                    )),
+                },
                 // +0x280 (0xc0a) tBitArray per-addr parity-even existence.
-                ColData { selector: 0xc0a, domain: 2, exists: vec![true, false],
-                          counts: vec![], values: vec![], code_8000: 0x16, code_0000: 0x14, range_from_to: None },
+                ColData {
+                    selector: 0xc0a,
+                    domain: 2,
+                    exists: vec![true, false],
+                    counts: vec![],
+                    values: vec![],
+                    code_8000: 0x16,
+                    code_0000: 0x14,
+                    range_from_to: None,
+                },
             ],
         };
         let file = write_gen_attr_file(4, &[], &[mk(0, 1, 0, 1), mk(2, 3, 2, 3)]);
@@ -1019,22 +1461,32 @@ mod tests {
 
         for (bi, (a0, a1)) in [(0usize, (0u32, 1u32)), (1, (2, 3))] {
             let blk = gi.decode_block(&file, bi).unwrap();
-            let st = |col: u32, flag: u32| blk.streams.iter().find(|s| s.col == col && s.flags == flag)
-                .unwrap_or_else(|| panic!("blk {bi} missing col {col:03x}/{flag:04x}"));
+            let st = |col: u32, flag: u32| {
+                blk.streams
+                    .iter()
+                    .find(|s| s.col == col && s.flags == flag)
+                    .unwrap_or_else(|| panic!("blk {bi} missing col {col:03x}/{flag:04x}"))
+            };
             // +0x28: street0 -> [addr0, addr1].
-            let ex = st(0xc01, 0x4000); let off = st(0xc01, 0x8000); let val = st(0xc01, 0);
+            let ex = st(0xc01, 0x4000);
+            let off = st(0xc01, 0x8000);
+            let val = st(0xc01, 0);
             assert_eq!(ex.bits, vec![true, false]);
-            assert_eq!(&val.values[..off.values[0] as usize], [a0, a1], "blk {bi} street0 addr list");
+            assert_eq!(
+                &val.values[..off.values[0] as usize],
+                [a0, a1],
+                "blk {bi} street0 addr list"
+            );
             // +0x4d0: owner-descr(addr idx) -> street-desc.
-            let ooff = st(0xc13, 0x8000); let oval = st(0xc13, 0);
+            let ooff = st(0xc13, 0x8000);
+            let oval = st(0xc13, 0);
             assert_eq!(oval.values, vec![0, 1]);
             assert_eq!(&oval.values[..ooff.values[0] as usize], [0]); // addr0 -> street-desc 0
-            // +0x300 Range number.
+                                                                      // +0x300 Range number.
             assert_eq!(st(0x00c, 0x8000).values, vec![a0 * 10, a1 * 10]);
             assert_eq!(st(0x00c, 0).values, vec![a0 * 10, a1 * 10]);
             // parity existence.
             assert_eq!(st(0xc0a, 0x4000).bits, vec![true, false]);
         }
     }
-
 }

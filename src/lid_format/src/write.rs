@@ -13,8 +13,8 @@
 //! proven against the author's file in `rebuild.rs`; we reuse them so a block we write re-decodes to our
 //! exact input AND `rebuild_all` returns byte-equal output.
 
-use super::{vle_encode, u32};
-use crate::rebuild::{encode_numeric};
+use super::{u32, vle_encode};
+use crate::rebuild::encode_numeric;
 
 /// One attribute-vector selector triple (existence / counts / values).
 pub struct ColData {
@@ -65,15 +65,44 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
     // (kind, code, param, bytes); 3 rows per column: (4000,0x01/0x02), (8000,..), (0000,..).
     let mut rows: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
     for c in &blk.cols {
-        let ex_code: u16 = if c.exists.iter().any(|&b| b) { 0x02 } else { 0x01 };
-        rows.push((c.selector | 0x4000, ex_code, c.domain, exist_bytes(&c.exists, ex_code)));
+        let ex_code: u16 = if c.exists.iter().any(|&b| b) {
+            0x02
+        } else {
+            0x01
+        };
+        rows.push((
+            c.selector | 0x4000,
+            ex_code,
+            c.domain,
+            exist_bytes(&c.exists, ex_code),
+        ));
         let nexist = c.exists.iter().filter(|&&b| b).count() as u32;
         if let Some((from, to)) = &c.range_from_to {
-            rows.push((c.selector | 0x8000, 0x16, nexist, encode_numeric(from, 0x16).expect("range from VLE")));
-            rows.push((c.selector, 0x11, to.len() as u32, encode_numeric(to, 0x11).expect("range to")));
+            rows.push((
+                c.selector | 0x8000,
+                0x16,
+                nexist,
+                encode_numeric(from, 0x16).expect("range from VLE"),
+            ));
+            rows.push((
+                c.selector,
+                0x11,
+                to.len() as u32,
+                encode_numeric(to, 0x11).expect("range to"),
+            ));
         } else {
-            rows.push((c.selector | 0x8000, c.code_8000, c.counts.len() as u32, encode_numeric(&c.counts, c.code_8000 as u32).expect("counts")));
-            rows.push((c.selector, c.code_0000, c.values.len() as u32, encode_numeric(&c.values, c.code_0000 as u32).expect("values")));
+            rows.push((
+                c.selector | 0x8000,
+                c.code_8000,
+                c.counts.len() as u32,
+                encode_numeric(&c.counts, c.code_8000 as u32).expect("counts"),
+            ));
+            rows.push((
+                c.selector,
+                c.code_0000,
+                c.values.len() as u32,
+                encode_numeric(&c.values, c.code_0000 as u32).expect("values"),
+            ));
         }
     }
     let n = rows.len() as u16;
@@ -100,12 +129,16 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
 /// `outer` = an existing file's first `hdr+16` bytes, reused verbatim; pass `&[]` for a fresh file (a
 /// zero `[0..16]`, `hdr=16`, sub-header built from `elem_count` + the block list).
 pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData]) -> Vec<u8> {
-    let hdr = if outer.len() >= 0x14 { u32(outer, 0x10) as usize } else { 0x20 };
+    let hdr = if outer.len() >= 0x14 {
+        u32(outer, 0x10) as usize
+    } else {
+        0x20
+    };
     let toc_bytes = 12 * blocks.len();
     let toc_size = 16 + toc_bytes; // sub-header(16) + TOC at hdr
     let blocks_off = ((hdr + toc_size + 3) & !3).max(hdr + toc_size);
     let mut out: Vec<u8> = vec![0u8; hdr + toc_size]; // sub-header + TOC region; blocks appended below
-    // Reuse outer's [0..hdr] (outer container fields incl the `hdr` pointer @0x10) if provided.
+                                                      // Reuse outer's [0..hdr] (outer container fields incl the `hdr` pointer @0x10) if provided.
     let reuse = hdr.min(outer.len());
     out[..reuse].copy_from_slice(&outer[..reuse]);
     out[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
@@ -130,6 +163,8 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
         bo += block_bytes[i].len();
     }
     out.resize(blocks_off, 0);
-    for bb in &block_bytes { out.extend_from_slice(bb); }
+    for bb in &block_bytes {
+        out.extend_from_slice(bb);
+    }
     out
 }
