@@ -45,6 +45,7 @@ This project would not be possible if not a hard work of other people:
 ## MAP files
 
 Location: `CRYPTNAV/DATA/DATA/MAP` folder.
+Status: **BETA** (tested in the car on a small city sized area)
 
 Map files are used to draw shapes on the screen (roads, build-up areas, grass, lakes). The data are used only for drawing shapes on the screen, not for navigation routing. The data on the original SD card covers 22 regions. You can see these regions and their names on the picture below: ![Region Map](./doc/images/region_map_01.png).
 
@@ -53,7 +54,13 @@ Generation of these files is working and is in the early testing phase. For usag
 ## RNW files
 
 Location: `CRYPTNAV/DATA/DATA/RNW/CCP` folder.
+Status: **IN DEVELOPMENT**
 
 Road navigation data is used to route navigation paths.
 
-This part is still in the reverse engineering phase...
+## LID files
+
+Location: `CRYPTNAV/DATA/DATA/LID/CCP` folder.
+Status: **IN DEVELOPMENT**
+
+Address & POI database.
