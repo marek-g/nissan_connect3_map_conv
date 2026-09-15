@@ -372,6 +372,7 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
 
 #[derive(Debug, Clone)]
 pub struct Element {
+    pub block: usize, // 0-based NLAsfBlock index this element belongs to
     pub category: u16,
     pub name: String,
     /// Full raw device string of this element's trie path **before** the display cut (line 1 =
@@ -873,6 +874,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                 continue;
             }
             elements.push(Element {
+                block: bi,
                 category: 0,
                 name,
                 sort_name: {

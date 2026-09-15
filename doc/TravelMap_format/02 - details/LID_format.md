@@ -806,6 +806,11 @@ coords are deltas from the queried city's position (query-supplied), and `read` 
 `tNLHPosition` (`NameList.origin`). Stock-name garbage (2026-09): the old reader keyed labels by child node-id
 and "picked a variant" by longest/diacritic heuristics; replaced by the device-faithful walk above
 (verified against stock `POL` via the RE'd accessors; the temporary diagnostic dumps were removed once fixed).
+`lid2dump --sqlite OUT.db` additionally exports the whole decoded model as a relational SQLite db
+(`file`/`element`/`rel`/`hnr` + raw mirrors of embedded SQLite tables + views `v_element`/`v_city`/
+`v_street`/`v_address`/`v_completeness` + a bundled `queries` pack); absolute lat/lon is emitted only
+where the file anchor honestly applies (`coords_valid`), raw PAU deltas always ship. See
+`samples/krzeszowice/README.md`.
 
 **12.9 Writer status.** `src/lid_format::encode` (Rust) is the writer half of the oracle: it builds the trie,
 numbers it in the same DFS-preorder layout, splits into ≤10k-node blocks, and emits the container + descriptor
