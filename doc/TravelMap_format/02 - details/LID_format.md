@@ -784,14 +784,28 @@ coordinate fields are honored, and `LID20000` (gazetteer) is the "no coordinates
   `bHasEntryPointAddresses` / `bHasEntryCells` / `…DetailedDescription` (bitvector columns; `enGetEntryCharacterStatus`
   → column `0x415` `NLBinListAttrVector`).
 - name variants: `Permutation`/`Alternative`/`Belonging`/`Exonym`/`Base` (`enGetEntry…NameMainElementIndex`).
-- `0x402` = `NLBlockLinkAttrVector` = bitmap + `2·k` u32 pairs → `map<node, {block, index}>` (cross-block links).
+- `0x402` = `NLBlockLinkAttrVector` (`Decode` `00cde84c`): the flag-`0x4000` sub-stream is a **sparse set** of
+  the linked source nodes (bitfield code `0x02` = VLE delta positions); the flag-0 sub-stream is VLE u32
+  `2 × param` values (= `2·k`, param = `k` = link count) = pairs `(target block index, target node index)`,
+  paired with the set positions **in order** → `map<node, {block, node}>`. This is not a side-channel:
+  `NLInputStep::bStepDown` (`00cecf78`) RE-HOMES the walk/container (`enGetNodeBlockLink` +
+  `poGetContainer(disposer@+400, +0x11c, …)`) onto the target node **while the accumulated name string keeps
+  running** — the namelist trie is a DAG *across blocks* whose trunk is block 0. A link node itself is a leaf
+  (`outDegree==0`); its edge label stays in the SOURCE block, the continuation subtree in the TARGET block
+  (e.g. `LID20004` blk0 node1811 path `"AK"` → `(blk1, 1041)` `"…ACJOWE PRZEDSZKOLE…"`, i.e. exactly what the
+  device types). Linked leaves are NOT terminating elements (`enGetEdgeLabel` walk skips them; the element
+  lives on a terminal leaf of the continuation side). Links always point to a higher block index (verified
+  over the stock POL namelists). A block subtree that no link addresses starts at its own root with an
+  empty prefix (plain §12.3 reading).
 
 **12.7 Converter verdict.** To emit a working regional address search (city+street+HNR) we must write
 `LID%05u` (cities/streets name-lists) + `@(id+20000)` GenAttr/HNR + `PA_%05u` (+ `REL`), as this **trie/column
 format**. Stock is already a **plain trie** (§12.3), so the writer builds a trie directly — insert each full
 name root→leaf (terminating each with `0x00` so strict-prefix names stay leaves), number nodes in the
 DFS-preorder `childStart` layout, split into ≤ ~10k-node blocks (`node_count`/`element_count` are `u16`), and
-populate the terminating-element DFS order + the per-element columns. No DAWG minimization needed. House
+populate the terminating-element DFS order + the per-element columns. Blocks must be **self-contained** trie
+forests (keep every name's whole path inside one block) unless `0x402` block-links are emitted like stock
+(§12.6) — the reader restores names only through declared links. No DAWG minimization needed. House
 numbers = per-street GenAttr `+20000` columns (§11.6); optional exact points in `PA` (§11.7).
 
 **12.8 Reader status.** `src/lid_format/` (Rust, wired into `lid2dump`) implements §12.1–12.6 faithfully (no
@@ -799,9 +813,16 @@ heuristics/filters): container + block table + descriptor TOC (flag sub-streams)
 **correct** Simple9 mode table §12.4 and custom `ReadVle`) + `outDegree`/DFS-`childStart` children +
 `CalculateTerminatingElementIndex` element DFS **with the walk-stack name accumulation** + `0x403` blob/**edge**
 offsets + §12.4 multi-line name cut (C-string / `<?xml>` / first-TAB) +
-`NLPositionAttrVector` (bitmap + rank-compressed PAU) + belonging column. On `POL/LID20006` it decodes
-**883 936 elements / 883 929 with positions / 231 882 unique names**, all real Polish street names with
-diacritics. The former "only remaining UNKNOWN" (the per-block **geo origin**, §12.5) is **RESOLVED**: stored
+`NLPositionAttrVector` (bitmap + rank-compressed PAU) + belonging column + the **cross-block naming pass**
+of the `0x402` link DAG (one ascending block sweep: block-0 roots → DFS, link leaves push `(target block,
+target node)` entries with the running string; terminals of linked subtrees take the global prefix, other
+subtrees keep their block-local spelling). On `POL/LID20006` it now decodes **974 871 elements**, all real
+Polish street names with diacritics and **complete prefixes** (former 883 936: the 91 k delta is precisely
+the elements that hide in continuation blocks behind links). Proven 2026-09 against the device itself:
+the stock files type-search + display `AKACJOWE …` / `PRZEDSZKOLE ŁAGIEWNIKI WIELKIE` **in full** while the
+old per-block reader truncated them (`ACJOWE…`, `EDSZKOLE…`) — the "vendor cut the names" theory is dead,
+storage and reader now match the car 1:1 (regenerated `samples/krzeszowice/dbs/stock_CCP_POL.db` =
+1 982 596 elements, zero truncated names). The former "only remaining UNKNOWN" (the per-block **geo origin**, §12.5) is **RESOLVED**: stored
 coords are deltas from the queried city's position (query-supplied), and `read` also exposes the file-level
 `tNLHPosition` (`NameList.origin`). Stock-name garbage (2026-09): the old reader keyed labels by child node-id
 and "picked a variant" by longest/diacritic heuristics; replaced by the device-faithful walk above
@@ -886,11 +907,12 @@ is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matc
    **Still pending:** point-address `PA`, crossing files (+10000), own META writer,
    and on-device acceptance (`NLHnrToTree` against a real card).
 
-> The trie **structure** (forest, `f2` trees/block), **element order + walk-stack names**
-> (`CalculateTerminatingElementIndex`), **edge labels** (`0x403` per-EDGE offsets + TAB multi-line display
-> cut per `vCollectNamesOfCat`) and **relative positions** (`NLPositionAttrVector`, rank-compressed) are all
-> CONFIRMED and reproduced faithfully by `src/lid_format/` (883 936 elements off `POL/LID20006`; stock
-> `LID20001` city names now clean incl. diacritics and exonym entries).
+> The trie **structure** (forest, `f2` trees/block, cross-block `0x402` link-DAG naming), **element order +
+> walk-stack names** (`CalculateTerminatingElementIndex`), **edge labels** (`0x403` per-EDGE offsets + TAB
+> multi-line display cut per `vCollectNamesOfCat`) and **relative positions** (`NLPositionAttrVector`,
+> rank-compressed) are all CONFIRMED and reproduced faithfully by `src/lid_format/` (974 871 elements off
+> `POL/LID20006`, names prefix-complete; stock `LID20001` city names now clean incl. diacritics and exonym
+> entries).
 
 > Practical note for a converter: if your goal is *navigation*, LID is the optional content layer — the
 > network still loads and routes via RNW→MAP without it. If you need POI search / landmark rendering, the files

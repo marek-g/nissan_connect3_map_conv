@@ -606,6 +606,40 @@ pub fn is_name_list(b: &[u8]) -> bool {
     hdr > 0x26 && hdr < 0x1000 && extra < 0x10_0000 && u32(b, hdr as usize) > 0
 }
 
+/// One parsed `NLAsfBlock`: trie tables + per-block element columns, kept raw so the
+/// cross-block naming pass can run over the whole namelist afterwards.
+struct ParsedBlock<'a> {
+    node_count: usize,
+    elem_count_b: usize,
+    od: Vec<u32>,
+    fe: Vec<usize>,
+    cs: Vec<usize>,
+    blob: &'a [u8],
+    loff: Vec<u32>,
+    roots: Vec<usize>,
+    links: std::collections::HashMap<usize, (usize, usize)>,
+    term_nodes: Vec<usize>,
+    raw_local: Vec<Vec<u8>>,
+    has_pos: Vec<bool>,
+    coords: Vec<u32>,
+    belongs_flag: Vec<bool>,
+    belongs_vals: Vec<u32>,
+}
+
+impl<'a> ParsedBlock<'a> {
+    fn lab(&self, e: usize) -> &'a [u8] {
+        lab_loc(self.blob, &self.loff, e)
+    }
+}
+
+fn lab_loc<'a>(blob: &'a [u8], loff: &[u32], e: usize) -> &'a [u8] {
+    let a = *loff.get(e).unwrap_or(&(blob.len() as u32)) as usize;
+    let bb = *loff.get(e + 1).unwrap_or(&(blob.len() as u32)) as usize;
+    let a = a.min(blob.len());
+    let bb = bb.max(a).min(blob.len());
+    &blob[a..bb]
+}
+
 pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     let b = b_in;
     let n = b.len();
@@ -638,7 +672,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         return Err("no block table".into());
     }
 
-    let mut elements: Vec<Element> = Vec::new();
+    let mut bp: Vec<ParsedBlock> = Vec::new();
 
     for bi in 0..block_off.len() {
         let bs = block_off[bi];
@@ -717,11 +751,13 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // children(n) = [childStart[n] .. +outDegree[n]). Root loop jumps by the subtree VISIT count.
         let mut cs = vec![0usize; node_count];
         let mut fe = vec![usize::MAX; node_count];
+        let mut roots: Vec<usize> = Vec::new();
         {
             let mut ec = 0usize;
             let mut root = 0usize;
             let mut base = 1usize;
             while root < node_count {
+                roots.push(root);
                 let mut stack = vec![root];
                 let mut visits = 0usize;
                 while let Some(n) = stack.pop() {
@@ -753,6 +789,23 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             }
             None => vec![false; node_count],
         };
+        // NLBlockLinkAttrVector::Decode (00cde84c): the linked NODES (bitmap above) pair up, in order,
+        // with u32 VLE pairs in the flags-0 sub-stream (code 0x14): (target block index, target node
+        // index). `NLInputStep::bStepDown` (00cecf78) then RE-HOMES the search to that node in that
+        // block while the accumulator string keeps running — the namelist trie is a DAG spanning
+        // blocks (`enGetNodeBlockLink` + `poGetContainer`). Names therefore need the cross-block walk.
+        let mut links: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+        if let (Some(bd), Some(vd)) = (get(0x402, 0x4000), get(0x402, 0)) {
+            let nn = (bd.param as usize).min(node_count);
+            let bits = bitfield(b, bd.code, bs + bd.off as usize, span_end(bd), nn);
+            let ones: Vec<usize> = (0..node_count.min(bits.len())).filter(|&i| bits[i]).collect();
+            let vals = decode_u32(b, vd.code, bs + vd.off as usize, span_end(vd), vd.param as usize * 2);
+            for (k, &nd) in ones.iter().enumerate() {
+                if 2 * k + 1 < vals.len() {
+                    links.insert(nd, (vals[2 * k] as usize, vals[2 * k + 1] as usize));
+                }
+            }
+        }
 
         // edge labels: col 0x403 = two sub-streams. NLEdgeLabelList::Decode: the RAW sub-stream
         // (code 0x11) is the name blob (param = byte length); the other sub-stream is the per-edge
@@ -807,14 +860,8 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // `NLInputStep::bSetSelectedEdge` does when the device walks). At each node: first register
         // the leaf children (od==0, no block-link) as elements, then recurse into internal children.
         // Raw label per (parent n, i-th child) = blob[loff[fe[n]+i] .. loff[fe[n]+i+1]].
-        let raw_names: Vec<Vec<u8>> = {
-            let lab = |e: usize| -> &[u8] {
-                let a = *loff.get(e).unwrap_or(&(blob.len() as u32)) as usize;
-                let bb = *loff.get(e + 1).unwrap_or(&(blob.len() as u32)) as usize;
-                let a = a.min(blob.len());
-                let bb = bb.max(a).min(blob.len());
-                &blob[a..bb]
-            };
+        let (term_nodes, raw_local): (Vec<usize>, Vec<Vec<u8>>) = {
+            let mut tnodes: Vec<usize> = Vec::with_capacity(elem_count_b);
             let mut out: Vec<Vec<u8>> = Vec::with_capacity(elem_count_b);
             let mut stack: Vec<(usize, Vec<u8>)> = Vec::new(); // (node, accumulated string so far)
             let mut root = 0usize;
@@ -829,7 +876,8 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                         let c = base + i;
                         if c < node_count && od[c] == 0 && !blocklink[c] {
                             let mut t = s.clone();
-                            t.extend_from_slice(lab(fen + i));
+                            t.extend_from_slice(lab_loc(&blob, &loff, fen + i));
+                            tnodes.push(c);
                             out.push(t);
                         }
                     }
@@ -837,34 +885,119 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                         let c = base + i;
                         if c < node_count && od[c] != 0 {
                             let mut t = s.clone();
-                            t.extend_from_slice(lab(fen + i));
+                            t.extend_from_slice(lab_loc(&blob, &loff, fen + i));
                             stack.push((c, t));
                         }
                     }
                 }
                 root += edgevisits + 1;
             }
-            out
+            (tnodes, out)
         };
 
+        bp.push(ParsedBlock {
+            node_count,
+            elem_count_b,
+            od,
+            fe,
+            cs,
+            blob,
+            loff,
+            roots,
+            links,
+            term_nodes,
+            raw_local,
+            has_pos,
+            coords,
+            belongs_flag,
+            belongs_vals,
+        });
+    }
+
+    // Cross-block naming (`NLInputStep::bStepDown` 00cecf78): the block 0 trie is the trunk of the
+    // namelist forest; every block-link node re-homes the walk to (target block, target node) with
+    // the accumulated string kept running. Blocks are emitted in file order and links always point
+    // forward, so one ascending sweep resolves every reached terminal's full raw string. Terminals
+    // of subtrees that no link addresses keep their block-local spelling (their string starts at
+    // the local root, empty prefix — identical to the old per-block reading).
+    let mut global: std::collections::HashMap<(usize, usize), Vec<u8>> = std::collections::HashMap::new();
+    let mut entries: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); bp.len()];
+    if let Some(first) = bp.first() {
+        for &r in &first.roots {
+            entries[0].push((r, Vec::new()));
+        }
+    }
+    for bi in 0..bp.len() {
+        let blk = &bp[bi];
+        let mut stack: Vec<(usize, Vec<u8>)> = std::mem::take(&mut entries[bi]);
+        while let Some((node, s)) = stack.pop() {
+            if node >= blk.node_count {
+                continue;
+            }
+            let deg = blk.od[node] as usize;
+            let base = blk.cs[node];
+            let fen = blk.fe[node];
+            let link = blk.links.get(&node).copied();
+            if let Some((tb, tn)) = link {
+                if tb < bp.len() && tb > bi {
+                    entries[tb].push((tn, s.clone()));
+                }
+            }
+            if deg == 0 {
+                if link.is_none() || !matches!(link, Some((tb, _)) if tb < bp.len() && tb > bi) {
+                    global.entry((bi, node)).or_insert_with(|| s.clone());
+                }
+                continue;
+            }
+            for i in 0..deg {
+                let c = base + i;
+                if c >= blk.node_count || blk.od[c] != 0 {
+                    continue;
+                }
+                let mut t = s.clone();
+                t.extend_from_slice(blk.lab(fen + i));
+                match blk.links.get(&c).copied() {
+                    Some((tb, tn)) if tb < bp.len() && tb > bi => entries[tb].push((tn, t)),
+                    _ => {
+                        global.entry((bi, c)).or_insert_with(|| t);
+                    }
+                }
+            }
+            for i in (0..deg).rev() {
+                let c = base + i;
+                if c < blk.node_count && blk.od[c] != 0 {
+                    let mut t = s.clone();
+                    t.extend_from_slice(blk.lab(fen + i));
+                    stack.push((c, t));
+                }
+            }
+        }
+    }
+
+    let mut elements: Vec<Element> = Vec::new();
+    for (bi, blk) in bp.iter().enumerate() {
         let mut pos_rank = 0usize;
         let mut bel_rank = 0usize;
-        for (ei, raw) in raw_names.iter().enumerate() {
+        for ei in 0..blk.term_nodes.len() {
+            let raw: &[u8] = match global.get(&(bi, blk.term_nodes[ei])) {
+                Some(t) => t,
+                None => &blk.raw_local[ei],
+            };
             let name = decode_name(raw);
-            let hp = has_pos.get(ei).copied().unwrap_or(false);
+            let hp = blk.has_pos.get(ei).copied().unwrap_or(false);
             let (x, y) = if hp {
                 let k = pos_rank * 2;
                 pos_rank += 1;
-                if k + 1 < coords.len() {
-                    (coords[k] as i32, coords[k + 1] as i32)
+                if k + 1 < blk.coords.len() {
+                    (blk.coords[k] as i32, blk.coords[k + 1] as i32)
                 } else {
                     (0, 0)
                 }
             } else {
                 (0, 0)
             };
-            let belonging = if belongs_flag.get(ei).copied().unwrap_or(false) {
-                let v = belongs_vals.get(bel_rank).copied().unwrap_or(0xffff_ffff);
+            let belonging = if blk.belongs_flag.get(ei).copied().unwrap_or(false) {
+                let v = blk.belongs_vals.get(bel_rank).copied().unwrap_or(0xffff_ffff);
                 bel_rank += 1;
                 v
             } else {
