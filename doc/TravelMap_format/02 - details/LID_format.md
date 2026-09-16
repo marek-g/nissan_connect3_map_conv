@@ -362,8 +362,14 @@ name-lists use the columnar PSF/ASF layout of §11.)
 | **CROSS** | `LID0` with **fileID+10000** (crossing variant), street pairs by index | `poGetNewNLCrossingProcessor` `00bd41b4`; `enGetCrossingStreetIndices` `00e086c4` |
 | **HNR** | `LID0` with **fileID+20000** (GenAttr blocks keyed by street element idx); exact coords from `PA_%05u.DAT`; else **interpolated** along the street | `poGetNewNLGenAttrProcessor` `00bd40ac`; `bGetHnrs` `00ce72a4`; `enGetHnr` `00e0d078`; `bGetPACells` `00be072c`; `bGetInterpolationRatio` `00ce4098` |
 
-**HNR record (INFERRED from `enGetHnr`):** `{ u32 hnr; u32 prefixNum; number/addition/prefix/suffix strings;
-NLHnrStatus{ even-parity, odd-parity, refuseInterpolation, countedAgainstDigits }; u32 rangeEnd (-1=none) }`.
+**HNR record (CONFIRMED from `enGetHnr` `00e0d078` + `NLHnrToString::bProcessHnr` `00ce7b80`).**
+`NLHnr = { u32 number FROM (0xc01), u32 number TO (0xc02), token/addition/prefix/suffix strings,
+NLHnrStatus{ even-parity (0xc09), odd-parity (0xc0a), refuseInterpolation (0xc0c), countedAgainstDigits } }`.
+A record is a **number interpolation**: `NLHnrToString::bProcessHnr` expands it to `FROM, FROM+step, … ≤ TO`
+where `step = (even == odd) ? 1 : 2` — both bits or neither ⇒ consecutive range; a single bit ⇒ stride 2
+of that parity. Verified 2026-09 against the author's card: stock `LID40006` records of `UL. GRÓJECKA`
+(KRAKÓW) expand exactly to the numbers the UI offers (typing `3` → `3, 36, 38`, `4` → `4, 43` from
+records [3,11]/odd and [36,38]/even — none of 5,22,37,… appears).
 Position = `PA` point if present, else `pos = street[i + idx/(n-1)]` between the range bounds unless
 `refuseInterpolation`. So house numbers are **attribute records + optional exact points, keyed to a street**
 — *not* LID polygons and *not* RNW interpolation.
@@ -434,6 +440,25 @@ POL stock inventory (`region 0x0402`): `LID20000`=listID **129**(HNR elements) `
 of listID 3 (+10000); `LID4000n` = GenAttr of listID(n-domain) (+20000, observed 129,2,10,8,12,9,3);
 `LID50001` = listID 2 kind 4. The compressed `LID0nnnn` speller files use a different (`2777000d`)
 container and are *not* this format.
+
+**Domain contents (stock POL, verified on card data):** listID **9** `LID20005` = the 16 **provinces**
+(województwa) × language variants (38 rows: `WOJ. MAZOWIECKIE`, `WOIWODSCHAFT MASOWIEN`, …) linked to
+towns by `REL00006` (d0/d1 = 9↔2); towns needing disambiguation are stored *inside* listID 2 as
+`ADJECTIVE, CITY` (`MAZOWIECKI, GRODZISK`) — exactly what the car's "which province?" prompt offers.
+listID **129** `LID20000` = the full **address entries**, one per house-number record, name format
+plain `"CITY, STREET NUMBER"` (194 118 POL rows, stored diacritic-free, no positions) — an *encoded*
+name whose components are city + street + house number. This is the source the address-search UI
+browses: device symbols `LISA_tclHnrProcessing::bSetUpStreetIndcesByHnr` and the descriptor
+`NLGenAttrHnrStreetIdxDetermination` (in the GenAttr block of the street list) re-derive a city's
+street index set from these names; the numeric house number comes from the GenAttr house-number
+stream joined on the element ordinal (`NLGeneralAttributeBlock::SetDataBlock`, §11.6). Consequence: the `REL00001` (3↔2) street↔town
+matrix is only *part* of the story — e.g. stock KRAKÓW has 10 matrix edges yet the car lists hundreds
+of streets (every `KRAKÓW, ULICA …` address row adds one; verified: `UL. GROMADY GRUDZIĄŻ`,
+`UL. ŻBICKA` in KRZESZOWICE are matrix-absent yet present as 129-domain entries). No
+`WOLA DUCHACKA`-style dzielnica strings exist anywhere in the POL LID set — district display is not
+an LID feature. listID 8/12 = phone numbers/phone-book entries (POI cross-rel via `REL00004`).
+`lid2dump --sqlite` exposes all of this in tables `addr`/`region`/`city_prefixed` and view
+`v_city_street` (source column `rel` vs `addr`).
 
 ### 11.3 Block = 8-byte header + column-descriptor TOC + compressed columns (CONFIRMED)
 
@@ -529,24 +554,31 @@ blocks rebuild byte-exact.)
 `kind & 0xfff` selects the vector member; `kind & 0xf000` the sub-stream): `0xc01` → `+0x28`
 ValueList\<u32\> = **per-owner (elem of the block range = STREET elem ids of the twin name-list) list of
 HOUSE NUMBERS** (`0x4000` existence bitmap over owners, `0x8000` sparse start flat-offsets for present
-owners — popcount-matched, `0` concatenated numbers; `enGetHnrIndices` `00e0c3a0` = flat `[before,count)`
-for a street); `0xc02` → `+0x7c` SV\<u32\> = per-**record** ref (PA point, ascending small ids on stock);
+owners — popcount-matched, `0` concatenated numbers; `enGetHnrIndices` `00e0c3a0` = per-owner
+`[before,count)` slice of the flat value list); `0xc02` → `+0x7c` SV\<u32\> = per-**record** `TO` bound
+(the record is the range `FROM..TO`; single records have `TO == FROM`);
 `0xc03..0xc06` → `+0xb0/+0x104/+0x158/+0x1ac` ValueList\<u8\> = hnr token/addition strings (empty on
 `POL`); `0xc08`/`0xc10`/`0xc14` → `+0x200`/`+0x340`/`+0x47c` Range\<u32\>; `0xc09..0xc0e` →
 `+0x260..+0x2e0` Binaries; `0xc0d` → `+0x300` Binary; `0xc11` → `+0x380` ValueList\<u32\> (per-record
 existence domain = `GetNumberOfExistenceFlags` bound in `enGetHnr`); `0xc12` → `+0x3d4` VL\<u32\>;
 `0xc13` → `+0x428` VL\<pair\>; cols `1..5` → cell vector(s) `+0x4dc`/`+0x530` (`0x001..0x005` CellId).
-`enGetHnr` `00e0d078` writes `NLHnr = { +0 number (0xc01 flat value), +4/+0x10/+8/+0x14 strings,
-+0xc ref (0xc02), +0x18 parity status (0xc09+0xc0a+0xc0b+0xc0d bits), +0x1c range (0xc10, -1 default) }`
-— the earlier note claiming `0xc01` carried *address element ids* and `0xc0c` the number range was a pre-
-dispatch guess and is **wrong** (there is no col `0xc` in stock files at all). Stock `POL/LID40006`
+`enGetHnr` `00e0d078` writes `NLHnr = { +0 FROM (0xc01 flat value), +4/+0x10/+8/+0x14 strings,
++0xc TO (0xc02), +0x18 parity status (0xc09+0xc0a+0xc0b+0xc0d bits), +0x1c range (0xc10, -1 default) }`
+— the device expands the `[FROM..TO]` range in `NLHnrToString::bProcessHnr` `00ce7b80` (step 2 when
+`0xc09 != 0xc0a`, step 1 otherwise). The earlier notes claiming `0xc02` was a *PA ref* or that `0xc01`
+carried *address element ids* were pre-dispatch guesses and are **wrong** (there is no col `0xc` in
+stock files at all). Stock `POL/LID40006`
 block 0 verifies the shape (under the corrected TOC grouping — see below): 7904-owner domain (sparse-set
 bitmap, 777 owners set) ↔ 777 start offsets ↔ 9665 flat house numbers; the five parity Bin columns are
 9665-bit (per **record**).
-`lid2dump --sqlite` therefore exports stock hnrs as one row per record: `hnr.elem` = file-wide record
-ordinal, `addr_to_street` = `elem_start + owner`, `house_number` = the `0xc01` value (a synthetic
+`lid2dump --sqlite` therefore exports stock hnrs as one row per record **with the range model intact**:
+`hnr.elem` = file-wide record ordinal, `addr_to_street` = `elem_start + owner`,
+`house_number` = the `0xc01` FROM bound, `house_number_to` = the `0xc02` TO bound, `hn_even`/`hn_odd` =
+the `0xc09`/`0xc0a` parity bits — view `v_hnr_offered` replays the device expansion
+(step `(even==odd)?1:2`) so `SELECT ... FROM v_hnr_offered WHERE street_elem=?` answers exactly what
+the car offers (synthetic
 `osm2lid` file with legacy `0x002`/`0x00c` tertiary rows keeps the old per-element shape — the legacy
-branch wins any file carrying those columns). Param rule (author): `flag 4000`.param = *domain* (existence
+branch wins any file carrying those columns, its `house_number_to`/parity fields stay NULL). Param rule (author): `flag 4000`.param = *domain* (existence
 bit count), `flag 8000`.param = Σ/total or #exist, `flag 0000`.param = #values; each member's *own* `8000`
 param equals its `4000` popcount. The synthetic
 `#[test] gen_attr_writer_roundtrip_device_model` uses the *device* layout (street domain = TOC width, `0xc01`
@@ -590,7 +622,8 @@ count = `param` of the value row, e.g. `9665`), `toc_count = 134` blocks coverin
 indexes it with `read_gen_attr`, and decodes each block's column streams with `GenAttrIndex::decode_block`
 (bitmap `0x02`/`0x03` counts come from `param`, never from byte span). The owner VectorList column `0xc01`
 (starts ascending within the block range — ABS ranges, first = 0 — values = owner element offsets) joins
-each record → its street element; `0xc02` (SV) = reference id, `0xc11` = existence gate, `0xc09/0c0a` =
+each record → its street element; `0xc02` (SV) = per-record `TO` bound (range end; `== FROM` for singles),
+`0xc11` = existence gate, `0xc09/0c0a` =
 even/odd parity bits per record, `0xc03..06` = HNR string VLs (`enGetHnr` `00e0d078` decodes all four;
 stock POL ships them empty). The on-device `NLHnrToTree` matcher cannot be run here — the offline device
 read-model (`gen_attr_writer_roundtrip_device_model`) replays `enGetHnrIndices`/`enGetHnr` only.
@@ -905,7 +938,8 @@ each to the *same* street-element order as `LID20006.DAT`. Element domain = the 
 (`0..nst`, chunked `HN_ATTR_CHUNK`=8192; ≥ 2 TOC blocks the container requires; empty blocks still emit the
 `0xc01` triple so tiling never breaks) and writes the device column set (§11.6b): `0xc01`(+0x28)
 house-number list per street (`4000` existence bitmap over the block's street-domain width, `8000` cumulative
-starts, `0000` the numbers), `0xc02`(+0x7c) SV ref = owning street element, `0xc11`(+0x380) gate
+starts, `0000` the numbers), `0xc02`(+0x7c) SV per-record `TO` bound (= the number — synthetic records are
+singles, so `TO == FROM`), `0xc11`(+0x380) gate
 existence domain = record count (bounds every `enGetHnr`), `0xc09/0c0a`(+0x260/0x280) even/odd parity bits
 per record, `0xc0b/0c0d` zero binaries, `0xc03..0xc06` empty byte-VLs (stock-`POL` shape — decoder must still
 find all four). Validation is offline (no card in the loop): `lid_format`'s `gen_attr_*` tests (byte-exact

@@ -4,18 +4,27 @@
 //   file    1 row per input file (list_id, kind, country, block anchor, coords_valid)
 //   element 1 row per LID element (raw `name`/`sort_name`, raw PAU deltas) — never rewritten
 //   rel     REL00001-style pair matrices, endpoints resolved to file ids within the run
-//   hnr     GenAttr house numbers -> street element; stock layout: `elem` = file-wide record ordinal,
-//           street = 0xc01 owner, number = flat value (§11.6b); legacy osm2lid files: elem = addr element
+//   hnr     GenAttr house-number records: street element + [0xc01..0xc02] range + 0xc09/0xc0a
+//           parity bits; the device expands each record n = from, from+step..to with
+//           step = (even == odd) ? 1 : 2 (`NLHnrToString::bProcessHnr` 00ce7b80)
 //   <STEM>__<table>  1:1 mirrors of embedded SQLite tables (GLOB_POI, DB_CITY)
 //   queries bundled, documented SELECT statements (the user's join layer)
 //
-// Views (`v_element`, `v_city`, `v_street`, `v_address`, `v_completeness`) carry the joins;
+// Derived (non-raw, but reversible) tables: `addr` splits address-list (list_id 129) display
+// names 'CITY, STREET NUM' (the device's own source of a city's street list — it re-derives
+// street indices from HNR names, see LISA_tclHnrProcessing::bSetUpStreetIndcesByHnr); `region`
+// holds the province list (list_id 9, LID20005 'WOJ. X' + foreign variants) with a derived
+// adjective key; `city_prefixed` splits 'ADJ, CITY' city entries (same-name cities in different
+// provinces - the car's "which province?" disambiguation) and links them to `region`.
+//
+// Views (`v_element`, `v_city`, `v_street`, `v_address`, `v_hnr_offered`, `v_city_street`,
+// `v_completeness`) carry the joins; `v_hnr_offered` expands every record with the device rule
 // absolute lat/lon is exposed ONLY where it is honestly computable (`coords_valid` =
 // file anchor known and a single block; multi-block stock files keep per-block anchors
 // that are not decoded yet, so their lat/lon stay NULL by design — raw deltas always ship).
 // No data cleaning happens here (ZIP prefixes etc. stay inside `sort_name`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -48,12 +57,20 @@ pub struct RelOut {
     pub pairs: Vec<(u32, u32)>,
 }
 
-/// One GenAttr (LID4nnnn) address row: element index + the writer's street/number streams.
+/// One GenAttr (LID4nnnn) house-number record (`enGetHnr` 00e0d078): number range [from..to] with
+/// parity flags; the device (`NLHnrToString::bProcessHnr` 00ce7b80) expands it to
+/// `from, from+step, ... <= to` where `step = (even == odd) ? 1 : 2`.
 #[derive(Debug, Clone)]
 pub struct HnrRow {
     pub elem: u32,
     pub addr_to_street: Option<u32>,
     pub house_number: Option<u32>,
+    /// `0xc02` upper bound; on stock single-number records it equals `house_number`.
+    pub house_number_to: Option<u32>,
+    /// `0xc09` hasEvenParity (NLHnrStatus::bHasEvenParity).
+    pub even: Option<bool>,
+    /// `0xc0a` hasOddParity (NLHnrStatus::bHasOddParity).
+    pub odd: Option<bool>,
 }
 
 /// One LID element, exactly as `lid_format::read` decoded it (no transformations).
@@ -129,11 +146,44 @@ CREATE TABLE rel(
 CREATE INDEX ix_rel_src ON rel(src_file_id, src_elem);
 CREATE INDEX ix_rel_tgt ON rel(tgt_file_id, tgt_elem);
 CREATE TABLE hnr(
-  file_id        INTEGER NOT NULL REFERENCES file(id),
-  elem           INTEGER NOT NULL,
-  addr_to_street INTEGER,                       -- street element id (in the list_id=3 file)
-  house_number   INTEGER,
-  street_file_id INTEGER REFERENCES file(id),   -- resolved in-run (NULL = no street file in run)
+  file_id          INTEGER NOT NULL REFERENCES file(id),
+  elem             INTEGER NOT NULL,
+  addr_to_street   INTEGER,                         -- street element id (in the list_id=3 file)
+  house_number     INTEGER,                         -- 0xc01 lower bound (from)
+  house_number_to  INTEGER,                         -- 0xc02 upper bound (to); legacy osm2lid files: NULL
+  hn_even          INTEGER,                         -- 0xc09 hasEvenParity; device step = 2 when it differs from odd
+  hn_odd           INTEGER,                         -- 0xc0a hasOddParity
+  street_file_id   INTEGER REFERENCES file(id),     -- resolved in-run (NULL = no street file in run)
+  PRIMARY KEY(file_id, elem)
+);
+CREATE TABLE addr(
+  id           INTEGER PRIMARY KEY,
+  file_id      INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  elem         INTEGER NOT NULL,                -- element of the list_id=129 name list
+  city         TEXT NOT NULL,                   -- DERIVED: prefix matched against the list_id=2 names
+  street       TEXT,                            -- DERIVED: remainder without a trailing number token
+  house_number TEXT,                            -- DERIVED: trailing token iff it starts with a digit (kept raw, e.g. '3', '12A/2')
+  name         TEXT NOT NULL,                   -- original display name, raw
+  UNIQUE(file_id, elem)
+);
+CREATE INDEX ix_addr_city ON addr(city);
+CREATE TABLE region(
+  id         INTEGER PRIMARY KEY,
+  file_id    INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  elem       INTEGER NOT NULL,                  -- element of the province list (list_id 9)
+  name       TEXT NOT NULL,                     -- raw ('WOJ. MAZOWIECKIE', 'WOIWODSCHAFT MASOWIEN', ...)
+  adjective  TEXT,                              -- DERIVED: 'MAZOWIECKI' from 'WOJ. MAZOWIECKIE' (NULL for foreign forms)
+  adjective_ascii TEXT,                         -- DERIVED: ASCII form of the adjective
+  UNIQUE(file_id, elem)
+);
+CREATE TABLE city_prefixed(
+  file_id     INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  elem        INTEGER NOT NULL,                 -- city element (list_id 2)
+  adjective   TEXT NOT NULL,                    -- DERIVED: 'ADJ' of 'ADJ, CITY' (only when it names a province)
+  base_name   TEXT NOT NULL,                    -- DERIVED: city name without the province prefix
+  base_ascii  TEXT,                             -- DERIVED: adjective/CSV check helper: base name in ASCII
+  region_file_id INTEGER,                       -- region.file_id of the matched province (NULL = adjective matched none)
+  region_elem    INTEGER,
   PRIMARY KEY(file_id, elem)
 );
 CREATE TABLE queries(
@@ -187,10 +237,55 @@ SELECT st.country      AS country,
        st.name         AS street,
        h.elem          AS hnr_elem,
        h.house_number  AS house_number,
+       h.house_number_to AS house_number_to,
+       h.hn_even       AS hn_even,
+       h.hn_odd        AS hn_odd,
        st.longitude    AS longitude,
        st.latitude     AS latitude
 FROM hnr h
 LEFT JOIN v_street st ON st.file_id = h.street_file_id AND st.elem = h.addr_to_street;
+
+-- exactly what the car offers for one street when the user types digits: every record's
+-- range expanded the device way (NLHnrToString::bProcessHnr): step = (even == odd) ? 1 : 2.
+CREATE VIEW v_hnr_offered AS
+WITH RECURSIVE gen(file_id, hnr_elem, street_elem, city, street, n, top, st) AS (
+  SELECT h.file_id, h.elem, st2.elem, st2.city_name, st2.name,
+         h.house_number,
+         COALESCE(h.house_number_to, h.house_number),
+         CASE WHEN COALESCE(h.hn_even, 0) = COALESCE(h.hn_odd, 0) THEN 1 ELSE 2 END
+    FROM hnr h
+    JOIN v_street st2 ON st2.file_id = h.street_file_id AND st2.elem = h.addr_to_street
+   WHERE h.house_number IS NOT NULL
+  UNION ALL
+  SELECT file_id, hnr_elem, street_elem, city, street, n + st, top, st
+    FROM gen
+   WHERE n < top
+)
+SELECT DISTINCT file_id, hnr_elem, street_elem, city, street, n AS house_number
+  FROM gen;
+
+CREATE VIEW v_city_prefixed AS
+SELECT p.file_id     AS file_id,
+       p.elem        AS city_elem,
+       c.name        AS city_name,
+       p.adjective   AS region_adjective,
+       p.base_name   AS base_name,
+       r.name        AS region
+FROM city_prefixed p
+JOIN element c  ON c.file_id = p.file_id AND c.elem = p.elem
+LEFT JOIN region r ON r.file_id = p.region_file_id AND r.elem = p.region_elem;
+
+-- city's streets the way the car browses them: REL00001 edges PLUS the names the device
+-- re-derives from the address list (LID20000); `source` says which.
+CREATE VIEW v_city_street AS
+SELECT DISTINCT 'rel' AS source, city_elem, city_name, name, sort_name, elem AS street_elem
+FROM v_street
+UNION
+SELECT DISTINCT 'addr', e.elem, a.city, a.street, NULL, NULL
+FROM addr a
+JOIN element e ON e.name = a.city
+JOIN file f    ON f.id = e.file_id AND f.list_id = 2 AND f.kind = 'namelist'
+WHERE a.street IS NOT NULL;
 
 CREATE VIEW v_completeness AS
 SELECT f.id AS file_id, f.name AS file, f.kind AS kind, f.list_id AS list_id,
@@ -234,6 +329,48 @@ pub const QUERY_PACK: &[(&str, &str, &str)] = &[
            FROM v_address
           WHERE city = :city
           ORDER BY street, house_number;",
+    ),
+    (
+        "streets_in_city_car_view",
+        "DERIVED: what the car lists as streets of a city - REL00001 edges ('rel') plus names the device derives from the address list ('addr'); bind :city",
+        "SELECT source, city_elem, street_elem, name FROM v_city_street
+          WHERE city_name = :city
+          ORDER BY name;",
+    ),
+    (
+        "addresses_in_city_list",
+        "address-list (LID20000) entries of one city, parsed; bind :city to a city name from v_city",
+        "SELECT city, street, house_number, name FROM addr
+          WHERE city = :city
+          ORDER BY street, house_number;",
+    ),
+    (
+        "provinces",
+        "province list (LID20005): all language variants; adjective is the DERIVED key used to match 'ADJ, CITY' city names",
+        "SELECT r.elem AS region_elem, r.adjective, r.adjective_ascii, r.name
+           FROM region r
+          ORDER BY r.name;",
+    ),
+    (
+        "cities_with_province_prefix",
+        "DERIVED: city entries spelled 'ADJECTIVE, CITY' (same-name cities in different provinces - the disambiguation the car asks about)",
+        "SELECT city_elem, city_name, region_adjective, region FROM v_city_prefixed
+          ORDER BY base_name;",
+    ),
+    (
+        "city_regions_rel",
+        "raw REL edges between the city list and the province list (e.g. REL00006); both endpoint roles possible",
+        "SELECT r.file_id AS rel_file, f.name AS rel_name,
+                s.elem AS city_elem, s.name AS city_name,
+                t.elem AS region_elem, t.name AS region_name
+           FROM rel r
+           JOIN file f    ON f.id = r.file_id
+           JOIN element s ON s.file_id = r.src_file_id AND s.elem = r.src_elem
+           JOIN element t ON t.file_id = r.tgt_file_id AND t.elem = r.tgt_elem
+           JOIN file sf ON sf.id = r.src_file_id
+           JOIN file tf ON tf.id = r.tgt_file_id
+          WHERE (sf.list_id = 2 AND tf.list_id = 9) OR (sf.list_id = 9 AND tf.list_id = 2)
+          ORDER BY r.file_id, r.pair_idx;",
     ),
     (
         "line1_prefix_derived",
@@ -397,6 +534,107 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
         }
     }
 
+    // derived province / prefixed-city / address tables (see header comment; raw tables untouched)
+    {
+        let mut provs: Vec<(i64, u32, String, Option<String>, Option<String>, Option<String>)> =
+            Vec::new();
+        for (fi, f) in files.iter().enumerate() {
+            if f.kind == "namelist" && f.list_id == Some(9) {
+                for e in &f.elements {
+                    let prov = province_adjectives(&e.name);
+                    provs.push((ids[fi], e.elem, e.name.clone(), prov.0, prov.1, prov.2));
+                }
+            }
+        }
+        let mut adj_of: HashMap<String, (i64, u32)> = HashMap::new();
+        for (fid, el, _, neuter, adj, adj_a) in &provs {
+            let mut keys: Vec<String> = Vec::new();
+            for opt in [neuter, adj, adj_a].into_iter().flatten() {
+                keys.push(opt.clone());
+                keys.push(ascii_fold(opt));
+            }
+            for k in keys {
+                adj_of.entry(k).or_insert((*fid, *el));
+            }
+        }
+
+        let mut ps = tx
+            .prepare_cached(
+                "INSERT INTO region(file_id,elem,name,adjective,adjective_ascii) VALUES(?1,?2,?3,?4,?5)",
+            )
+            .map_err(|e| e.to_string())?;
+        for (fid, el, name, _, adj, adj_a) in &provs {
+            ps.execute(rusqlite::params![fid, *el as i64, name, adj, adj_a])
+                .map_err(|err| format!("region {name}: {err}"))?;
+        }
+
+        let mut pc = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO city_prefixed(file_id,elem,adjective,base_name,base_ascii,region_file_id,region_elem)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            )
+            .map_err(|e| e.to_string())?;
+        for (fi, f) in files.iter().enumerate() {
+            if f.kind != "namelist" || f.list_id != Some(2) {
+                continue;
+            }
+            for e in &f.elements {
+                let Some((adj, base)) = e.name.split_once(", ") else { continue };
+                let Some(&(rf, re)) = adj_of.get(adj.trim()) else { continue };
+                pc.execute(rusqlite::params![
+                    ids[fi],
+                    e.elem as i64,
+                    adj.trim(),
+                    base.trim(),
+                    ascii_fold(base.trim()),
+                    rf,
+                    re as i64
+                ])
+                .map_err(|err| format!("city_prefixed {}: {err}", e.elem))?;
+            }
+        }
+
+        let city_forms: HashSet<String> = files
+            .iter()
+            .filter(|f| f.kind == "namelist" && f.list_id == Some(2))
+            .flat_map(|f| f.elements.iter())
+            .flat_map(|e| {
+                std::iter::once(e.name.clone()).chain(
+                    e.sort_name
+                        .split('\t')
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty()),
+                )
+            })
+            .collect();
+
+        let mut pa = tx
+            .prepare_cached(
+                "INSERT INTO addr(file_id,elem,city,street,house_number,name) VALUES(?1,?2,?3,?4,?5,?6)",
+            )
+            .map_err(|e| e.to_string())?;
+        for (fi, f) in files.iter().enumerate() {
+            if f.kind != "namelist" || f.list_id != Some(129) {
+                continue;
+            }
+            for e in &f.elements {
+                let Some((city, rest)) = split_city_prefix(&e.name, &city_forms) else {
+                    continue;
+                };
+                let (street, num) = split_trailing_number(rest);
+                pa.execute(rusqlite::params![
+                    ids[fi],
+                    e.elem as i64,
+                    city,
+                    street,
+                    num,
+                    e.name
+                ])
+                .map_err(|err| format!("addr {}: {err}", e.elem))?;
+            }
+        }
+    }
+
     // rel matrices (endpoints resolved in-run by list_id)
     for (fi, f) in files.iter().enumerate() {
         let Some(r) = &f.rel else { continue };
@@ -426,8 +664,8 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
         let fid = ids[fi];
         let mut stmt = tx
             .prepare_cached(
-                "INSERT INTO hnr(file_id,elem,addr_to_street,house_number,street_file_id)
-                 VALUES(?1,?2,?3,?4,?5)",
+                "INSERT INTO hnr(file_id,elem,addr_to_street,house_number,house_number_to,hn_even,hn_odd,street_file_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             )
             .map_err(|e| e.to_string())?;
         for h in &f.hnr {
@@ -436,6 +674,9 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
                 h.elem as i64,
                 h.addr_to_street.map(|x| x as i64),
                 h.house_number.map(|x| x as i64),
+                h.house_number_to.map(|x| x as i64),
+                h.even.map(|x| x as i64),
+                h.odd.map(|x| x as i64),
                 if h.addr_to_street.is_some() {
                     street_fid
                 } else {
@@ -518,5 +759,78 @@ impl From<SqliteValue> for Cell {
             SqliteValue::Text(s) => Cell::Text(s),
             SqliteValue::Blob(b) => Cell::Blob(b),
         }
+    }
+}
+
+/// Strip Polish diacritics so a name matches its ASCII sibling in the same list.
+fn ascii_fold(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'Ą' | 'ą' => 'A',
+            'Ć' | 'ć' => 'C',
+            'Ę' | 'ę' => 'E',
+            'Ł' | 'ł' => 'L',
+            'Ń' | 'ń' => 'N',
+            'Ó' | 'ó' => 'O',
+            'Ś' | 'ś' => 'S',
+            'Ź' | 'ź' | 'Ż' | 'ż' => 'Z',
+            other => other,
+        })
+        .collect()
+}
+
+/// Province entry name -> (neuter form, masculine adjective, ascii adjective).
+/// Only `WOJ. X` entries are decodable this way; foreign ('WOIWODSCHAFT ...') rows yield all-None.
+fn province_adjectives(name: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let up = name.trim().to_uppercase();
+    let Some(neuter) = up.strip_prefix("WOJ. ").map(str::trim) else {
+        return (None, None, None);
+    };
+    if neuter.is_empty() {
+        return (None, None, None);
+    }
+    let adj = neuter.strip_suffix('E').unwrap_or(neuter).to_string();
+    (Some(neuter.to_string()), Some(adj.clone()), Some(ascii_fold(&adj)))
+}
+
+/// Split an address-list display name `CITY, STREET ...` on the longest `CITY` that is a known
+/// city-name form (city names may themselves carry a `ADJ, ` province prefix).
+fn split_city_prefix<'a>(name: &'a str, city_forms: &HashSet<String>) -> Option<(&'a str, &'a str)> {
+    let mut first: Option<(&'a str, &'a str)> = None;
+    let mut best: Option<(&'a str, &'a str)> = None;
+    for (pos, _) in name.match_indices(", ") {
+        let city = name[..pos].trim();
+        if city.is_empty() {
+            continue;
+        }
+        let rest = name[pos + 2..].trim();
+        if first.is_none() {
+            first = Some((city, rest));
+        }
+        if city_forms.contains(city) && best.map(|(c, _)| city.len() > c.len()).unwrap_or(true) {
+            best = Some((city, rest));
+        }
+    }
+    best.or(first)
+}
+
+/// Split the street tail `STREET NAME 12A/2` into (street, trailing house-number token).
+fn split_trailing_number(rest: &str) -> (Option<String>, Option<String>) {
+    if rest.is_empty() {
+        return (None, None);
+    }
+    match rest.rsplit_once(' ') {
+        Some((head, num)) if num.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+            let street = head.trim();
+            (
+                if street.is_empty() {
+                    None
+                } else {
+                    Some(street.to_string())
+                },
+                Some(num.to_string()),
+            )
+        }
+        _ => (Some(rest.to_string()), None),
     }
 }

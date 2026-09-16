@@ -87,11 +87,17 @@ fn export_views_and_joins() {
             elem: 0,
             addr_to_street: Some(0),
             house_number: Some(7),
+            house_number_to: Some(7),
+            even: Some(false),
+            odd: Some(true),
         },
         HnrRow {
             elem: 1,
             addr_to_street: Some(1),
             house_number: Some(3),
+            house_number_to: Some(9),
+            even: Some(false),
+            odd: Some(true),
         },
     ];
     let mut poi = export_file("GLOB_POI", "sqlite", None);
@@ -167,6 +173,39 @@ fn export_views_and_joins() {
     assert_eq!(row.2, Some(7));
     let expect = (600_000_000i64 + 900) as f64 * 180.0 / 2147483648.0;
     assert!((row.3.unwrap() - expect).abs() < 1e-12);
+
+    // device number model: a record expands [from..to] with step = (even == odd) ? 1 : 2.
+    // hnr_elem=1 is 3..9 with odd-only parity -> 3,5,7,9; hnr_elem=0 collapses to the point 7.
+    let offered: Vec<i64> = {
+        let mut s = db
+            .prepare("SELECT house_number FROM v_hnr_offered WHERE hnr_elem=1 ORDER BY 1")
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(offered, vec![3, 5, 7, 9]);
+    let offered: Vec<i64> = {
+        let mut s = db
+            .prepare("SELECT DISTINCT house_number FROM v_hnr_offered WHERE hnr_elem=1 AND street_elem=1")
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(offered, vec![3, 5, 7, 9]);
+    let offered: Vec<i64> = {
+        let mut s = db
+            .prepare("SELECT house_number FROM v_hnr_offered WHERE hnr_elem=0 ORDER BY 1")
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(offered, vec![7]);
 
     // multi-block file → coords NULL (honesty rule via coords_valid)
     // bundled query pack

@@ -687,7 +687,8 @@ const HN_ATTR_CHUNK: usize = 8192;
 /// Emit `LID40006.DAT` — the house-number GenAttr file (+20000, §11.6) in the **stock device
 /// layout** (`SetDataBlock 00e09b60` / `enGetHnrIndices 00e0c3a0` / `enGetHnr 00e0d078`, §11.6b):
 /// block element ranges tile the STREET name-list `0..nst`; `0xc01` (+0x28) = per-street house
-/// numbers (existence/offsets/values), `0xc02` (+0x7c) per-record ref (street elem id), `0xc03..
+/// number lower bounds (existence/offsets/values), `0xc02` (+0x7c) per-record upper bound (`to`;
+/// equals the number for a single-number record), `0xc03..
 /// 0xc06` empty per-record string lists (card requires them decodable), `0xc09/0xc0a/0xc0b/0xc0d`
 /// per-record parity bits, `0xc11` (+0x380) per-record existence domain (the `enGetHnr` gate).
 /// One record per numeric `addr:housenumber` joined to a street in `LID20006`.
@@ -730,7 +731,7 @@ fn write_gen_attr(
         let mut exists = vec![false; width as usize];
         let mut offs: Vec<u32> = Vec::new();
         let mut nums: Vec<u32> = Vec::new();
-        let mut refs: Vec<u32> = Vec::new();
+        let mut tos: Vec<u32> = Vec::new(); // 0xc02 per-record `to` bound (NLHnr+0xc)
         let mut ev: Vec<bool> = Vec::new();
         let mut od: Vec<bool> = Vec::new();
         for (&sid, list) in by_street.range(lo as u32..hi as u32) {
@@ -740,7 +741,7 @@ fn write_gen_attr(
             list.sort_unstable();
             for &n in &list {
                 nums.push(n);
-                refs.push(sid);
+                tos.push(n);
                 ev.push(n % 2 == 0);
                 od.push(n % 2 == 1);
             }
@@ -801,7 +802,7 @@ fn write_gen_attr(
                 domain: nrec as u32,
                 exists: vec![true; nrec],
                 counts: vec![],
-                values: refs,
+                values: tos,
                 bits: vec![],
                 code_8000: 0x16,
                 code_0000: 0x14,

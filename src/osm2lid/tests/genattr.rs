@@ -99,7 +99,7 @@ fn genattr_osm_roundtrip() {
     // replay enGetHnrIndices/enGetHnr across all blocks: street -> house numbers.
     let mut street_nums: Vec<(u32, Vec<u32>)> = Vec::new();
     let mut parity_even: Vec<bool> = Vec::new(); // 0xc09 (even), records in owner order
-    let mut refs: Vec<u32> = Vec::new(); // 0xc02 ref per record = owning street elem
+    let mut tos: Vec<u32> = Vec::new(); // 0xc02 per-record `to` bound (NLHnr+0x0c); single = number
     for bi in 0..ga.blocks.len() {
         let blk = ga.decode_block(&ga_bytes, bi).expect("block decode");
         let (a, c) = (ga.blocks[bi].elem_start, ga.blocks[bi].elem_end);
@@ -119,10 +119,10 @@ fn genattr_osm_roundtrip() {
             "enGetHnr gate = record count"
         );
         assert_eq!(stream(0xc09, 0).bits.len(), vals.len(), "parity per record");
-        assert_eq!(stream(0xc02, 0).values.len(), vals.len(), "ref per record");
+        assert_eq!(stream(0xc02, 0).values.len(), vals.len(), "to bound per record");
         assert_eq!(stream(0xc03, 0x4000).param as usize, vals.len());
         assert!(stream(0xc03, 0x4000).bits.iter().all(|&b| !b));
-        refs.extend(stream(0xc02, 0).values.iter().copied());
+        tos.extend(stream(0xc02, 0).values.iter().copied());
         parity_even.extend(stream(0xc09, 0).bits.iter().copied());
         for (k, o) in (0..ex.len()).filter(|&i| ex[i]).enumerate() {
             let start = offs[k] as usize;
@@ -141,14 +141,14 @@ fn genattr_osm_roundtrip() {
     let (marsz_n, nowo_n) = (nums_of(marsz), nums_of(nowo));
     assert_eq!(marsz_n, vec![10u32, 11], "Marszalkowska numbers");
     assert_eq!(nowo_n, vec![5u32], "Nowogrodzka number");
-    // per-record parity & refs follow owner (street ascending) order:
-    let (exp_parity, exp_refs) = if marsz < nowo {
-        (vec![true, false, false], vec![marsz, marsz, nowo]) // 10 even, 11 odd, 5 odd
+    // per-record parity & `to` bound follow owner (street ascending) order; single numbers have to == from:
+    let (exp_parity, exp_tos) = if marsz < nowo {
+        (vec![true, false, false], vec![10u32, 11, 5]) // to == the number itself
     } else {
-        (vec![false, false, true], vec![nowo, marsz, marsz])
+        (vec![false, false, true], vec![5u32, 10, 11])
     };
     assert_eq!(parity_even, exp_parity, "0xc09 even bits");
-    assert_eq!(refs, exp_refs, "0xc02 refs = owning street elem");
+    assert_eq!(tos, exp_tos, "0xc02 to bound = the number");
 
     // 3. outer-header identities (the device binds list files by these first bytes) + the REL matrix.
     for (f, id, kind) in [

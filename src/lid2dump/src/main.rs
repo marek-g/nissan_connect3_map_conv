@@ -373,6 +373,9 @@ fn decode_for_export(
                         elem: blk.elem_start + k as u32,
                         addr_to_street: a,
                         house_number: h,
+                        house_number_to: None,
+                        even: None,
+                        odd: None,
                     });
                 }
                 continue;
@@ -386,16 +389,58 @@ fn decode_for_export(
                     .map(|x| x.bits.clone())
                     .unwrap_or_default();
                 let starts = stream(0xc01, 0x8000);
+                // Records are addressed by block-ordinal `r` in every per-record column:
+                // `0xc02` = SingleValue<u32> upper bound (NLHnr+0xc), `0xc09`/`0xc0a` = parity
+                // bitmaps driving the device's expansion step (enGetHnr 00e0d078).
+                let to_val = stream(0xc02, 0);
+                let to_exists: Vec<bool> = blk
+                    .streams
+                    .iter()
+                    .find(|x| x.col == 0xc02 && x.flags == 0x4000)
+                    .map(|x| x.bits.clone())
+                    .unwrap_or_default();
+                // `0xc02` carries an existence bitmap; its value stream is packed in bitmap-set
+                // order. Stock has every record present (all bits set) so ordinal == record ordinal,
+                // but honor a sparse bitmap too.
+                let to_prefix: Vec<u32> = if !to_exists.is_empty() && !to_exists.iter().all(|&x| x) {
+                    let mut p = Vec::with_capacity(to_exists.len() + 1);
+                    let mut acc = 0u32;
+                    p.push(0);
+                    for bit in &to_exists {
+                        acc += *bit as u32;
+                        p.push(acc);
+                    }
+                    p
+                } else {
+                    Vec::new()
+                };
+                let to_at = |r: usize| -> Option<u32> {
+                    let ord = if to_prefix.is_empty() {
+                        r
+                    } else {
+                        *to_prefix.get(r)? as usize
+                    };
+                    to_val.get(ord).copied()
+                };
+                let bit_at = |col: u32, r: usize| -> Option<bool> {
+                    blk.streams
+                        .iter()
+                        .find(|x| x.col == col && x.flags == 0)
+                        .map(|x| *x.bits.get(r).unwrap_or(&false))
+                };
                 let owners: Vec<u32> = (0..bits.len() as u32).filter(|&i| bits[i as usize]).collect();
                 if owners.len() == starts.len() && starts.first().copied() == Some(0) {
                     for (k, &o) in owners.iter().enumerate() {
                         let a = starts[k] as usize;
                         let b = starts.get(k + 1).copied().unwrap_or(hv.len() as u32) as usize;
-                        for &h in hv[a..b.min(hv.len()).max(a)].iter() {
+                        for r in a..b.min(hv.len()).max(a) {
                             ex.hnr.push(sqlite_export::HnrRow {
                                 elem: record_base,
                                 addr_to_street: Some(blk.elem_start + o),
-                                house_number: Some(h),
+                                house_number: Some(hv[r]),
+                                house_number_to: to_at(r),
+                                even: bit_at(0xc09, r),
+                                odd: bit_at(0xc0a, r),
                             });
                             record_base += 1;
                         }
