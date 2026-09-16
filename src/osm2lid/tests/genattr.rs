@@ -84,88 +84,71 @@ fn genattr_osm_roundtrip() {
         "gazetteer carries no coordinates"
     );
 
-    // 2. GenAttr: 3 numeric housenumbers (11A dropped — stock number column is u32), chunks to >=2 blocks.
+    // 2. GenAttr in the STOCK device layout (§11.6b): element domain = the street name-list;
+    // 0xc01 = per-street house numbers, 0xc09/0xc0a = per-record parity, 0xc11 = record gate,
+    // 0xc03.. = empty string lists. 3 numeric housenumbers (11A dropped — u32 column).
     let ga_bytes = std::fs::read(out.join("LID40006.DAT")).unwrap();
     let ga = lid_format::read_gen_attr(&ga_bytes).expect("not a GenAttr file");
-    assert_eq!(ga.element_count, 3);
+    assert_eq!(
+        ga.element_count,
+        nl.elements.len() as u32,
+        "GenAttr domain = street elements"
+    );
     assert!(ga.blocks.len() >= 2);
 
-    let mut st_cols = Vec::new(); // 0xc01 8000: per-street addr counts, blocks concatenated
-    let mut st_vals = Vec::new(); // 0xc01 0000: addr elem ids
-    let mut to_street = Vec::new(); // 0x002 8000: elem -> street id
-    let mut number = Vec::new(); // 0x00c 8000: elem -> housenumber
-    let mut num_to = Vec::new(); // 0x00c 0000
-    let mut parity = Vec::new(); // 0xc0a 4000: elem -> even
+    // replay enGetHnrIndices/enGetHnr across all blocks: street -> house numbers.
+    let mut street_nums: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut parity_even: Vec<bool> = Vec::new(); // 0xc09 (even), records in owner order
+    let mut refs: Vec<u32> = Vec::new(); // 0xc02 ref per record = owning street elem
     for bi in 0..ga.blocks.len() {
         let blk = ga.decode_block(&ga_bytes, bi).expect("block decode");
         let (a, c) = (ga.blocks[bi].elem_start, ga.blocks[bi].elem_end);
-        let col = |cc: u32, fl: u32| -> Vec<u32> {
+        let stream = |cc: u32, fl: u32| {
             blk.streams
                 .iter()
                 .find(|s| s.col == cc && s.flags == fl)
                 .unwrap_or_else(|| panic!("no col {cc:#x}/{fl:#x} in block {bi}"))
-                .values
-                .clone()
         };
-        let bits = |cc: u32, fl: u32| -> Vec<bool> {
-            blk.streams
-                .iter()
-                .find(|s| s.col == cc && s.flags == fl)
-                .unwrap_or_else(|| panic!("no bits col {cc:#x}/{fl:#x} in block {bi}"))
-                .bits
-                .clone()
-        };
+        let ex = stream(0xc01, 0x4000).bits.clone();
+        assert_eq!(ex.len(), (c - a + 1) as usize, "owner domain = block width");
+        let offs = stream(0xc01, 0x8000).values.clone();
+        let vals = stream(0xc01, 0x0000).values.clone();
         assert_eq!(
-            col(0xc01, 0x0000).len(),
-            col(0xc01, 0x8000).iter().sum::<u32>() as usize,
-            "addr vals = Σ counts"
+            stream(0xc11, 0x4000).param as usize,
+            vals.len(),
+            "enGetHnr gate = record count"
         );
-        assert_eq!(
-            col(0x00c, 0x0000).len() as u32,
-            c - a + 1,
-            "number tos = block elems"
-        );
-        st_cols.extend(col(0xc01, 0x8000));
-        st_vals.extend(col(0xc01, 0x0000));
-        to_street.extend(col(0x002, 0x8000));
-        number.extend(col(0x00c, 0x8000));
-        num_to.extend(col(0x00c, 0x0000));
-        parity.extend(bits(0xc0a, 0x4000));
+        assert_eq!(stream(0xc09, 0).bits.len(), vals.len(), "parity per record");
+        assert_eq!(stream(0xc02, 0).values.len(), vals.len(), "ref per record");
+        assert_eq!(stream(0xc03, 0x4000).param as usize, vals.len());
+        assert!(stream(0xc03, 0x4000).bits.iter().all(|&b| !b));
+        refs.extend(stream(0xc02, 0).values.iter().copied());
+        parity_even.extend(stream(0xc09, 0).bits.iter().copied());
+        for (k, o) in (0..ex.len()).filter(|&i| ex[i]).enumerate() {
+            let start = offs[k] as usize;
+            let end = offs.get(k + 1).copied().unwrap_or(vals.len() as u32) as usize;
+            street_nums.push((a + o as u32, vals[start..end].to_vec()));
+        }
     }
-
-    // street-domain is the 2 address-bearing streets, ascending street-id order in every block:
-    let (lo, hi) = (marsz.min(nowo), marsz.max(nowo)); // ids of the two streets
-    assert_eq!(
-        st_cols.len(),
-        2,
-        "one (count) entry per address-bearing street"
-    );
-    // the two Marszalkowska addrs come first (lowest elem ids 0,1), Nowogrodzka's elem 2 last.
-    assert_eq!(st_vals, vec![0u32, 1, 2]);
-    let first_street_n = st_cols[0];
-    assert_eq!(first_street_n, if marsz < nowo { 2 } else { 1 });
-    assert_eq!(st_cols[1], if marsz < nowo { 1 } else { 2 });
-    // street->addr membership: Marszalkowska elems {0,1}; Nowogrodzka elem {2}
-    let marsz_addrs = if marsz < nowo {
-        &st_vals[..first_street_n as usize]
-    } else {
-        &st_vals[1..]
+    assert_eq!(street_nums.len(), 2, "two address-bearing streets");
+    let nums_of = |sid: u32| {
+        street_nums
+            .iter()
+            .find(|(s, _)| *s == sid)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
     };
-    assert_eq!(marsz_addrs, &[0u32, 1u32]);
-
-    assert_eq!(
-        to_street,
-        vec![marsz, marsz, nowo],
-        "addr->street ids match LID20006 element order"
-    );
-    assert_eq!(number, vec![10, 11, 5], "housenumber froms");
-    assert_eq!(num_to, vec![10, 11, 5], "housenumber tos (== number)");
-    assert_eq!(
-        parity,
-        vec![true, false, false],
-        "even-number parity bits (10 even; 11,5 odd)"
-    );
-    let _ = (hi, lo);
+    let (marsz_n, nowo_n) = (nums_of(marsz), nums_of(nowo));
+    assert_eq!(marsz_n, vec![10u32, 11], "Marszalkowska numbers");
+    assert_eq!(nowo_n, vec![5u32], "Nowogrodzka number");
+    // per-record parity & refs follow owner (street ascending) order:
+    let (exp_parity, exp_refs) = if marsz < nowo {
+        (vec![true, false, false], vec![marsz, marsz, nowo]) // 10 even, 11 odd, 5 odd
+    } else {
+        (vec![false, false, true], vec![nowo, marsz, marsz])
+    };
+    assert_eq!(parity_even, exp_parity, "0xc09 even bits");
+    assert_eq!(refs, exp_refs, "0xc02 refs = owning street elem");
 
     // 3. outer-header identities (the device binds list files by these first bytes) + the REL matrix.
     for (f, id, kind) in [

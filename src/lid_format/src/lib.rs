@@ -13,6 +13,7 @@
 //! `NLBlock::ProcessNode`. See LID_format.md (ASF section).
 
 pub mod header;
+pub mod pa;
 mod rebuild;
 pub mod rel;
 pub mod write;
@@ -150,7 +151,7 @@ impl<'a> Cur<'a> {
 }
 
 /// Decode a numeric column with `NLStandardDecoder`/`NLValueListDecoder` alphabet.
-fn decode_u32(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
+pub(crate) fn decode_u32(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
     decode_u32_c(b, code, start, end, n).0
 }
 
@@ -419,28 +420,33 @@ pub struct GenAttrIndex {
 }
 
 /// GenAttr sub-header layout (`NLGenAttrFile::DecodeSubHeader` @0xe0e3d0), read at `hdr`:
-/// `u32 elem_count(=this+0x80), u32 this+0x84, u32 toc_count(=this+0x88)`, then `toc_count ×
-/// NLBlockTocEntry` of 3 `u32` each. Distinct from `NLNameList::LoadHeader`'s VLE/raw section table.
+/// `u32 elem_count(=this+0x80), u32 x(=this+0x84 = filesize − first block_off), u32 toc_count(=this
+/// +0x88)`, then `toc_count × NLBlockTocEntry` starting **at `hdr+12`** of 3 `u32` each:
+/// `{u32 block_off, NLInterval{u32 elem_start, u32 elem_end}}` — exactly the field order
+/// `GetBlockDescr` @0xe0dd4c consumes (`*off = entry[0]`, interval = `entry+4`, block byte size =
+/// `next.block_off − this.block_off`, last block runs to EOF). Grouping the table as
+/// (elem_start, elem_end, block_off) from `hdr+16` — a −4-byte misgroupBy — makes every block read
+/// the *next* block's byte window (the historic bug: 0xc01 "domains" appeared shifted, D_N = W_{N+1},
+/// and last-entry offsets decoded as garbage). Distinct from `NLNameList::LoadHeader`'s VLE/raw
+/// section table.
 fn gen_attr_toc(b: &[u8]) -> Option<(u32, Vec<GenAttrTocEntry>)> {
     let n = b.len();
     let hdr = u32(b, 0x10) as usize;
     if hdr + 24 > n {
         return None;
     }
-    // sub-header: `u32 elem_count, u32 this+4, u32 toc_count, u32 block_count`, then toc_count
-    // NLBlockTocEntry {u32 elem_start, u32 elem_end, u32 block_off} (NLGenAttrFile 0xe0e3d0).
     let elem_count = u32(b, hdr);
     let toccount = u32(b, hdr + 8);
     if toccount < 2 || toccount > 1_000_000 || elem_count < 1 || elem_count > 0x7fff_ffff {
         return None;
     }
-    let mut p = hdr + 16;
+    let mut p = hdr + 12;
     let mut blocks: Vec<GenAttrTocEntry> = Vec::with_capacity((toccount as usize).min(n / 12));
     for i in 0..toccount {
         if p + 12 > n {
             break;
         }
-        let (a, c, o) = (u32(b, p), u32(b, p + 4), u32(b, p + 8));
+        let (o, a, c) = (u32(b, p), u32(b, p + 4), u32(b, p + 8));
         p += 12;
         // element ranges must tile contiguously & ascending (first starts at 0, ends at elem_count-1)
         let contiguous = i == 0 || a == blocks[i as usize - 1].elem_end + 1;
@@ -552,9 +558,16 @@ impl GenAttrIndex {
         for (i, d) in descs.iter().enumerate() {
             let (s, en) = (bs + d.off as usize, span_end(i));
             let is_bitmap = matches!(d.code, 0x01 | 0x02 | 0x03); // existence sub-streams only
-            let count = (d.param as usize)
-                .min((en - s).min(huge_len(en)) * 32)
-                .min(64_000_000);
+            let count = if matches!(d.code, 0x02 | 0x03) {
+                // Sparse bitmaps are self-delimiting: `param` is authoritative, bytes may be *shorter*
+                // than worst case or empty (code `0x02` with zero bytes = the stock "all-missing"
+                // string-vector existence row; code `0x03` zero bytes = "all present").
+                (d.param as usize).min(64_000_000)
+            } else {
+                (d.param as usize)
+                    .min((en - s).min(huge_len(en)) * 32)
+                    .min(64_000_000)
+            };
             let (values, bits) = if is_bitmap {
                 (vec![], bitfield(b, d.code, s, en, count))
             } else {
@@ -1443,16 +1456,15 @@ mod tests {
         b[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
         let toccount = elem_count.div_ceil(per_block);
         b.extend_from_slice(&elem_count.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes()); // this+4
+        b.extend_from_slice(&0u32.to_le_bytes()); // this+4 (= filesize − first block_off)
         b.extend_from_slice(&toccount.to_le_bytes());
-        b.extend_from_slice(&(toccount * 13).to_le_bytes()); // this+12 (some other count)
         let mut off = 0x1000u32;
         for i in 0..toccount {
             let a = i * per_block;
             let c = ((i + 1) * per_block - 1).min(elem_count - 1);
+            b.extend_from_slice(&off.to_le_bytes());
             b.extend_from_slice(&a.to_le_bytes());
             b.extend_from_slice(&c.to_le_bytes());
-            b.extend_from_slice(&off.to_le_bytes());
             off += 0x1000;
         }
         b.resize(0x400, 0x00); // real GenAttr files are MB-sized; pad past the `is_gen_attr` size floor
@@ -1481,8 +1493,8 @@ mod tests {
     fn gen_attr_rejects_bad_toc() {
         // a broken tiling (a gap) must not validate
         let mut b = synth_gen_attr(10000, 5000);
-        // corrupt the 2nd entry's elem_start (offset hdr+16+12+0) to introduce a gap
-        let p = 0x77 + 16 + 12;
+        // corrupt the 2nd entry's elem_start (entry table at hdr+12, {off,es,ee}, entry1.es @ +12+12+4)
+        let p = 0x77 + 12 + 12 + 4;
         b[p..p + 4].copy_from_slice(&6000u32.to_le_bytes()); // should have been 5000
         assert!(!is_gen_attr(&b));
         assert!(read_gen_attr(&b).is_err());
@@ -1535,12 +1547,18 @@ mod tests {
         assert_eq!(ga.element_count, 974871);
         assert_eq!(blk.elem_start, 0);
         assert_eq!(blk.elem_end, 7903);
-        // parity bitmap col 0xc09 must decode to param bits with a plausible ~half density
+        // Correct TOC window ⇒ 0xc01 owner domain == block width (the historic −4 grouping read
+        // this block's numbers from the NEXT block's table and saw domain 4027 "shifted").
+        let c01 = blk.streams.iter().find(|s| s.col == 0xc01 && s.flags == 0x4000).unwrap();
+        assert_eq!(c01.param, 7904);
+        // parity bitmap col 0xc09 is per-**record**: its length must equal the 0xc01 value count.
         let par = blk.streams.iter().find(|s| s.col == 0xc09).unwrap();
-        assert_eq!(par.bits.len(), 10886);
+        let val = blk.streams.iter().find(|s| s.col == 0xc01 && s.flags == 0).unwrap();
+        assert_eq!(par.bits.len(), val.values.len());
+        assert_eq!(par.bits.len(), 9665);
         let set = par.bits.iter().filter(|&&x| x).count();
         assert!(
-            set > 4000 && set < 8000,
+            set > 3000 && set < 7000,
             "parity density implausible: {set}"
         );
     }
@@ -1561,104 +1579,178 @@ mod tests {
         assert_eq!(ok, nblocks, "all blocks must byte-rebuild exactly");
     }
 
-    /// Synthetic GenAttr HnR block: streets -> addr lists, addr -> number range, addr -> owner street-desc,
-    /// parity. Write -> `read_gen_attr`/`decode_block` -> replay the car's member lookups and assert the
-    /// answers match what we encoded. Proves `write` is byte-valid *and* read-model-consistent offline
-    /// (the LID2 element-id join itself is external — these use block-internal street-desc indices).
+    /// Synthetic GenAttr HnR file in the **stock** layout (§11.6b): block ranges are STREET elements,
+    /// `0xc01` = per-street house-number lists, `0xc02` per-record ref, `0xc03..0xc06` empty string
+    /// lists, `0xc09/0xc0a/0xc0b/0xc0d` per-record parity bits, `0xc11` per-record gate. Write ->
+    /// `read_gen_attr`/`decode_block` -> replay `enGetHnrIndices`/`enGetHnr` (`00e0c3a0`/`00e0d078`)
+    /// and assert the answers. Proves the writer emits what the card reads, offline.
     #[test]
     fn gen_attr_writer_roundtrip_device_model() {
-        use crate::write::{write_gen_attr_file, BlockData, ColData};
-        // block0: elems 0..1 (addrs 0,1); street-list = 2 streets -> addrs {0,1}/{2,3-per-blk0:false}.
-        let mk = |e0: u32, e1: u32, addr0: u32, addr1: u32| BlockData {
+        use crate::write::{write_gen_attr_file, BlockData, ColData, ColKind};
+        let vl = |domain: u32, exists: Vec<bool>, counts: Vec<u32>, values: Vec<u32>| ColData {
+            selector: 0xc01,
+            kind: ColKind::ValueList,
+            domain,
+            exists,
+            counts,
+            values,
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let gate = |recs: usize| ColData {
+            selector: 0xc11,
+            kind: ColKind::ValueList,
+            domain: recs as u32,
+            exists: vec![true; recs],
+            counts: (0..recs as u32).collect(),
+            values: (0..recs as u32).collect(),
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let sv = |domain: u32, values: Vec<u32>| ColData {
+            selector: 0xc02,
+            kind: ColKind::SingleValue,
+            domain,
+            exists: vec![true; domain as usize],
+            counts: vec![],
+            values,
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let bin = |selector: u16, bits: Vec<bool>| ColData {
+            selector,
+            kind: ColKind::Binary,
+            domain: bits.len() as u32,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits,
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let es = |selector: u16, recs: u32| ColData {
+            selector,
+            kind: ColKind::EmptyByteList,
+            domain: recs,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits: vec![],
+            code_8000: 0x11,
+            code_0000: 0x11,
+            range_from_to: None,
+        };
+
+        // 6 street elements in 2 tiling blocks: [0..4] (street1 -> {3,4}, street2 -> {7}, 3 records),
+        // [5..6] (street5 -> {2}, 1 record).
+        let mkb = |e0: u32,
+                   e1: u32,
+                   nrec: usize,
+                   c01: ColData,
+                   refs: Vec<u32>,
+                   ev: Vec<bool>,
+                   od: Vec<bool>| BlockData {
             elem_start: e0,
             elem_end: e1,
             cols: vec![
-                // +0x28 (0xc01) street -> addr list. street0 owns both addrs, street1 none.
-                ColData {
-                    selector: 0xc01,
-                    domain: 2,
-                    exists: vec![true, false],
-                    counts: vec![2],
-                    values: vec![addr0, addr1],
-                    code_8000: 0x16,
-                    code_0000: 0x14,
-                    range_from_to: None,
-                },
-                // +0x4d0 (0xc13) owner-descr -> street-desc list (addr idx = owner-descr, 1:1).
-                ColData {
-                    selector: 0xc13,
-                    domain: 2,
-                    exists: vec![true, true],
-                    counts: vec![1, 2],
-                    values: vec![0, 1],
-                    code_8000: 0x16,
-                    code_0000: 0x14,
-                    range_from_to: None,
-                },
-                // +0x300 (0x00c) Range<u32> number per addr.
-                ColData {
-                    selector: 0x00c,
-                    domain: 2,
-                    exists: vec![true, true],
-                    counts: vec![],
-                    values: vec![],
-                    code_8000: 0x16,
-                    code_0000: 0x11,
-                    range_from_to: Some((
-                        vec![addr0 * 10, addr1 * 10],
-                        vec![addr0 * 10, addr1 * 10],
-                    )),
-                },
-                // +0x280 (0xc0a) tBitArray per-addr parity-even existence.
-                ColData {
-                    selector: 0xc0a,
-                    domain: 2,
-                    exists: vec![true, false],
-                    counts: vec![],
-                    values: vec![],
-                    code_8000: 0x16,
-                    code_0000: 0x14,
-                    range_from_to: None,
-                },
+                c01,
+                sv(nrec as u32, refs),
+                gate(nrec),
+                bin(0xc09, ev),
+                bin(0xc0a, od),
+                bin(0xc0b, vec![false; nrec]),
+                bin(0xc0d, vec![false; nrec]),
+                es(0xc03, nrec as u32),
+                es(0xc04, nrec as u32),
+                es(0xc05, nrec as u32),
+                es(0xc06, nrec as u32),
             ],
         };
-        let file = write_gen_attr_file(4, &[], &[mk(0, 1, 0, 1), mk(2, 3, 2, 3)]);
+        let file = write_gen_attr_file(
+            7,
+            &[],
+            &[
+                mkb(
+                    0,
+                    4,
+                    3,
+                    vl(5, vec![false, true, true, false, false], vec![0, 2], vec![3, 4, 7]),
+                    vec![100, 101, 102],
+                    vec![false, true, false], // 3:odd 4:even 7:odd
+                    vec![true, false, true],
+                ),
+                mkb(
+                    5,
+                    6,
+                    1,
+                    vl(2, vec![false, true], vec![0], vec![2]),
+                    vec![200],
+                    vec![true],
+                    vec![false],
+                ),
+            ],
+        );
 
         let gi = read_gen_attr(&file).expect("self-written file must re-parse");
-        assert_eq!(gi.element_count, 4);
+        assert_eq!(gi.element_count, 7);
         assert_eq!(gi.blocks.len(), 2);
         let (ok, mm) = crate::rebuild::rebuild_all(&file);
         assert!(mm.is_none(), "self-written file must byte-rebuild: {mm:?}");
         assert_eq!(ok, 2);
 
-        for (bi, (a0, a1)) in [(0usize, (0u32, 1u32)), (1, (2, 3))] {
-            let blk = gi.decode_block(&file, bi).unwrap();
-            let st = |col: u32, flag: u32| {
-                blk.streams
-                    .iter()
-                    .find(|s| s.col == col && s.flags == flag)
-                    .unwrap_or_else(|| panic!("blk {bi} missing col {col:03x}/{flag:04x}"))
-            };
-            // +0x28: street0 -> [addr0, addr1].
-            let ex = st(0xc01, 0x4000);
-            let off = st(0xc01, 0x8000);
-            let val = st(0xc01, 0);
-            assert_eq!(ex.bits, vec![true, false]);
-            assert_eq!(
-                &val.values[..off.values[0] as usize],
-                [a0, a1],
-                "blk {bi} street0 addr list"
-            );
-            // +0x4d0: owner-descr(addr idx) -> street-desc.
-            let ooff = st(0xc13, 0x8000);
-            let oval = st(0xc13, 0);
-            assert_eq!(oval.values, vec![0, 1]);
-            assert_eq!(&oval.values[..ooff.values[0] as usize], [0]); // addr0 -> street-desc 0
-                                                                      // +0x300 Range number.
-            assert_eq!(st(0x00c, 0x8000).values, vec![a0 * 10, a1 * 10]);
-            assert_eq!(st(0x00c, 0).values, vec![a0 * 10, a1 * 10]);
-            // parity existence.
-            assert_eq!(st(0xc0a, 0x4000).bits, vec![true, false]);
+        let blk = gi.decode_block(&file, 0).unwrap();
+        let st = |col: u32, flag: u32| {
+            blk.streams
+                .iter()
+                .find(|s| s.col == col && s.flags == flag)
+                .unwrap_or_else(|| panic!("missing col {col:03x}/{flag:04x}"))
+        };
+        // ---- enGetHnrIndices(street elem): before = starts[ordinal], count = next − start. ----
+        let hnr_indices = |street_elem: u32| -> Option<(u32, u32)> {
+            let ex = st(0xc01, 0x4000).bits.clone();
+            let local = (street_elem - blk.elem_start) as usize;
+            if local >= ex.len() || !ex[local] {
+                return None; // device: no values ⇒ interval, enGetHnr not called
+            }
+            let ord = ex[..=local].iter().filter(|&&b| b).count() - 1;
+            let starts = st(0xc01, 0x8000).values.clone();
+            let before = starts[ord];
+            let total = st(0xc01, 0).values.len() as u32;
+            let end = starts.get(ord + 1).copied().unwrap_or(total);
+            Some((before, end - before))
+        };
+        assert_eq!(hnr_indices(0), None);
+        assert_eq!(hnr_indices(1), Some((0, 2)));
+        assert_eq!(hnr_indices(2), Some((2, 1)));
+        assert_eq!(hnr_indices(3), None);
+        assert_eq!(hnr_indices(4), None);
+
+        // ---- enGetHnr(flat record): gate on 0xc11, number from 0xc01, parity from bin cols. ----
+        let gate_n = st(0xc11, 0x4000).param;
+        assert_eq!(gate_n, 3, "enGetHnr gate must cover all records");
+        let nums = st(0xc01, 0).values.clone();
+        let ev = st(0xc09, 0).bits.clone();
+        let od = st(0xc0a, 0).bits.clone();
+        let refs = st(0xc02, 0).values.clone();
+        for rec in 0..3usize {
+            assert!((rec as u32) < gate_n);
+            assert_eq!(nums[rec], [3u32, 4, 7][rec]);
+            assert_eq!(ev[rec], [3u32, 4, 7][rec] % 2 == 0);
+            assert_eq!(od[rec], [3u32, 4, 7][rec] % 2 == 1);
+            assert_eq!(refs[rec], 100 + rec as u32);
+        }
+        // empty string lists must decode to record-sized all-missing bitmaps (enGetValues succeeds).
+        for col in [0xc03u32, 0xc04, 0xc05, 0xc06] {
+            let s = st(col, 0x4000);
+            assert_eq!(s.param, 3, "{col:03x} existence param");
+            assert!(s.bits.iter().all(|&b| !b), "{col:03x} all missing");
         }
     }
 }

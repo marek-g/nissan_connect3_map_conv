@@ -16,24 +16,52 @@
 use super::{u32, vle_encode};
 use crate::rebuild::encode_numeric;
 
-/// One attribute-vector selector triple (existence / counts / values).
+/// Column vector flavor (which descriptor rows the device's `SetDataBlock` decoder expects).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColKind {
+    /// 3 rows: existence / cumulative offsets (VLE delta) / concatenated values
+    /// (`NLValueListAttrVector` — `0xc01` house numbers, `0xc11` record domain, …).
+    ValueList,
+    /// 2 rows: existence / one value per existing *record* (`NLSingleValueAttrVector` — `0xc02` ref).
+    SingleValue,
+    /// 1 row: raw bit vector; the bits are the data (`NLBinaryAttrVector` — `0xc09`/`0xc0a`/`0xc0b`/`0xc0d`).
+    Binary,
+    /// The stock `POL` "empty string list" shape for `0xc03..0xc06` (`NLValueListAttrVector<u8>`,
+    /// which `enGetHnr` *requires* to decode successfully): existence `0x02` with **zero bytes**
+    /// (`param` = record count, all-missing), then two `0x11` rows with `param = 0` (no bytes).
+    /// Equal `off` rows are legal (row span = next-off − off, §`decode_block`).
+    EmptyByteList,
+    /// 3 rows: existence / `from`s / `to`s (`NLRangeAttrVector` — `0xc08`/`0xc10`). `range_from_to`.
+    Range,
+}
+
+/// One attribute-vector selector triple (existence / offsets / values — flavor per `kind`).
 pub struct ColData {
-    /// Selector (`kind & 0xfff`): e.g. `0xc01`(+0x28 `VL<u32>`  street→addr), `0x002`(SV<u32> addr→street),
-    /// `0x00e`(+0x340 `Range<u32>` number from/to), `0xc0a`/`0xc0b`(tBitArray per-addr parity bits).
+    /// Selector (`kind & 0xfff`): `0xc01`(+0x28 `VL<u32>` street→house numbers), `0xc02`(+0x7c
+    /// `SV<u32>` per-record ref), `0xc03..0xc06`(+0xb0.. `VL<u8>` hnr strings — empty on POL),
+    /// `0xc09/0xc0a/0xc0b/0xc0d`(+0x260/280/2a0/300 per-record parity bits), `0xc11`(+0x380 `VL<u32>`
+    /// per-record existence domain = the `enGetHnr` gate), `0xc10`(+0x340 `Range`).
     pub selector: u16,
-    /// Existence domain size (`param` of the `4000` stream; bit count the device's `HasAttribute` tests).
+    pub kind: ColKind,
+    /// Existence domain size (`param` of the `4000` stream; bit count the device's `HasAttribute` /
+    /// `GetNumberOfExistenceFlags` tests). For `ValueList`/`SingleValue`/`EmptyByteList`.
     pub domain: u32,
-    /// Existence bits, length `domain` (`true` ⇒ element has this attribute).
+    /// Existence bits, length `domain` (`true` ⇒ owner/element has this attribute).
     pub exists: Vec<bool>,
-    /// Per exist-element list lengths in sorted-exist order (the `8000` stream). Empty for range/SV cols.
+    /// Per exist-element **absolute start offsets** in the flat `values` list in sorted-exist order,
+    /// first = 0 (the `8000` stream, `0x16`-delta encoded ⇒ decodes back to absolutes, like stock).
+    /// Unused by `SingleValue`/`Binary`/`EmptyByteList`/`Range`.
     pub counts: Vec<u32>,
-    /// The concatenated values (`0000` stream), length = Σ counts. For range/SV: see `range_from_to`.
+    /// The concatenated values (`0000` stream), length = for `ValueList` Σ counts (abs starts, last
+    /// implicit = list end). For `SingleValue`: one value per existing record.
     pub values: Vec<u32>,
+    /// Bit data for `Binary` columns (length = record count).
+    pub bits: Vec<bool>,
     /// `code` for the `8000` counts stream: `0x16` (cumulative VLE delta) or `0x14` (absolute VLE).
     pub code_8000: u16,
     /// `code` for the `0x0000` values: `0x14` (VLE) or `0x18` (Simple9). Use `0x14` for safety.
     pub code_0000: u16,
-    /// For `Range`/`SingleValue` columns: per-exist *(from, to)*; replaces `counts`/`values` and forces
+    /// For `Range` columns: per-exist *(from, to)*; replaces `counts`/`values` and forces
     /// `8000`=`0x16` froms & `0000`=`0x11` tos.
     pub range_from_to: Option<(Vec<u32>, Vec<u32>)>,
 }
@@ -58,51 +86,88 @@ fn exist_bytes(exists: &[bool], code: u16) -> Vec<u8> {
     }
 }
 
+/// Existence bitmap `code` matching the stock convention: `0x01` dense (none set ⇒ zero-filled),
+/// `0x02` sparse set-positions (mixed), `0x03` sparse unset-positions (all set ⇒ zero bytes).
+fn ex_code(exists: &[bool]) -> u16 {
+    let t = exists.iter().filter(|&&b| b).count();
+    if t == 0 {
+        0x01
+    } else if t == exists.len() {
+        0x03
+    } else {
+        0x02
+    }
+}
+
 /// One block's bytes: `[u16 num] + num*{u16 kind,u16 code,u32 off,u32 param} + stream bytes`. Descriptor
 /// stream spans are `[off[i], off[i+1])` in *row order* (row `i+1`'s span ⇒ this one's byte-length), the
-// device span rule; rows are packed back-to-back. Param per row mirrors the stock convention.
+// device span rule; rows are packed back-to-back. `0`-length rows are legal (equal `off`), e.g. the
+// stock EmptyByteList existence + offset rows. Param per row mirrors the stock convention.
 pub fn build_block(blk: &BlockData) -> Vec<u8> {
-    // (kind, code, param, bytes); 3 rows per column: (4000,0x01/0x02), (8000,..), (0000,..).
+    // (kind, code, param, bytes) — rows per column depend on the vector `kind`.
     let mut rows: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
     for c in &blk.cols {
-        let ex_code: u16 = if c.exists.iter().any(|&b| b) {
-            0x02
-        } else {
-            0x01
-        };
-        rows.push((
-            c.selector | 0x4000,
-            ex_code,
-            c.domain,
-            exist_bytes(&c.exists, ex_code),
-        ));
-        let nexist = c.exists.iter().filter(|&&b| b).count() as u32;
-        if let Some((from, to)) = &c.range_from_to {
-            rows.push((
-                c.selector | 0x8000,
-                0x16,
-                nexist,
-                encode_numeric(from, 0x16).expect("range from VLE"),
-            ));
-            rows.push((
-                c.selector,
-                0x11,
-                to.len() as u32,
-                encode_numeric(to, 0x11).expect("range to"),
-            ));
-        } else {
-            rows.push((
-                c.selector | 0x8000,
-                c.code_8000,
-                c.counts.len() as u32,
-                encode_numeric(&c.counts, c.code_8000 as u32).expect("counts"),
-            ));
-            rows.push((
-                c.selector,
-                c.code_0000,
-                c.values.len() as u32,
-                encode_numeric(&c.values, c.code_0000 as u32).expect("values"),
-            ));
+        match c.kind {
+            ColKind::ValueList => {
+                let xc = ex_code(&c.exists);
+                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector | 0x8000,
+                    c.code_8000,
+                    c.counts.len() as u32,
+                    encode_numeric(&c.counts, c.code_8000 as u32).expect("counts"),
+                ));
+                rows.push((
+                    c.selector,
+                    c.code_0000,
+                    c.values.len() as u32,
+                    encode_numeric(&c.values, c.code_0000 as u32).expect("values"),
+                ));
+            }
+            ColKind::Range => {
+                let (from, to) = c
+                    .range_from_to
+                    .as_ref()
+                    .expect("Range column needs range_from_to");
+                let xc = ex_code(&c.exists);
+                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector | 0x8000,
+                    0x16,
+                    from.len() as u32,
+                    encode_numeric(from, 0x16).expect("range from VLE"),
+                ));
+                rows.push((
+                    c.selector,
+                    0x11,
+                    to.len() as u32,
+                    encode_numeric(to, 0x11).expect("range to"),
+                ));
+            }
+            ColKind::SingleValue => {
+                let xc = ex_code(&c.exists);
+                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector,
+                    c.code_0000,
+                    c.values.len() as u32,
+                    encode_numeric(&c.values, c.code_0000 as u32).expect("values"),
+                ));
+            }
+            ColKind::Binary => {
+                rows.push((
+                    c.selector,
+                    0x01,
+                    c.bits.len() as u32,
+                    exist_bytes(&c.bits, 0x01),
+                ));
+            }
+            ColKind::EmptyByteList => {
+                // stock POL shape: `0x02` existence with 0 bytes, then `0x11`/`0x11` with param 0.
+                rows.push((c.selector | 0x4000, 0x02, c.domain, Vec::new()));
+                rows.push((c.selector | 0x8000, 0x11, 0, Vec::new()));
+                rows.push((c.selector, 0x11, 0, Vec::new()));
+            }
         }
     }
     let n = rows.len() as u16;
@@ -123,11 +188,13 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
     out
 }
 
-/// Build `LID4nnnn` bytes. Header layout (reader `gen_attr_toc`/`DecodeSubHeader`): `u32 hdr` at
-/// `f[0x10]`; the sub-header lives **at `hdr`** = `{u32 elem_count, u32 x, u32 toc_count, u32 other}`,
-/// then `hdr+16` = `toc_count × {u32 elem_start,u32 elem_end,u32 block_off(absolute file offset)}`.
-/// `outer` = an existing file's first `hdr+16` bytes, reused verbatim; pass `&[]` for a fresh file (a
-/// zero `[0..16]`, `hdr=16`, sub-header built from `elem_count` + the block list).
+/// Build `LID4nnnn` bytes. Header layout (reader `gen_attr_toc`/`DecodeSubHeader` `00e0e3d0`):
+/// `u32 hdr` at `f[0x10]`; the sub-header lives **at `hdr`** = `{u32 elem_count, u32 x = total block
+/// bytes (= filesize − first block_off), u32 toc_count}`, then the `NLBlockTocEntry` table **at
+/// `hdr+12`** = `toc_count × {u32 block_off (absolute), u32 elem_start, u32 elem_end}` (this is the
+/// field order `GetBlockDescr` 00e0dd4c consumes; the last block runs to EOF). `outer` = an existing
+/// file's first `hdr+16` bytes, reused verbatim; pass `&[]` for a fresh file (a zero `[0..16]`,
+/// `hdr=16`, sub-header built from `elem_count` + the block list).
 pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData]) -> Vec<u8> {
     let hdr = if outer.len() >= 0x14 {
         u32(outer, 0x10) as usize
@@ -135,7 +202,7 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
         0x20
     };
     let toc_bytes = 12 * blocks.len();
-    let toc_size = 16 + toc_bytes; // sub-header(16) + TOC at hdr
+    let toc_size = 16 + toc_bytes; // sub-header + TOC (table starts at hdr+12, pads to hdr+16+12n)
     let blocks_off = ((hdr + toc_size + 3) & !3).max(hdr + toc_size);
     let mut out: Vec<u8> = vec![0u8; hdr + toc_size]; // sub-header + TOC region; blocks appended below
                                                       // Reuse outer's [0..hdr] (outer container fields incl the `hdr` pointer @0x10) if provided.
@@ -143,26 +210,21 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
     out[..reuse].copy_from_slice(&outer[..reuse]);
     out[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
     out[0x14..0x18].copy_from_slice(&(hdr as u32 + toc_size as u32).to_le_bytes()); // sub-header region size
-                                                                                    // Sub-header @hdr: elem_count, x (reuse or 0), toc_count, other (reuse or 0).
-    if outer.len() >= hdr + 16 {
-        out[hdr..hdr + 4].copy_from_slice(&outer[hdr..hdr + 4]);
-        out[hdr + 4..hdr + 8].copy_from_slice(&outer[hdr + 4..hdr + 8]);
-        out[hdr + 8..hdr + 12].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
-        out[hdr + 12..hdr + 16].copy_from_slice(&outer[hdr + 12..hdr + 16]);
-    } else {
-        out[hdr..hdr + 4].copy_from_slice(&element_count.to_le_bytes());
-        out[hdr + 8..hdr + 12].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
-    }
+                                                                                     // Sub-header @hdr: elem_count, x (reuse or computed), toc_count.
+    out[hdr..hdr + 4].copy_from_slice(&element_count.to_le_bytes());
+    out[hdr + 8..hdr + 12].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
     // Blocks.
     let block_bytes: Vec<Vec<u8>> = blocks.iter().map(build_block).collect();
     let mut bo = blocks_off;
     for (i, blk) in blocks.iter().enumerate() {
-        let p = hdr + 16 + 12 * i;
-        out[p..p + 4].copy_from_slice(&blk.elem_start.to_le_bytes());
-        out[p + 4..p + 8].copy_from_slice(&blk.elem_end.to_le_bytes());
-        out[p + 8..p + 12].copy_from_slice(&(bo as u32).to_le_bytes());
+        let p = hdr + 12 + 12 * i;
+        out[p..p + 4].copy_from_slice(&(bo as u32).to_le_bytes());
+        out[p + 4..p + 8].copy_from_slice(&blk.elem_start.to_le_bytes());
+        out[p + 8..p + 12].copy_from_slice(&blk.elem_end.to_le_bytes());
         bo += block_bytes[i].len();
     }
+    let total: usize = block_bytes.iter().map(|b| b.len()).sum();
+    out[hdr + 4..hdr + 8].copy_from_slice(&(total as u32).to_le_bytes());
     out.resize(blocks_off, 0);
     for bb in &block_bytes {
         out.extend_from_slice(bb);

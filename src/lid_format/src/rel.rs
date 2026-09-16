@@ -247,7 +247,8 @@ fn encode_positions(pos: &[u32]) -> Vec<u8> {
 }
 
 /// Build a `REL` file relating `src_elems` source to `tgt_elems` target elements;
-/// `list_a`/`list_b` are the side ids stored in the sub-header.
+/// `list_a`/`list_b` are the side ids stored in the sub-header. Uniform device-style grid
+/// (`d4 = d5 = REL_BAND`, groups sized to ≈`REL_CELL_BANDS` bands per matrix cell).
 pub fn write_rel(
     src_elems: u64,
     tgt_elems: u64,
@@ -255,17 +256,40 @@ pub fn write_rel(
     list_b: u16,
     rels: &[(u32, u32)],
 ) -> Result<Vec<u8>, String> {
+    let src_bands = src_elems.div_ceil(REL_BAND);
+    let tgt_bands = tgt_elems.div_ceil(REL_BAND);
+    let d6 = src_bands.div_ceil(REL_CELL_BANDS);
+    let d7 = tgt_bands.div_ceil(REL_CELL_BANDS);
+    write_rel_grid(src_elems, tgt_elems, list_a, list_b, REL_BAND, REL_BAND, d6, d7, rels)
+}
+
+/// `write_rel` with the **explicit device grid** (`d4`/`d5` elements per source/target band,
+/// `d6`/`d7` stored matrix dims) — the grid author tools actually pick per file (stock
+/// `REL00004` uses `380/806/20/10`), which the byte-exact stock oracles compare against.
+pub fn write_rel_grid(
+    src_elems: u64,
+    tgt_elems: u64,
+    list_a: u16,
+    list_b: u16,
+    d4: u64,
+    d5: u64,
+    d6: u64,
+    d7: u64,
+    rels: &[(u32, u32)],
+) -> Result<Vec<u8>, String> {
     if src_elems == 0
         || tgt_elems == 0
+        || d4 == 0
+        || d5 == 0
+        || d6 == 0
+        || d7 == 0
         || src_elems > u64::from(u32::MAX) / 2
         || tgt_elems > u64::from(u32::MAX) / 2
     {
         return Err("rel: element count out of range".to_string());
     }
-    let src_bands = src_elems.div_ceil(REL_BAND);
-    let tgt_bands = tgt_elems.div_ceil(REL_BAND);
-    let d6 = src_bands.div_ceil(REL_CELL_BANDS);
-    let d7 = tgt_bands.div_ceil(REL_CELL_BANDS);
+    let src_bands = src_elems.div_ceil(d4);
+    let tgt_bands = tgt_elems.div_ceil(d5);
     if d6 >= 0x10000 || d7 >= 0x10000 {
         return Err("rel: grid too large".to_string());
     }
@@ -290,7 +314,7 @@ pub fn write_rel(
         if s >= src_elems || t >= tgt_elems {
             return Err(format!("rel: pair ({s},{t}) out of range"));
         }
-        let (sb, tb) = (s / REL_BAND, t / REL_BAND);
+        let (sb, tb) = (s / d4, t / d5);
         let (rowg, colg) = (sb / bpr, tb / bpc);
         let g = colg * d6 + rowg;
         let (rows, _, _) = tcs_of(g);
@@ -298,7 +322,7 @@ pub fn write_rel(
         // position is band-pair relative: src = rowBase + pos % d4, tgt = colBase + pos / d4
         runs[g as usize].push((
             ci as usize,
-            ((t % REL_BAND) * REL_BAND + s % REL_BAND) as u32,
+            ((t % d5) * d4 + s % d4) as u32,
         ));
     }
 
@@ -371,8 +395,8 @@ pub fn write_rel(
         u32::from(list_b),
         src_elems as u32,
         tgt_elems as u32,
-        REL_BAND as u32,
-        REL_BAND as u32,
+        d4 as u32,
+        d5 as u32,
         d6 as u32,
         d7 as u32,
         tiles_total as u32,
@@ -470,5 +494,50 @@ mod tests {
         let r = get_relations(&b, &idx, true, 0, 40).unwrap();
         assert!(!r.is_empty());
         assert!(r.iter().all(|&(s, t)| s < 40 && t < idx.d[3]));
+    }
+
+    /// EQUIVALENCE oracle: every stock `REL` file re-emitted from its *decoded pairs* through
+    /// `write_rel_grid` with the file's own grid must decode back to exactly the same relation set.
+    /// BYTE equality is deliberately NOT asserted: stock tiles carry author-exporter artifacts —
+    /// the last table cell's window often runs past its own stream into a duplicated/shifted
+    /// continuation of neighbouring band data (observed: final windows of 1, 2 or 2× length with
+    /// constant position offsets; content beyond the cell's band is tolerated/redecoded by the
+    /// device as real relations). Our writer emits the minimal spec-faithful encoding instead.
+    #[ignore = "requires the stock card dump"]
+    #[test]
+    fn rel_stock_roundtrip_equivalence() {
+        let dir = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/";
+        for name in [
+            "REL00000.DAT",
+            "REL00001.DAT",
+            "REL00002.DAT",
+            "REL00003.DAT",
+            "REL00004.DAT",
+            "REL00006.DAT",
+        ] {
+            let b = std::fs::read(format!("{dir}{name}")).unwrap();
+            let idx = RelIndex::parse(&b).unwrap();
+            let mut rels = get_relations(&b, &idx, true, 0, idx.d[2]).unwrap();
+            rels.sort_unstable();
+            rels.dedup();
+            let mine = write_rel_grid(
+                u64::from(idx.d[2]),
+                u64::from(idx.d[3]),
+                idx.d[0] as u16,
+                idx.d[1] as u16,
+                u64::from(idx.d[4]),
+                u64::from(idx.d[5]),
+                u64::from(idx.d[6]),
+                u64::from(idx.d[7]),
+                &rels,
+            )
+            .unwrap_or_else(|e| panic!("{name}: write failed: {e}"));
+            let stock = get_relations(&b, &idx, true, 0, idx.d[2]).unwrap();
+            let midx = RelIndex::parse(&mine).unwrap_or_else(|e| panic!("{name}: reparse: {e}"));
+            assert_eq!(midx.d[..8], idx.d[..8], "{name}: sub-header differs");
+            assert_eq!(midx.region, idx.region, "{name}: region differs");
+            let mine_r = get_relations(&mine, &midx, true, 0, idx.d[2]).unwrap();
+            assert_eq!(mine_r, stock, "{name}: decoded relation sets differ");
+        }
     }
 }

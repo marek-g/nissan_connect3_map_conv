@@ -28,6 +28,10 @@ pub const KIND_NAME_LIST: u32 = 1;
 pub const KIND_GEN_ATTR: u32 = 3;
 /// REL relation matrix.
 pub const KIND_REL: u32 = 6;
+/// `PA_%05u` container class stored at header `u32@0x0c`. No stock card ships a PA file, so the
+/// author's value is unobservable; `NLFileBase::LoadHeader` does not read this field (the consumer
+/// class is chosen by the caller), authoring `5` is a documented choice. [OPEN]
+pub const KIND_PA: u32 = 5;
 
 /// Total outer header length; every stock NL file splits at this offset.
 pub const NL_HEADER_LEN: usize = 0x77;

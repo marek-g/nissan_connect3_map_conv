@@ -502,8 +502,9 @@ primitives:
 `enDecodeHnr` calls these columns in a fixed order (offsets above). **Status: the GenAttr *container +
 TOC + block interior* are now decoded** (`NLGenAttrFile` container + `NLGeneralAttributeBlock` descriptors +
 attr-vector streams — `src/lid_format::{read_gen_attr, GenAttrIndex::decode_block}`, validated against
-`POL/LID40006` block 0, `#[test] gen_attr_stock_block0_decodes`). What remains is the **HNR writer** and the
-on-device pattern-matching (`NLHnrToTree` / `NLHnrVerification` `00ce76a8`) semantics, which cannot be run here.
+`POL/LID40006` block 0, `#[test] gen_attr_stock_block0_decodes`). The **HNR writer** is done (§12.10); the
+on-device pattern-matching (`NLHnrToTree` / `NLHnrVerification` `00ce76a8`) semantics still cannot be run
+here — card validation pending.
 
 **Stream framing + byte-exact write proof (2026-09, `LID_format.md §11.6` / `src/lid_format/src/rebuild.rs`).**
 `SetDataBlock` is *streaming*: a descriptor row `i`'s **byte span is `[off[i], off[i+1])` in table-row order**
@@ -514,15 +515,14 @@ Dispatch is by `kind & 0xfff` (vector slot — cols 1/2/4/5→CellId, 1/0xc01/0x
 >0xc13→ValueList\<pair\>) and `kind & 0xf000` is that vector's *member* selector, **not** a separate codec —
 and a numeric stream's `code` is always ≥ `0x11` while bitfields (`0x01` dense/`0x02` sparse-set/`0x03`
 sparse-clear) use `0x01-0x03`. **Proof the encoders are byte-faithful (no card needed):** ignored test
-`gen_attr_stock_rebuild_byte_exact` rebuilds **every byte** of `POL/LID40006`'s 27 MB across **all 133
-readable blocks** from our decoded values (the descriptor table + inter-region padding are preserved
-verbatim; the 134th TOC entry's `block_off` `0x4c010031`≈1.275e9 is past EOF — the device can't read it
-either, so the oracle skips it). Confirmed encoders: raw-u32 (`0x11`), VLE (`0x14`), cumulative-VLE delta
+`gen_attr_stock_rebuild_byte_exact` rebuilds **every byte** of `POL/LID40006`'s 27 MB across **all 134
+blocks** from our decoded values (the descriptor table + inter-region padding are preserved verbatim). Confirmed encoders: raw-u32 (`0x11`), VLE (`0x14`), cumulative-VLE delta
 (`0x16`), Simple9 greedy-largest-count (`0x18`, mode table `1:(28,1)…9:(1,28)` matches author exactly),
 run/boundaries (`0x12` u32 / `0x15`,`0x17` VLE of run-ending boundaries), bitmap (`0x01` LSB-dense / `0x02`
 sparse-set / `0x03` sparse-clear, both as delta-VLE over `param` bits). So *emitting* our data through these
- same encoders yields device-correct bytes; only choosing each column's `param`/`off` + the street↔record join
-for OSM `addr:housenumber` remains (see §11.8).
+same encoders yields device-correct bytes. (The earlier "133 readable blocks / 134th entry past EOF" note was
+an artifact of the `hdr+16` mis-grouping described below — under the correct `hdr+12` grouping **all 134**
+blocks rebuild byte-exact.)
 
 **GenAttr *writer* + join model derived from firmware (2026-09, `src/lid_format/src/write.rs` + reader).**
 **Column→vector dispatch — CONFIRMED from `NLGeneralAttributeBlock::SetDataBlock` `00e09b60`** (desc
@@ -540,23 +540,21 @@ existence domain = `GetNumberOfExistenceFlags` bound in `enGetHnr`); `0xc12` →
 +0xc ref (0xc02), +0x18 parity status (0xc09+0xc0a+0xc0b+0xc0d bits), +0x1c range (0xc10, -1 default) }`
 — the earlier note claiming `0xc01` carried *address element ids* and `0xc0c` the number range was a pre-
 dispatch guess and is **wrong** (there is no col `0xc` in stock files at all). Stock `POL/LID40006`
-block 0 verifies the shape bit-exactly: 4027-bit owner domain (876 set) ↔ 876 start offsets ↔ 10886 flat
-house numbers; the five parity Bin columns are 10886-bit (per **record**).
+block 0 verifies the shape (under the corrected TOC grouping — see below): 7904-owner domain (sparse-set
+bitmap, 777 owners set) ↔ 777 start offsets ↔ 9665 flat house numbers; the five parity Bin columns are
+9665-bit (per **record**).
 `lid2dump --sqlite` therefore exports stock hnrs as one row per record: `hnr.elem` = file-wide record
 ordinal, `addr_to_street` = `elem_start + owner`, `house_number` = the `0xc01` value (a synthetic
 `osm2lid` file with legacy `0x002`/`0x00c` tertiary rows keeps the old per-element shape — the legacy
 branch wins any file carrying those columns). Param rule (author): `flag 4000`.param = *domain* (existence
 bit count), `flag 8000`.param = Σ/total or #exist, `flag 0000`.param = #values; each member's *own* `8000`
 param equals its `4000` popcount. The synthetic
-`#[test] gen_attr_writer_roundtrip_device_model` writes 2 tiling blocks and asserts, on re-parse,
-`rebuild_all` byte-equality **and** the enGetHnr/enGetOwner-style member lookups return the exact encoded
-street→addr / addr→number / addr→street answers. **Writer TODO (unmasked by this dispatch):** the synthetic
-`osm2lid` GenAttr columns are the old guess-layout and do NOT match the device reading above — rewrite it
-to `0xc01` numbers-per-street + `0xc02` refs + `0xc09..0xc0d` per-record parity before the card test.
-**Still needs** the OSM-→element join in `osm2lid`: map each
-`addr:housenumber` point is now wired: `osm2lid` collects those objects, joins them to **the street**
-`LID20006` element named by `addr:street`, and feeds `BlockData{0xc01 street→addr elem, 0x002 addr→street
-Range, 0x00c number Range(from=to=num), 0xc0a parity bits}` to `write_gen_attr_file` (§11.6b end / §12.10).
+`#[test] gen_attr_writer_roundtrip_device_model` uses the *device* layout (street domain = TOC width, `0xc01`
+numbers-per-street, `0xc02` SV refs, `0xc11` gate, `0xc09/0c0a` parity, empty `0xc03..06` string VLs) and
+asserts, on re-parse, `rebuild_all` byte-equality **and** `enGetHnrIndices`/`enGetHnr`-style lookups returning
+the street→numbers / record→`NLHnr` answers. `osm2lid` writes this same device layout (the old
+`0x002`/`0x00c` guess-layout TODO is done; files carrying those legacy tertiary rows still decode via the
+legacy branch).
 Stock keyed some of these columns through **LID3 crossing** element/owner-descr ids we do not generate; the
 author join semantics on-device (`NLHnrToTree`) are unverifiable without the card, so our columns are the
 reader-consistent subset validated offline: 5 `gen_attr_*` tests (rebuild oracle + device read-model) and
@@ -570,26 +568,59 @@ shared, but GenAttr files are parsed by `NLGenAttrFile::DecodeSubHeader` (`00e0e
 `NLNameList::LoadHeader` — which is why the name-list section-table decode returned garbage on them. Real
 layout (verified on `POL/LID40006`):
 ```
-@hdr(=u32@0x10):  u32 elem_count, u32 x, u32 toc_count, u32 other_count   (other_count=1739 here)
-@hdr+16:          toc_count × NLBlockTocEntry { u32 elem_start, u32 elem_end, u32 block_off }
-                  (element ranges tile [0, elem_count) contiguously — the reliable GenAttr signal)
+@hdr(=u32@0x10):  u32 elem_count, u32 x, u32 toc_count        (3×u32 per DecodeSubHeader 00e0e3d0)
+                  x = filesize − block_off[0]  (Σ block byte sizes; NOT reusable from header)
+@hdr+12:          toc_count × NLBlockTocEntry { u32 block_off, u32 elem_start, u32 elem_end }
+                  (element ranges tile [0, elem_count) contiguously — the reliable GenAttr signal;
+                   block byte size = block_off[i+1] − block_off[i], last = EOF — per GetBlockDescr
+                   00e0dd4c + NLFileBase block loader / bProcBlocksForElemIndices 00ce5f30)
 @block_off:       NLGeneralAttributeBlock: u16 num_desc (=0x31 in block 0, the `31 00`), then num_desc ×
                   12-byte {u16 kind,u16 code,u32 off,u32 param} descriptors, then column data. No trie.
 ```
-`POL/LID40006`: `elem_count = 974 871` (**numerically identical to street base `LID20006`**),
-`toc_count = 134` blocks covering ranges `0..974 870`, `block_off ≈ 206 KB` apart. `src/lid_format` detects
-this via `is_gen_attr` (validated contiguous tiling), indexes it with `read_gen_attr`, and decodes each block's
-column streams with `GenAttrIndex::decode_block`. Note the block columns index a *record* space whose per-block
-count is the descriptors' `param` (e.g. block 0 bitmaps are `10886` bits) — which can exceed the TOC range size
-(`0..7903`); the owner VectorList column `0xc01` (values ascending within the block range, e.g. `2,2,3,6,7,11,…`)
-joins each record → its street element. The per-street **HNR record↔element join** and `NLHnrToTree`
-pattern semantics are the last thing not pinned (the on-device matcher cannot be run here).
+> **Byte-level proof of the `hdr+12` grouping:** the descriptor-table sizes are stored by the decoder into
+> `u16`s; `u16@0xE3(=227)` and `u16@0x6CB(=1739)` in `POL/LID40006` both read `49` = block 0's `num_desc`,
+> which is only consistent when entry 0 is `(off=1739, es=0, ee=7904)` at `hdr+12`. Grouping from `hdr+16`
+> as `(es,ee,off)` — an earlier wrong reading of this doc — makes every block read the *next* block's byte
+> window (a systematic −4-byte shift: "range 0..7904 vs 876 owners", "last entry 0x4c010031 past EOF",
+> record count `= next block's param`) and mis-attributes one block's street numbers to the previous block.
+`POL/LID40006`: `elem_count = 974 871` (**numerically identical to street base `LID20006`**), domain per block
+= its TOC width (block 0 = 7904; `0xc01/0x4000` sparse-set bitmap `param = 7904`, 777 owners set; record
+count = `param` of the value row, e.g. `9665`), `toc_count = 134` blocks covering ranges `0..974 870`,
+`block_off ≈ 206 KB` apart. `src/lid_format` detects this via `is_gen_attr` (validated contiguous tiling),
+indexes it with `read_gen_attr`, and decodes each block's column streams with `GenAttrIndex::decode_block`
+(bitmap `0x02`/`0x03` counts come from `param`, never from byte span). The owner VectorList column `0xc01`
+(starts ascending within the block range — ABS ranges, first = 0 — values = owner element offsets) joins
+each record → its street element; `0xc02` (SV) = reference id, `0xc11` = existence gate, `0xc09/0c0a` =
+even/odd parity bits per record, `0xc03..06` = HNR string VLs (`enGetHnr` `00e0d078` decodes all four;
+stock POL ships them empty). The on-device `NLHnrToTree` matcher cannot be run here — the offline device
+read-model (`gen_attr_writer_roundtrip_device_model`) replays `enGetHnrIndices`/`enGetHnr` only.
 
 ### 11.7 `PA_%05u` (point addresses) and `REL_%05u` (relations)
 
-- `PA` (fileType 0x18, `NLPABlock::SetDataBlock` `00e0f0b4` / `bDecodeLists` `00e0f824`): columns
-  owner-street-elem (`0xd04` SimpleList<u32>), flags (`0xd05/6`), **HNR value** (SimpleList<u8>), and an exact
-  `NLPositionAttrVector` → resolves a house number to a real coordinate (no interpolation).
+- `PA` (fileType 0x18, `bGetFileNameFromDataAddress 00bc4d54` → `PA_%05u` keyed by the **base** name-list
+  fileID — street list ⇒ `PA_20006.DAT`; `poGetNewPAProcessor 00bd3f9c`): per street element an access
+  point. Sub-header at the split: `{u32 domain, u32 0, u16 coord_mode, u16 group_count≤3}`, then groups of
+  16 B `{u16 kind 0xd01..0xd03, u16 flags, u32 table_off FILE-ABS, u32 count, u32 span}`
+  (`DecodeSubHeader 00ce012c`, bounds via `FillBlockDescription 00ce0078`); block ranges replay
+  `GetBlockDescr 00cdfa14` (first `[0, w0−1]`, then `end += w`, size = next_off − off, last `span + first − off`).
+  **DETAIL group `0xd03` keyed by STREET element** (`bGetPACells 00be072c` → `bGetDetails 00ce98f0` →
+  `NLPADetailBlock::SetDataBlock 00e0f8c4` / `bDecodeLists 00e0f824`): block = `u32 width, u16 ndesc`,
+  `ndesc` × **packed 11-byte descriptors** `{u16 kind, u8 code, u32 off BLOCK-rel, u32 param}` with columns
+  `0xd0b` cell `SimpleList<u32>`, `0xd0c/0xd0d` left/right side `Binary`, `0xd0e` ratio `SimpleList<u8>`
+  (= %; device NLHnr status pct·255/100), `0xd0f` position = existence bitvector + `NLPositionAttrVector`
+  **relative PAU** — the device ADDS the street element's own name-list position (`bGetRelPosition` of −1 ⇒
+  fall back to interpolation, i.e. PA absence is graceful). Reader+writer+device-model: `src/lid_format/src/pa.rs`.
+  **[OPEN] / status:** no `PA_*.DAT` exists on ANY stock card (fileType 0x18 never observed; devices always
+  interpolate), so the writer ships cell 0 / ratio 100 / pos = lowest numeric address − street anchor and is
+  validated only against the device model replayed in tests — card test pending.
+- **REL tile tail artifact (measured, stock POL):** the LAST table cell's window frequently runs past its own
+  stream into a duplicated/shifted continuation of neighbouring band data (final windows of 1×, 2× or odd
+  extra words — REL00006 tiles: tail = own stream bytes twice; REL00000: own + constant-shifted copy;
+  REL00001/2/4: irregular ≤ a few words). This is an exporter artifact the device tolerates (it decodes them
+  as additional in-range relations); `osm2lid`/`write_rel_grid` emit the minimal spec-faithful encoding
+  instead, so **byte-equality with stock is impossible by design** — the `#[ignore]` oracle
+  `rel_stock_roundtrip_equivalence` instead verifies decode(write(decode)) == decode for all 6 stock files
+  (sub-header + region byte-identical, tile blob only shorter).
 - `REL` (fileType 0x16, `LISA_tclDataManager::bGetFileNameFromDataAddress` `00bc4dd0`; +90000 variant for
   cross-domain): a **sparse blocked relation matrix**. `NLRelMatrixFile::DecodeSubHeader` `00e11874` reads
   **9 consecutive u32** at the region start (file `u32@0x10` = header size 0x77, `u32@0x14` = region size):
@@ -870,18 +901,23 @@ gazetteer, which itself links 8–38 times per block and starts trees `f2` up to
 collects `addr:housenumber` objects (nodes or building/entrance ways; the street comes from `addr:street`,
 falling back to `addr:place`) that land within `--bbox`, keeps **numeric** numbers only (the authoring tool
 too dropped suffixed/compound numbers such as `11A` — they cannot live in the `u32` number column), and joins
-each to the *same* street-element order as `LID20006.DAT`. It chunks the address records
-(`HN_ATTR_CHUNK`=8192, adaptive so even tiny inputs emit the ≥ 2 TOC blocks the container requires) and writes
-the four device columns: `0xc01`(+0x28) street→address **element-list** (existence `4000` over the used-street
-domain, cumulative `8000`, `0000` element ids in sorted-street order), `0x002`(+0x7c) address→street (Range
-from/to = street id), `0x00c`(+0x300) the house **number** (Range from/to = the number; `8000`=VLE-delta of
-the froms so their decode-cumulatives are exact, `0000`=raw-u32 tos), and `0xc0a`(+0x280) per-address
-**parity** (even-number bit ride in the column's existence bitmap). Validation is offline (no card in the
-loop): `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle over `POL/LID40006` + device read-model
-round-trip) and `osm2lid/tests/genattr.rs`, which runs the real binary on a tiny fixture and re-reads every
-column with `read_gen_attr`/`decode_block` (it also pins the §12.5 city-relative coordinates and the
-element-order street ids). **Still pending:** `PA`, crossing files (+10000), and writing `REL` (its container
-is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matcher itself cannot be run here.
+each to the *same* street-element order as `LID20006.DAT`. Element domain = the **street elements**
+(`0..nst`, chunked `HN_ATTR_CHUNK`=8192; ≥ 2 TOC blocks the container requires; empty blocks still emit the
+`0xc01` triple so tiling never breaks) and writes the device column set (§11.6b): `0xc01`(+0x28)
+house-number list per street (`4000` existence bitmap over the block's street-domain width, `8000` cumulative
+starts, `0000` the numbers), `0xc02`(+0x7c) SV ref = owning street element, `0xc11`(+0x380) gate
+existence domain = record count (bounds every `enGetHnr`), `0xc09/0c0a`(+0x260/0x280) even/odd parity bits
+per record, `0xc0b/0c0d` zero binaries, `0xc03..0xc06` empty byte-VLs (stock-`POL` shape — decoder must still
+find all four). Validation is offline (no card in the loop): `lid_format`'s `gen_attr_*` tests (byte-exact
+rebuild oracle over **all 134 blocks** of `POL/LID40006` + device read-model round-trip) and
+`osm2lid/tests/genattr.rs`, which runs the real binary on the real fixture, re-reads every column, and
+replays `enGetHnrIndices`/`enGetHnr` semantics. `osm2lid` also writes **`PA_20006.DAT`** (§11.7 — one access
+point per street element, `pos` = lowest numeric address − name-list anchor, cell 0 / ratio 100; disabled
+with `--no-pa`) and **`REL00001.DAT`** (street↔city, stock grid via `write_rel_grid`; the `#[ignore]`
+`rel_stock_roundtrip_equivalence` oracle proves decode(write(decode)) == decode for all 6 stock REL files —
+byte equality is impossible because stock tails carry the exporter artifact, see §11.7). **Still pending:**
+crossing files (+10000) and an own META writer; the on-device `NLHnrToTree` matcher and
+any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card test pending**.
 
 > **Corrected decoder notes (were wrong in earlier revisions):**
 > - **Simple9 mode→(count,bits)** (from `DecodeSimple9` `00cdc3bc`/`00cdc908`, values LSB-first, mode nibble
@@ -919,10 +955,12 @@ is decoded §11.7, generation not implemented); the on-device `NLHnrToTree` matc
    `LID20006.DAT`, listID 3), **city name-list** (OSM `place=` → `LID20001.DAT`, listID 2), the **house-number
    GenAttr** (`LID40006.DAT`, §11.6/§11.6b) and the **street→city relation `REL00001.DAT`** (street element ↔
    anchor-city element; stock-numbered: META0000 relation entry #1 = (2↔3) — ship the stock META0000.DAT
-   unchanged and the device finds the file). All files carry the canonical 0x77 outer header with their
-   `rIdxListID` identity (`lid_format::header`, byte-verified against stock); `osm2lid/tests/genattr.rs`
-   asserts identities + REL matrix end-to-end. **Nothing is on-device-validated yet — first card test pending.**
-   **Still pending:** point-address `PA`, crossing files (+10000), own META writer,
+   unchanged and the device finds the file), plus the **point-address `PA_20006.DAT`** (§11.7/§12.10 — access
+   points for houses; device-fallback-safe). All files carry the canonical 0x77 outer header with their
+   `rIdxListID` identity (`lid_format::header`, byte-verified against stock); `osm2lid/tests/genattr.rs` and
+   `osm2lid/tests/point_addr.rs` assert identities + REL matrix + PA device-walk end-to-end.
+   **Nothing is on-device-validated yet — first card test pending.**
+   **Still pending:** crossing files (+10000), own META writer,
    and on-device acceptance (`NLHnrToTree` against a real card).
 
 > The trie **structure** (forest, `f2` trees/block, cross-block `0x402` link-DAG naming), **element order +

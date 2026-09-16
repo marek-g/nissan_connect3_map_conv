@@ -84,6 +84,7 @@ fn main() {
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
     let mut no_poi = false;
     let mut no_genattr = false;
+    let mut no_pa = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -105,6 +106,7 @@ fn main() {
             }
             "--no-poi" => no_poi = true,
             "--no-genattr" => no_genattr = true,
+            "--no-pa" => no_pa = true,
             "-h" | "--help" => {
                 usage();
                 exit(0);
@@ -167,8 +169,7 @@ fn main() {
     );
     let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
     let (ncit, city_idx) = write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2);
-    let (st_entries, city_of) = collect_street_entries(&data, bbox);
-    let (nst, street_idx) =
+    let (st_entries, city_of) = collect_street_entries(&data, bbox);    let (nst, street_idx) =
         write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
     let nrel = write_street_city_rel(
         &outdir.join("REL00001.DAT"),
@@ -177,6 +178,19 @@ fn main() {
         &street_idx,
         &city_idx,
     );
+    let npa = if no_pa {
+        0
+    } else {
+        write_pa(
+            &outdir.join("PA_20006.DAT"),
+            &data,
+            bbox,
+            &st_entries,
+            &street_idx,
+            nst,
+            region_id,
+        )
+    };
     let naddr = if no_genattr {
         0
     } else {
@@ -185,16 +199,17 @@ fn main() {
             &data,
             bbox,
             &street_idx,
+            nst,
             region_id,
         )
     };
 
     eprintln!(
-        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), REGION_ID=0x{:03x} ({})",
-        out, npoi, ncity, ncit, nst, nrel, naddr, region_id, region.to_uppercase()
+        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), PA_20006.DAT ({} access points), REGION_ID=0x{:03x} ({})",
+        out, npoi, ncity, ncit, nst, nrel, naddr, npa, region_id, region.to_uppercase()
     );
     eprintln!("NOTE: ship the stock META0000.DAT unchanged — its relation table entry #1 is (2↔3), which is what REL00001.DAT carries.");
-    eprintln!("NOTE: crossing (+10000) and point-address (PA) tables are not generated yet — see LID_format.md §12.");
+    eprintln!("NOTE: crossing (+10000) tables are not generated yet — see LID_format.md §12. PA file card-test pending (no stock PA sample exists on any card).");
 }
 
 fn usage() {
@@ -204,7 +219,8 @@ fn usage() {
         \t--lang 22      LANG_IDX tag written on GLOB_POI rows (language index)\n\
         \t--bbox W,S,E,N keep only entries within this lon/lat box\n\
         \t--no-poi       skip amenity/shop/tourism POIs (cities only)\n\
-        \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file"
+        \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file\n\
+        \t--no-pa        skip the PA_20006.DAT point-access-point file"
     );
 }
 
@@ -665,119 +681,143 @@ fn hnr_number(s: &str) -> Option<u32> {
     }
 }
 
-/// GenAttr house-number attribute block chunk size (elements per TOC block; stock ≈7300, 134 blocks).
+/// GenAttr house-number attribute block chunk size (street elements per TOC block; stock ≈4–19 k).
 const HN_ATTR_CHUNK: usize = 8192;
 
-/// Emit `LID40006.DAT` — the house-number GenAttr file (+20000, §11.6). One record element per
-/// numeric `addr:housenumber` joined to a street in `LID20006`; blocks chunk the element range and carry
-/// the four columns the device reads per record (`+0x28` 0xc01 street→addr, `+0x7c` 0x002 addr→street,
-/// `+0x300` 0x00c number range, `+0x280` 0xc0a parity bits) as existence/counts/values triples.
+/// Emit `LID40006.DAT` — the house-number GenAttr file (+20000, §11.6) in the **stock device
+/// layout** (`SetDataBlock 00e09b60` / `enGetHnrIndices 00e0c3a0` / `enGetHnr 00e0d078`, §11.6b):
+/// block element ranges tile the STREET name-list `0..nst`; `0xc01` (+0x28) = per-street house
+/// numbers (existence/offsets/values), `0xc02` (+0x7c) per-record ref (street elem id), `0xc03..
+/// 0xc06` empty per-record string lists (card requires them decodable), `0xc09/0xc0a/0xc0b/0xc0d`
+/// per-record parity bits, `0xc11` (+0x380) per-record existence domain (the `enGetHnr` gate).
+/// One record per numeric `addr:housenumber` joined to a street in `LID20006`.
 fn write_gen_attr(
     path: &Path,
     d: &Data,
     bbox: Option<(f64, f64, f64, f64)>,
     street_idx: &HashMap<String, u32>,
+    nst: usize,
     region: u16,
 ) -> usize {
-    use lid_format::write::{write_gen_attr_file, BlockData, ColData};
+    use lid_format::write::{write_gen_attr_file, BlockData, ColData, ColKind};
     use std::collections::BTreeMap;
 
-    // Address elements: keep only numeric numbers whose street is in the street name-list.
-    let mut addrs: Vec<u32> = Vec::new(); // addr elem id -> number; parallel `st_of` below
-    let mut st_of: Vec<u32> = Vec::new(); // addr elem id -> its street element id
+    // street element id -> its house numbers (numeric only, street present in the name-list, in bbox).
+    let mut by_street: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut nrec_all = 0usize;
     for (num, c, street) in &d.addrs {
-        let st = street.trim();
         if !in_bbox(*c, bbox) {
             continue;
         }
-        let Some(sid) = street_idx.get(st).copied() else {
+        let Some(sid) = street_idx.get(street.trim()).copied() else {
             continue;
         };
         let Some(n) = hnr_number(num) else { continue };
-        addrs.push(n);
-        st_of.push(sid);
+        by_street.entry(sid).or_default().push(n);
+        nrec_all += 1;
     }
-    let nel = addrs.len() as u32;
-    if nel < 2 {
+    if nst < 2 || nrec_all == 0 {
         return 0;
-    } // the file format is meaningless with < 2 records; GenAttr files need >=2 blocks
+    } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
 
-    // Adaptive chunking: always emit >= 2 blocks (the container's block-TOC requires a tiling of >= 2).
-    let chunk = HN_ATTR_CHUNK.min(nel.div_ceil(2) as usize).max(1);
-
-    // Street -> addr elements (global), ascending street -> ascending elem ids.
-    let mut by_street: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (e, &sid) in st_of.iter().enumerate() {
-        by_street.entry(sid).or_default().push(e as u32);
-    }
-    let all_streets: Vec<u32> = by_street.keys().copied().collect();
-    let nstreet = all_streets.len() as u32;
-    let is_st = |id: u32| all_streets.binary_search(&id).unwrap_or(usize::MAX);
-
+    // Always >= 2 blocks tiling [0, nst).
+    let nblk = (nst as usize).div_ceil(HN_ATTR_CHUNK).max(2);
+    let w = (nst as usize).div_ceil(nblk);
     let mut blocks = Vec::new();
-    for lo in (0..nel as usize).step_by(chunk) {
-        let hi = (lo + chunk).min(nel as usize);
-        // per-street slices within [lo,hi)
-        let mut counts = Vec::new();
-        let mut values = Vec::new();
-        let mut exists: Vec<bool> = vec![false; nstreet as usize];
-        for (&sid, elems) in &by_street {
-            let s = elems.partition_point(|&x| (x as usize) < lo);
-            let t = elems.partition_point(|&x| (x as usize) < hi);
-            if let Some(p) = all_streets.get(is_st(sid)) {
-                if *p != sid {
-                    continue;
-                } // unreachable; all_streets contains all keys
+    for lo in (0..nst as usize).step_by(w) {
+        let hi = (lo + w).min(nst as usize);
+        let width = (hi - lo) as u32;
+        let mut exists = vec![false; width as usize];
+        let mut offs: Vec<u32> = Vec::new();
+        let mut nums: Vec<u32> = Vec::new();
+        let mut refs: Vec<u32> = Vec::new();
+        let mut ev: Vec<bool> = Vec::new();
+        let mut od: Vec<bool> = Vec::new();
+        for (&sid, list) in by_street.range(lo as u32..hi as u32) {
+            exists[(sid - lo as u32) as usize] = true;
+            offs.push(nums.len() as u32);
+            let mut list = list.clone();
+            list.sort_unstable();
+            for &n in &list {
+                nums.push(n);
+                refs.push(sid);
+                ev.push(n % 2 == 0);
+                od.push(n % 2 == 1);
             }
-            exists[is_st(sid)] = t > s;
-            counts.extend(std::iter::repeat((t - s) as u32).take(1).filter(|_| t > s));
-            values.extend(&elems[s..t]);
         }
-        let nums = &addrs[lo..hi];
-        let parity = nums.iter().map(|&n| n % 2 == 0).collect::<Vec<_>>();
-        let streets_in_block = st_of[lo..hi].to_vec();
-        let cols = vec![
+        let nrec = nums.len();
+        let dom1 = |n: u32| ColData {
+            selector: 0xc11,
+            kind: ColKind::ValueList,
+            domain: n,
+            exists: vec![true; n as usize],
+            counts: (0..n).collect(),
+            values: (0..n).collect(),
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let bits_col = |selector: u16, bits: Vec<bool>| ColData {
+            selector,
+            kind: ColKind::Binary,
+            domain: nrec as u32,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits,
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        let es_col = |selector: u16| ColData {
+            selector,
+            kind: ColKind::EmptyByteList,
+            domain: nrec as u32,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits: vec![],
+            code_8000: 0x11,
+            code_0000: 0x11,
+            range_from_to: None,
+        };
+        let mut cols = vec![
             ColData {
                 selector: 0xc01,
-                domain: nstreet,
+                kind: ColKind::ValueList,
+                domain: width,
                 exists,
-                counts,
-                values,
+                counts: offs,
+                values: nums,
+                bits: vec![],
                 code_8000: 0x16,
                 code_0000: 0x14,
                 range_from_to: None,
             },
             ColData {
-                selector: 0x002,
-                domain: (hi - lo) as u32,
-                exists: vec![true; hi - lo],
+                selector: 0xc02,
+                kind: ColKind::SingleValue,
+                domain: nrec as u32,
+                exists: vec![true; nrec],
                 counts: vec![],
-                values: vec![],
-                code_8000: 0x16,
-                code_0000: 0x11,
-                range_from_to: Some((streets_in_block.clone(), streets_in_block)),
-            },
-            ColData {
-                selector: 0x00c,
-                domain: (hi - lo) as u32,
-                exists: vec![true; hi - lo],
-                counts: vec![],
-                values: vec![],
-                code_8000: 0x16,
-                code_0000: 0x11,
-                range_from_to: Some((nums.to_vec(), nums.to_vec())),
-            },
-            ColData {
-                selector: 0xc0a,
-                domain: (hi - lo) as u32,
-                exists: parity,
-                counts: vec![],
-                values: vec![],
+                values: refs,
+                bits: vec![],
                 code_8000: 0x16,
                 code_0000: 0x14,
                 range_from_to: None,
             },
+            dom1(nrec as u32),
+            bits_col(0xc09, ev),
+            bits_col(0xc0a, od),
+            bits_col(0xc0b, vec![false; nrec]),
+            bits_col(0xc0d, vec![false; nrec]),
+            es_col(0xc03),
+            es_col(0xc04),
+            es_col(0xc05),
+            es_col(0xc06),
         ];
+        cols.retain(|c| nrec > 0 || c.selector == 0xc01);
         blocks.push(BlockData {
             elem_start: lo as u32,
             elem_end: (hi - 1) as u32,
@@ -785,12 +825,101 @@ fn write_gen_attr(
         });
     }
     let outer = lid_format::header::nl_header(lid_format::header::KIND_GEN_ATTR, region, 3, 0);
-    let bytes = write_gen_attr_file(nel, &outer, &blocks);
+    let bytes = write_gen_attr_file(nst as u32, &outer, &blocks);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
         return 0;
     }
-    nel as usize
+    nrec_all
+}
+
+/// Point-address block width (street elements per DETAIL block; stock block sizes were ~k-10k).
+const PA_CHUNK: usize = 4096;
+
+/// Emit `PA_20006.DAT` — the point-address (fileType 0x18) sidecar of the STREET list: one access
+/// point per street element. Device model (§11.7b, `bGetPACells 00be072c` / `00e0f8c4`): DETAIL
+/// rows `0xd0b..0xd0f` = cell id / left / right / ratio / RELATIVE position; the device ADDS the
+/// street element's own name-list anchor, so we store `house − street_centroid`. `cell` and `ratio`
+/// existence bitmaps are all-set ([OPEN] NLCellID semantics unknown ⇒ neutral 0; ratio 100).
+/// Position only for streets that have a numeric address — every other element keeps `None`, and
+/// the device falls back to the anchor itself (= same result as shipping no PA file at all).
+fn write_pa(
+    path: &Path,
+    d: &Data,
+    bbox: Option<(f64, f64, f64, f64)>,
+    entries: &[lid_format::NameEntry],
+    street_idx: &HashMap<String, u32>,
+    nst: usize,
+    region: u16,
+) -> usize {
+    use lid_format::pa::{write_pa_file, PaDetailBlock, PaDetailEntry};
+    use std::collections::BTreeMap;
+
+    // street element -> lowest numeric address point (coords), if any.
+    let mut best: BTreeMap<u32, (u32, (i64, i64))> = BTreeMap::new();
+    for (num, c, street) in &d.addrs {
+        if !in_bbox(*c, bbox) {
+            continue;
+        }
+        let Some(sid) = street_idx.get(street.trim()).copied() else {
+            continue;
+        };
+        let Some(n) = hnr_number(num) else { continue };
+        match best.get(&sid) {
+            Some(&(bn, _)) if bn <= n => {}
+            _ => {
+                best.insert(sid, (n, *c));
+            }
+        }
+    }
+    if nst == 0 || best.is_empty() {
+        return 0;
+    }
+
+    let mut filled = vec![
+        PaDetailEntry {
+            cell: 0,
+            left: false,
+            right: false,
+            ratio: 100,
+            pos: None
+        };
+        nst
+    ];
+    let mut npa = 0usize;
+    for e in entries {
+        let Some(&sid) = street_idx.get(e.label.as_str()) else {
+            continue;
+        };
+        if sid as usize >= nst {
+            continue;
+        }
+        if let Some((_, (ax, ay))) = best.get(&sid) {
+            // relative PAU offset from the street anchor (the device adds the anchor back).
+            let dx = ax - i64::from(e.x_pau);
+            let dy = ay - i64::from(e.y_pau);
+            if i64::from(i32::MIN) <= dx && dx <= i64::from(i32::MAX)
+                && i64::from(i32::MIN) <= dy && dy <= i64::from(i32::MAX)
+            {
+                filled[sid as usize].pos = Some((dx as i32, dy as i32));
+                npa += 1;
+            }
+        }
+    }
+    let nblk = nst.div_ceil(PA_CHUNK);
+    let w = nst.div_ceil(nblk);
+    let blocks: Vec<PaDetailBlock> = (0..nblk)
+        .map(|i| PaDetailBlock {
+            entries: filled[i * w..((i + 1) * w).min(nst)].to_vec(),
+        })
+        .collect();
+    // coord_mode [OPEN]: bDecodeLists consumes it as a parameter; 0 = PAU (name-list flavour).
+    let bytes = write_pa_file(region, 3, nst as u32, 0, &blocks);
+    if fs::write(path, &bytes).is_err() {
+        eprintln!("write {path:?} failed");
+        return 0;
+    }
+    npa
 }
 
 /// Emit `REL00001.DAT` — the street↔city relation matrix the stock META0000 relation table expects at
