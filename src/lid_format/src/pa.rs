@@ -25,7 +25,10 @@
 //! cell id (`0xd0b` `SimpleList<u32>`), on-left (`0xd0c` Binary), on-right (`0xd0d` Binary),
 //! access-point ratio (`0xd0e` `SimpleList<u8>`, 0..100 %; the device NLHnr value = pct·255/100),
 //! and a RELATIVE position (`0xd0f` `NLPositionAttrVector`; `bGetPACells` ADDS the street element's
-//! own name-list position — so we store `house_pau − street_anchor_pau`). The cell/ratio existence
+//! own name-list position — so we store `house_pau − street_anchor_pau`). The `cell` value is NOT a
+//! global id: `bGetPACellIDs 00b898dc` feeds detail `+0x00` into `NLGenAttrProcessor::bGetCellOfBlock
+//! 00ce6458` → `enGetCells` of the street's own `+20000` block, so it must be a `0xc11` table ordinal
+//! of that street's GenAttr file (LID_format §11.6b). The cell/ratio existence
 //! bitmaps are written all-set (`0x03`, zero bytes): those two lists are indexed by *element*, so a
 //! sparse encoding would mis-rank them; the position bitmap is the only sparse one.
 

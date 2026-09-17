@@ -605,6 +605,16 @@ cross-cluster fixup nor the `.PTH` patch step in `u16PatchCluster` is triggered;
 enough for the reader to load and route within the region; it will not reproduce the original
 multi-cluster tiling, which is not needed for a conversion target.
 
+### Generator note: cluster identity and byte-determinism (`osm2rnw`)
+
+Cluster *numbering* (blob index in write order, `+1`) is only meaningful within one authoring
+toolchain: `osm2rnw` numbers clusters by the pop order of its bbox-quad-split stack DFS, and the
+GenAttr cell table in LID (`0x004` `global_id`, `LID_format.md` §11.6b) must agree — both
+generators therefore share the onecell walk / split / numbering code through the `rnw_model`
+crate (golden runs in `trials` guard it). `NAV*.DAT` output is byte-reproducible: the
+cluster-overlap emission order (`ci2`/`oc_ovl` records) iterates shared boundary nodes in sorted
+order — with raw `HashMap` iteration it used to vary between runs of the same binary.
+
 ## 12. Runtime RNW→MAP conversion ("FastMap") — how the two formats meet at run time
 
 An earlier note (in the chat record) said "RNW → MAP in the build pipeline." That was an

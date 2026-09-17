@@ -168,9 +168,11 @@ segment** the car can navigate to. The GenAttr file therefore also ships a per-b
 (one row per RNW *onecell* = a 2-node segment from an `osm2rnw`-style build, carrying its local and
 global/cluster ids) and a per-record **`0xc11` column** that points each house-number record at its
 segment's table row — one row shared by the even and odd side of the same segment
-(details + device call chain: `LID_format.md` §11.6b). `osm2lid` builds both sides itself: it
-replicates the `osm2rnw` segment walk and cluster split on the same OSM extract, so the generated
-`LID40006.DAT` and the road tiles index identical one-cell/cluster sets by construction. `lid2dump
+(details + device call chain: `LID_format.md` §11.6b). `osm2lid` builds both sides itself: both it
+and `osm2rnw` compute the segment walk and cluster split from the ONE shared crate `src/rnw_model`
+(`rnw_model`), so on the same OSM extract the generated `LID40006.DAT` and the road tiles index
+identical one-cell/cluster sets by construction — no LID→RNW file consultation is ever needed
+(same OSM + same `rnw_model` ⇒ identical cluster ids; golden byte-check required on model changes). `lid2dump
 --sqlite` decodes the tables (`block_cells`), the per-record joins (`cellmap`) and the per-record
 cell/side columns (`hnr`).
 

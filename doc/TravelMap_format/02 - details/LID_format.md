@@ -638,9 +638,9 @@ table — device-side the rows are `NLCellID`s joined to the RNW one-cell id typ
 
 | selector | slot (device member) | content |
 |---|---:|---|
-| `0x001` | +0x4dc (`NLValueListAttrVector`) | per-address-element VL, decoded in `enDecodeCells` only behind gate `this+0x26==0`; **no device consumer found** (the two read-paths below use `0xc11`/`0xc12`). Stock: one unique u32 per record, scale reaching 240 k — [OPEN] meaning |
+| `0x001` | +0x4dc (`NLValueListAttrVector`) | per-address-element VL, decoded last by BOTH `enDecodeHnr` and `enDecodeCells`, behind gate `this+0x26==0` (gate = presence of the author columns); **write-only on the device** — searched: no consumer of the member exists in the binary (instruction scan of `0x4dc` hits only unrelated frame slots). Stock: one unique u32 per record, scale reaching 240 k — author-side bookkeeping, [OPEN] |
 | `0x002/0x003/0x004/0x005` (+ `0x8003`/`0x8004` variants) | +0x530 (`NLCellIdAttrVector`) | the cell table itself: local id list (+0x00 u16), global-recdesc search starts (+0x20, +0x60) over `NLRecordDescriptionAttrVector` +0x40, per-row extra list +0x80, row count +0x88, existence bit +0xa0 — assembled into `NLCellID{u16, u16, u32, bool}` by `enGetCells` |
-| `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record list of cell-row ordinals** (device model: 1..N — stock Kraków uses 1, other stock files up to 632); the ordinal < row-count (`+0x88`) check runs in `enGetCells` |
+| `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record cell-row ordinal list** — the device model supports 1..N values, but every examined stock block carries ONE value per record (VL existence bits over the full record domain, `0x8000` starts stream empty ⇒ trivial offsets; e.g. Kraków block 37: 1064 owner elements / 15857 records / 15857 `0xc11` values). The ordinal < row-count (`+0x88`) check runs in `enGetCells`. (In `lid2dump`'s `cellmap` the `0xc11` rows are grouped per OWNER element with `k` = record index — a flattened export view, not a device domain.) |
 | `0xc12` | +0x3d4 (`NLValueListAttrVector`) | **per-entry (name-list element: street/city) list of cell-row ordinals** — consumed by `bGetElementCellIDs` for element→cell lookup |
 | `0xc14` | +0x47c (`NLRangeAttrVector`) | range values **keyed by cell-row ordinal**; both read-paths look it up per ordinal (miss → `0xFFFFFFFF` sentinel) — [OPEN] what the value means |
 | `0xc0b/0xc0c/0xc0d` | +0x2c0/0x2e0/0x300 (`NLBinaryAttrVector`) | `NLHnrCellStatus` bytes {b0, b1, b2, u16=0xffff} — indexed **at the record's first `0xc11` value offset** (== row ordinal while 1 value/record), not by record number. Stock observation (data, not device): `0xc0b == 0xc09`, `0xc0c == 0xc0a` mirror the parity bits; `0xc0d` set on ~half the records — [OPEN] semantics |
@@ -650,15 +650,28 @@ HNR placement path: `bGetHnrCellIDs` iterates the matching records → per recor
 `enGetCells` assembles the `NLCellID`s (bounds-checked) → `0xc14::enGetValue` per ordinal →
 `0xc0b/0xc0c/0xc0d` bits at the `0xc11` value-offset window. Element path: `bGetElementCellIDs` →
 `enGetEntryCellReferences` reads `0xc12` per element and repeats the same `enGetCells`/`0xc14`
-steps (optionally filtered by `bHasValidOwner` against a street set). Stock ground-truth (LID40006 block 65, ul. GRÓJECKA):
+steps (optionally filtered by `bHasValidOwner` against a street set). Destination read-model
+(CONFIRMED callers): `LISA_tclHnrProcessing::bDetermineCells 00be17f4` requires exactly one
+disambiguated street, then calls `bGetHnrCellIDs` per record filtered by the *chosen house-number
+indices* (`corfoGetChosenElementIndices`) — or routes to `bGetPACells 00be072c` when the address has
+a PA row; `LISA_tclSMReadDestinationInfo::bReadHNRCells 00b8a314` / `bReadCellsFromIdList 00b8b7e4`
+convert the `NLCellID`s into `tclInternalClusterCellInfo` sets (street/POI destination without
+number), flipping a byte when `0xc0d` is set (`local_56 != 0 → local_55 = ~local_55`). Stock ground-truth (LID40006 block 65, ul. GRÓJECKA):
 each numbered segment is one table row; even/odd sides are separate records (own `0x001` ids, e.g.
 93585/93586) sharing one `0xc11` row. [OPEN] stock `global_id`s are an author registry numbering
-(1..~674, not the raw u16 RNW cluster ids 20000..59000 seen via `rnw2osm`) — the stock→RNW registry
-rule is undecoded; our `osm2lid` emits **raw `osm2rnw` cluster ids** (stack-DFS ordinal + 1), so its
+(1..~674, whole file: 728 distinct ids spanning 1..741 — far below the raw u16 RNW cluster ids
+20000..59000 seen via `rnw2osm`; no registry table for it located on any stock card) —
+the stock→RNW registry rule is undecoded; our `osm2lid` emits **raw `osm2rnw` cluster ids** (stack-DFS ordinal + 1), so its
 self-generated pairs — `LID40006.DAT` from `osm2lid` + `NAV*.DAT` from `osm2rnw` on the same OSM
 extract — match by construction (verified: 34 169 segments / 121 clusters identical in both tools).
-`osm2lid` replicates the `osm2rnw` segment walk (`windows(2)`, missing-node skip, bbox on the first
-node only) and `build_clusters` bbox quad-split (target 700 onecells/cluster). `lid2dump --sqlite`
+**This identity is guaranteed by shared code, not luck or cross-file consultation:** the segment
+walk (parse order, `windows(2)`, missing-node skip, bbox on the first node only, collapsed-pair
+skip), the routable-road predicate, the `build_clusters` bbox-quad-split stack DFS (target 700) and
+the push-order numbering rule (`cluster id = group index + 1`) all live in one crate, **`src/rnw_model`
+(`rnw_model`)**, which BOTH `osm2rnw` and `osm2lid` call. A same-source LID build therefore needs
+neither the RNW files nor the RNW binary; it only needs the same OSM input and the same `rnw_model`
+(=> re-run the byte golden, `trials/krk_frag2.osm` + `krzeszowice.osm`, whenever `rnw_model`
+changes — a drifted clusterer silently mis-routes every `0xc11` row). `lid2dump --sqlite`
 decodes all of this into `block_cells` (table rows; `cell_ord` = the `0xc11`/PA cell space),
 `cellmap` (flattened `0xc11/0xc12/0x003/0xc14` values) and the `hnr` side/cell columns.
 
@@ -677,6 +690,12 @@ decodes all of this into `block_cells` (table rows; `cell_ord` = the `0xc11`/PA 
   (= %; device NLHnr status pct·255/100), `0xd0f` position = existence bitvector + `NLPositionAttrVector`
   **relative PAU** — the device ADDS the street element's own name-list position (`bGetRelPosition` of −1 ⇒
   fall back to interpolation, i.e. PA absence is graceful). Reader+writer+device-model: `src/lid_format/src/pa.rs`.
+  **The `0xd0b` cell id space is CONFIRMED (CONFIRMED: `bGetPACellIDs 00b898dc`):** PA detail `+0x00` u32
+  is pushed verbatim into `NLGenAttrProcessor::bGetCellOfBlock 00ce6458` → `enGetCells` of **the street's
+  own `+20000` block** — i.e. it must equal a `0xc11` table ordinal of that street's GenAttr file (not a
+  global/NAV id); `+0x08/+0x0c` carry `tNLHPosition` and `bGetPACellIDs` returns PA x/y **plus the street
+  element's name-list position** as the final WGS84 destination. `osm2lid` therefore writes the `0xc11`
+  row of the street's lowest-numbered record (test `pa_cells_point_at_the_lowest_records_row`).
   **[OPEN] / status:** no `PA_*.DAT` exists on ANY stock card (fileType 0x18 never observed; devices always
   interpolate), so the writer ships cell 0 / ratio 100 / pos = lowest numeric address − street anchor and is
   validated only against the device model replayed in tests — card test pending.
@@ -1030,6 +1049,10 @@ any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card te
    **Nothing is on-device-validated yet — first card test pending.**
    **Still pending:** crossing files (+10000), own META writer,
    and on-device acceptance (`NLHnrToTree` against a real card).
+   (Crossing status: the reviewer side exists — `NLCrossingBlock::enGetCells 00e085ec` shows the
+   crossing block's own `NLCellIdAttrVector` at the block member `+0x230` with identical selectors —
+   but the POL card ships no `LID1*`/+10000 file, so an own writer has no byte-level comparator and
+   the device model for crossing reads is only partly replayable offline.)
 
 > The trie **structure** (forest, `f2` trees/block, cross-block `0x402` link-DAG naming), **element order +
 > walk-stack names** (`CalculateTerminatingElementIndex`), **edge labels** (`0x403` per-EDGE offsets + TAB

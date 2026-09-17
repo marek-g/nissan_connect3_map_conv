@@ -1,4 +1,7 @@
 // OSM (PBF or XML) road network -> Bosch TravelMap RNW (NAVnnnnn.DAT clusters).
+// This binary owns RNW semantics; the onecell walk + cluster numbering shared with `osm2lid`
+// (GenAttr 0x004 global ids must agree) come from the `rnw_model` crate — see its lib docs.
+// NAV*.DAT output is byte-deterministic (no RandomState iteration reaches the file).
 //
 // WRITE-side counterpart of `rnw2osm`. The byte layout is the exact inverse of
 // rnw2osm's `parse_cluster`, so output round-trips:
@@ -109,11 +112,9 @@ fn add_way(net: &mut Network, nodes: Vec<i64>, tags: &HashMap<String, String>) {
         Some(h) => h.as_str(),
         None => return,
     };
-    if matches!(
-        hw,
-        "proposed" | "construction" | "demolished" | "raceway" | "crossing" | "footway"
-            | "path" | "pedestrian" | "cycleway" | "steps" | "track"
-    ) {
+    // Road inclusion is the shared rnw_model predicate (the old blacklist here was always
+    // redundant with classify()'s acceptance set; rnw_model::routable_way IS that set).
+    if !rnw_model::routable_way(hw) {
         return;
     }
     let j = tags.get("junction").map(|s| s.as_str()).unwrap_or("");
@@ -795,39 +796,14 @@ fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {
     }
 }
 fn extent(g: &[(i64, i64)]) -> (i64, i64, i64, i64) {
-    let (mut w, mut s, mut e, mut n) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-    for &(x, y) in g {
-        if x < w { w = x; } if x > e { e = x; } if y < s { s = y; } if y > n { n = y; }
-    }
-    (w, s, e, n)
+    rnw_model::extent(g)
 }
 
 fn build_clusters(segs: &[Seg], bbox: (i64, i64, i64, i64), target: usize) -> Vec<Vec<usize>> {
-    let mut out = Vec::new();
-    let all: Vec<usize> = (0..segs.len()).collect();
-    let mut stack = vec![(0usize, bbox.0, bbox.2, bbox.1, bbox.3, all)];
-    while let Some((d, w, e, s, n, mem)) = stack.pop() {
-        if mem.len() <= target || d >= 16 || w >= e || s >= n {
-            if !mem.is_empty() {
-                out.push(mem);
-            }
-            continue;
-        }
-        let mw = w + (e - w) / 2;
-        let mh = s + (n - s) / 2;
-        let mut q: [Vec<usize>; 4] = [vec![], vec![], vec![], vec![]];
-        for &i in &mem {
-            let (x, y) = segs[i].mid;
-            q[(if x >= mw { 1 } else { 0 }) + if y >= mh { 2 } else { 0 }].push(i);
-        }
-        let cells = [(w, mw, s, mh), (mw, e, s, mh), (w, mw, mh, n), (mw, e, mh, n)];
-        for (cell, (cw, ce, cs, cn)) in q.into_iter().zip(cells) {
-            if !cell.is_empty() {
-                stack.push((d + 1, cw, ce, cs, cn, cell));
-            }
-        }
-    }
-    out
+    // THE clusterer lives in rnw_model — shared verbatim with osm2lid so `0x004` global ids
+    // agree across a same-source RNW+LID build without either tool reading the other (§11.6b).
+    let mids: Vec<(i64, i64)> = segs.iter().map(|s| s.mid).collect();
+    rnw_model::build_clusters(&mids, bbox, target)
 }
 
 struct ClusterBlob {
@@ -924,7 +900,11 @@ fn build_overlaps(blobs: &mut [ClusterBlob], segs: &[Seg]) {
         blobs[dst].oc_ovl[dst_oc as usize].push((ci2i as u16, nbr_oc, nbr));
     };
 
-    for g in owners.keys().copied().collect::<Vec<_>>() {
+    // Sort the shared-node keys: ci2/oc_ovl record order follows THIS iteration, and the
+    // HashMap order is per-process random — unsorted keys made NAV*.DAT non-reproducible.
+    let mut shared_nodes: Vec<u32> = owners.keys().copied().collect();
+    shared_nodes.sort_unstable();
+    for g in shared_nodes {
         let own = owners[&g].clone();
         if own.len() < 2 {
             continue;

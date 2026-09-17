@@ -16,7 +16,7 @@
 //
 // Usage: osm2lid <in.osm.pbf|in.osm> -o OUTDIR [--region POL] [--lang 22] [--bbox W,S,E,N] [--no-poi] [--no-genattr]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -181,6 +181,18 @@ fn main() {
         &street_idx,
         &city_idx,
     );
+    let (naddr, street_cell) = if no_genattr {
+        (0, Default::default())
+    } else {
+        write_gen_attr(
+            &outdir.join("LID40006.DAT"),
+            &data,
+            bbox,
+            &street_idx,
+            nst,
+            region_id,
+        )
+    };
     let npa = if no_pa {
         0
     } else {
@@ -190,18 +202,7 @@ fn main() {
             bbox,
             &st_entries,
             &street_idx,
-            nst,
-            region_id,
-        )
-    };
-    let naddr = if no_genattr {
-        0
-    } else {
-        write_gen_attr(
-            &outdir.join("LID40006.DAT"),
-            &data,
-            bbox,
-            &street_idx,
+            &street_cell,
             nst,
             region_id,
         )
@@ -697,19 +698,8 @@ const PA_CHUNK: usize = 4096;
 /// OSM `highway` values that osm2rnw treats as routable (classify() acceptance set — the only
 /// tag that decides inclusion; junction/oneway affect attributes, not membership).
 fn routable(hw: &str) -> bool {
-    matches!(
-        hw.strip_suffix("_link").unwrap_or(hw),
-        "motorway"
-            | "trunk"
-            | "primary"
-            | "secondary"
-            | "tertiary"
-            | "unclassified"
-            | "road"
-            | "residential"
-            | "living_street"
-            | "service"
-    )
+    // THE set lives in rnw_model (osm2rnw blacklist ∧ classify == this whitelist).
+    rnw_model::routable_way(hw)
 }
 
 /// One RNW onecell (2-node OSM way window), built exactly as `osm2rnw` builds its `segs` vector,
@@ -721,83 +711,33 @@ fn routable(hw: &str) -> bool {
 struct OneCell {
     ca: (i64, i64),
     cb: (i64, i64),
-    mid: (i64, i64),
     name: Option<String>,
     cluster: u32,
 }
 
 fn build_onecells(d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> Vec<OneCell> {
     let bb = bbox.map(|(w, s, e, n)| (deg2pau(w), deg2pau(s), deg2pau(e), deg2pau(n)));
-    let mut segs: Vec<OneCell> = Vec::new();
-    for (ids, name) in &d.hw {
-        for pair in ids.windows(2) {
-            let (ca, cb) = match (d.nodes.get(&pair[0]), d.nodes.get(&pair[1])) {
-                (Some(a), Some(b)) => (*a, *b),
-                _ => continue,
-            };
-            if let Some((w, s, e, n)) = bb {
-                if ca.0 < w || ca.0 > e || ca.1 < s || ca.1 > n {
-                    continue;
-                }
-            }
-            if pair[0] == pair[1] {
-                continue;
-            }
-            segs.push(OneCell {
-                ca,
-                cb,
-                mid: ((ca.0 + cb.0) / 2, (ca.1 + cb.1) / 2),
-                name: name.clone(),
-                cluster: 0,
-            });
-        }
-    }
-    if segs.is_empty() {
-        return segs;
-    }
-    // Root box = extent of the used nodes (osm2rnw `extent(&gnodes)` of the segment endpoints).
-    let (mut w, mut e, mut s, mut n) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
-    for sg in &segs {
-        for c in [sg.ca, sg.cb] {
-            w = w.min(c.0);
-            e = e.max(c.0);
-            s = s.min(c.1);
-            n = n.max(c.1);
-        }
-    }
-    // osm2rnw build_clusters(): recursive bbox quad-split, target 700 onecells/cluster, stack DFS.
-    const TARGET_OC: usize = 700;
-    let all: Vec<usize> = (0..segs.len()).collect();
-    let mut stack = vec![(0usize, w, e, s, n, all)];
-    let mut ncl = 0u32;
-    while let Some((depth, x0, x1, y0, y1, mem)) = stack.pop() {
-        if mem.len() <= TARGET_OC || depth >= 16 || x0 >= x1 || y0 >= y1 {
-            if !mem.is_empty() {
-                ncl += 1;
-                for &i in &mem {
-                    segs[i].cluster = ncl;
-                }
-            }
-            continue;
-        }
-        let mw = x0 + (x1 - x0) / 2;
-        let mh = y0 + (y1 - y0) / 2;
-        let mut q: [Vec<usize>; 4] = [vec![], vec![], vec![], vec![]];
-        for &i in &mem {
-            let (x, y) = segs[i].mid;
-            q[(if x >= mw { 1 } else { 0 }) + if y >= mh { 2 } else { 0 }].push(i);
-        }
-        let cells = [(x0, mw, y0, mh), (mw, x1, y0, mh), (x0, mw, mh, y1), (mw, x1, mh, y1)];
-        for (cell, (cw, ce, cs, cn)) in q.into_iter().zip(cells) {
-            if !cell.is_empty() {
-                stack.push((depth + 1, cw, ce, cs, cn, cell));
-            }
-        }
-    }
-    segs
+    // THE segment walk + cluster split live in rnw_model, shared with osm2rnw — this is the
+    // guarantee that 0x004 cluster ids match a same-source RNW build without reading it (§11.6b).
+    let cells = rnw_model::walk_onecells(
+        d.hw.iter().map(|(ids, name)| (ids.clone(), name.clone())),
+        |id| d.nodes.get(&id).copied(),
+        bb,
+    );
+    let groups = rnw_model::clusters_of(&cells, rnw_model::TARGET_ONECELLS);
+    let ids = rnw_model::cluster_ids(&groups, cells.len());
+    cells
+        .into_iter()
+        .zip(ids)
+        .map(|(c, cluster)| OneCell {
+            ca: c.ca,
+            cb: c.cb,
+            name: c.extra,
+            cluster,
+        })
+        .collect()
 }
 
-/// Squared PAU distance from a point to a segment chord (i128 to survive PAU-sized squares).
 fn pt_seg_d2(p: (i64, i64), a: (i64, i64), b: (i64, i64)) -> i128 {
     let (px0, py0) = (p.0 as i128, p.1 as i128);
     let (ax, ay) = (a.0 as i128, a.1 as i128);
@@ -829,7 +769,7 @@ fn write_gen_attr(
     street_idx: &HashMap<String, u32>,
     nst: usize,
     region: u16,
-) -> usize {
+) -> (usize, BTreeMap<u32, u32>) {
     use lid_format::write::{write_gen_attr_file, BlockData, ColData, ColKind};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -895,7 +835,7 @@ fn write_gen_attr(
         nrec_all += 1;
     }
     if nst < 2 || nrec_all == 0 {
-        return 0;
+        return (0, Default::default());
     } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
     for &sid in virt_cnt.keys() {
         virt_cluster.insert(sid, cluster_next);
@@ -905,6 +845,9 @@ fn write_gen_attr(
     let nblk = (nst as usize).div_ceil(HN_ATTR_CHUNK).max(2);
     let w = (nst as usize).div_ceil(nblk);
     let mut blocks = Vec::new();
+    // sid -> (lowest numeric record, its 0xc11 table row): the PA/destination cell for the street
+    // (bGetPACellIDs 00b898dc feeds its cell ids straight into the street block's enGetCells).
+    let mut street_cell: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     let mut gid = 0u32; // author-space id for column 0x001: unique per record, ever-increasing
     for lo in (0..nst as usize).step_by(w) {
         let hi = (lo + w).min(nst as usize);
@@ -951,6 +894,12 @@ fn write_gen_attr(
                     rec_row.push(base);
                     gid += 1;
                     rec_id.push(gid);
+                    match street_cell.get(&sid) {
+                        Some(&(mn0, _)) if mn0 <= mn => {}
+                        _ => {
+                            street_cell.insert(sid, (mn, base));
+                        }
+                    }
                 }
             }
         }
@@ -1122,9 +1071,9 @@ fn write_gen_attr(
     let bytes = write_gen_attr_file(nst as u32, &outer, &blocks);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
-        return 0;
+        return (0, Default::default());
     }
-    nrec_all
+    (nrec_all, street_cell.into_iter().map(|(sid, (_, row))| (sid, row)).collect())
 }
 
 fn write_pa(
@@ -1133,11 +1082,11 @@ fn write_pa(
     bbox: Option<(f64, f64, f64, f64)>,
     entries: &[lid_format::NameEntry],
     street_idx: &HashMap<String, u32>,
+    street_cell: &BTreeMap<u32, u32>,
     nst: usize,
     region: u16,
 ) -> usize {
     use lid_format::pa::{write_pa_file, PaDetailBlock, PaDetailEntry};
-    use std::collections::BTreeMap;
 
     // street element -> lowest numeric address point (coords), if any.
     let mut best: BTreeMap<u32, (u32, (i64, i64))> = BTreeMap::new();
@@ -1186,6 +1135,11 @@ fn write_pa(
                 && i64::from(i32::MIN) <= dy && dy <= i64::from(i32::MAX)
             {
                 filled[sid as usize].pos = Some((dx as i32, dy as i32));
+                // bGetPACellIDs 00b898dc hands this id straight to the street block's enGetCells:
+                // it must be the 0xc11 table ordinal of the street's cell (bGetCellOfBlock match).
+                if let Some(&row) = street_cell.get(&sid) {
+                    filled[sid as usize].cell = row;
+                }
                 npa += 1;
             }
         }

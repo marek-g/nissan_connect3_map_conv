@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <node id="100" lat="52.0000" lon="21.0000"/>
+  <node id="101" lat="52.0010" lon="21.0010"/>
+  <node id="102" lat="52.0040" lon="21.0040"/>
+  <node id="103" lat="52.0050" lon="21.0050"/>
+  <node id="104" lat="52.0200" lon="21.0200"/>
+  <node id="105" lat="52.0210" lon="21.0210"/>
+  <node id="300" lat="51.99950" lon="21.00060">
+    <tag k="place" v="city"/>
+    <tag k="name" v="Ceszin"/>
+  </node>
+  <node id="1" lat="52.0045" lon="21.0045">
+    <tag k="addr:housenumber" v="11"/>
+    <tag k="addr:street" v="Duza"/>
+  </node>
+  <node id="2" lat="52.0048" lon="21.0048">
+    <tag k="addr:housenumber" v="13"/>
+    <tag k="addr:street" v="Duza"/>
+  </node>
+  <node id="3" lat="52.0005" lon="21.0005">
+    <tag k="addr:housenumber" v="22"/>
+    <tag k="addr:street" v="Duza"/>
+  </node>
+  <node id="4" lat="52.0008" lon="21.0008">
+    <tag k="addr:housenumber" v="24"/>
+    <tag k="addr:street" v="Duza"/>
+  </node>
+  <way id="200">
+    <nd ref="100"/><nd ref="101"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Duza"/>
+  </way>
+  <way id="201">
+    <nd ref="102"/><nd ref="103"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Duza"/>
+  </way>
+  <way id="202">
+    <nd ref="104"/><nd ref="105"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Malutka"/>
+  </way>
+</osm>

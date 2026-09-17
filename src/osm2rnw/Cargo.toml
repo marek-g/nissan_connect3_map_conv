@@ -5,6 +5,7 @@ edition = "2021"
 
 # OSM PBF/XML road network -> Bosch TravelMap RNW (NAVnnnnn.DAT clusters).
 [dependencies]
+rnw_model = { path = "../rnw_model" }
 quick-xml = { version = "0.42", default-features = false }
 pbf-craft = "1.0"
 

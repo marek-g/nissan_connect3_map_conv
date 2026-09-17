@@ -387,6 +387,7 @@ dependencies = [
  "lid_format",
  "pbf-craft",
  "quick-xml",
+ "rnw_model",
  "rusqlite",
 ]
 
@@ -549,6 +550,10 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "rnw_model"
+version = "0.1.0"
 
 [[package]]
 name = "rsqlite-vfs"

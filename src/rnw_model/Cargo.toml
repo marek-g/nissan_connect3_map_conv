@@ -1,0 +1,12 @@
+[package]
+name = "rnw_model"
+version = "0.1.0"
+edition = "2021"
+
+# Shared RNW one-cell model: the single source of truth for what a routable road is,
+# how onecells are walked out of OSM ways, and how clusters are numbered. `osm2rnw`
+# (NAV*.DAT writer) and `osm2lid` (LID40006 hnr cell writer) both consume this crate,
+# so cluster ids — the GenAttr `0x004` `global_id` column (LID_format.md §11.6b) — agree
+# across a same-source OSM build WITHOUT either tool reading the other's output.
+
+[dependencies]
