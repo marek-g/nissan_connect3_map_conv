@@ -17,7 +17,7 @@ use super::{u32, vle_encode};
 use crate::rebuild::encode_numeric;
 
 /// Column vector flavor (which descriptor rows the device's `SetDataBlock` decoder expects).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ColKind {
     /// 3 rows: existence / cumulative offsets (VLE delta) / concatenated values
     /// (`NLValueListAttrVector` — `0xc01` house numbers, `0xc11` record domain, …).
@@ -33,6 +33,15 @@ pub enum ColKind {
     EmptyByteList,
     /// 3 rows: existence / `from`s / `to`s (`NLRangeAttrVector` — `0xc08`/`0xc10`). `range_from_to`.
     Range,
+    /// 1 row: plain numeric list without existence bits — the CellId table member `0x002` (per-row
+    /// NAV-file locals; values kept `u16`-wide by convention).
+    Simple16,
+    /// 1 row: plain numeric list without existence bits — CellId table `0x004` global ids and the
+    /// `0x8003/0x8004` record-description starts.
+    Simple32,
+    /// Verbatim descriptor rows `(selector, code, param, values)` (§11.6c recorddescription stub
+    /// `0x4003`; the lost stock writers emitted these with no existence stream).
+    Rows(Vec<(u16, u16, u32, Vec<u32>)>),
 }
 
 /// One attribute-vector selector triple (existence / offsets / values — flavor per `kind`).
@@ -107,7 +116,7 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
     // (kind, code, param, bytes) — rows per column depend on the vector `kind`.
     let mut rows: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
     for c in &blk.cols {
-        match c.kind {
+        match &c.kind {
             ColKind::ValueList => {
                 let xc = ex_code(&c.exists);
                 rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
@@ -167,6 +176,30 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
                 rows.push((c.selector | 0x4000, 0x02, c.domain, Vec::new()));
                 rows.push((c.selector | 0x8000, 0x11, 0, Vec::new()));
                 rows.push((c.selector, 0x11, 0, Vec::new()));
+            }
+            ColKind::Simple16 | ColKind::Simple32 => {
+                let bad = match c.kind {
+                    ColKind::Simple16 => c.values.iter().any(|&v| v > 0xFFFF),
+                    _ => false,
+                };
+                assert!(!bad, "Simple16 column {:#x} has a >u16 value", c.selector);
+                rows.push((
+                    c.selector,
+                    c.code_0000,
+                    c.values.len() as u32,
+                    encode_numeric(&c.values, c.code_0000 as u32).expect("simple values"),
+                ));
+            }
+            ColKind::Rows(extra) => {
+                for (sel, code, param, vals) in extra.clone() {
+                    // an empty payload skips the codec entirely (stock `0x03` stubs carry none)
+                    let bytes = if vals.is_empty() {
+                        Vec::new()
+                    } else {
+                        encode_numeric(&vals, code as u32).expect("row values")
+                    };
+                    rows.push((sel, code, param, bytes));
+                }
             }
         }
     }

@@ -203,6 +203,8 @@ fn decode_for_export(
         elements: Vec::new(),
         rel: None,
         hnr: Vec::new(),
+        block_cells: Vec::new(),
+        cellmap: Vec::new(),
         mirrors: Vec::new(),
     };
 
@@ -376,11 +378,15 @@ fn decode_for_export(
                         house_number_to: None,
                         even: None,
                         odd: None,
+                        side: None,
+                        cell: None,
                     });
                 }
                 continue;
             }
             let hv = stream(0xc01, 0);
+                let cv = stream(0xc11, 0); // flat per-record 0xc11 values (row ordinals)
+                let c1v = stream(0x0001, 0); // flat 0x001 author cell ids (when one per record)
             if !hv.is_empty() {
                 let bits = blk
                     .streams
@@ -441,8 +447,125 @@ fn decode_for_export(
                                 house_number_to: to_at(r),
                                 even: bit_at(0xc09, r),
                                 odd: bit_at(0xc0a, r),
+                                side: match (
+                                    bit_at(0xc0b, r),
+                                    bit_at(0xc0c, r),
+                                    bit_at(0xc0d, r),
+                                ) {
+                                    (Some(b), Some(c), Some(d)) => Some((b, c, d)),
+                                    _ => None,
+                                },
+                                cell: Some(c1v.get(r).copied().unwrap_or(0)),
                             });
                             record_base += 1;
+                            // 0xc11 per-record cell-table row ordinal (flat one-value-per-record
+                            // stream; stock `enGetHnrCellIndices` reads exactly this per record).
+                            if cv.len() == hv.len() {
+                                ex.cellmap.push(sqlite_export::CellmapRow {
+                                    block: bi,
+                                    owner_elem: Some(blk.elem_start + o),
+                                    key_idx: k as u32,
+                                    col: 0xc11,
+                                    k: (r - a) as u32,
+                                    value: cv.get(r).copied(),
+                                });
+                            }
+                        }
+                    }
+                    // Cell table (section 11.6c): one row per NLCellIdAttrVector entry, decoded
+                    // from the table-member streams bound to it (locals `0x002`, desc `0x003`,
+                    // global ids `0x004`, existence bits `0x005`). 0xc11 values index cell_ord.
+                    let bits05 = blk
+                        .streams
+                        .iter()
+                        .find(|x| x.col == 0x0005 && x.flags == 0)
+                        .map(|x| x.bits.clone())
+                        .unwrap_or_default();
+                    let locals = stream(0x0002, 0);
+                    // (lost-exporter compat) row.elem = the block `0xc01` owner at this ordinal
+                    let globals = stream(0x0004, 0);
+                    let nrow = bits05
+                        .len()
+                        .max(locals.len())
+                        .max(globals.len())
+                        .max(owners.len());
+                    if nrow > 0 {
+                        for i2 in 0..nrow {
+                            ex.block_cells.push(sqlite_export::BlockCellRow {
+                                block: bi,
+                                cell_ord: i2 as u32,
+                                elem: owners.get(i2).map(|&o| blk.elem_start + o),
+                                local_id: locals.get(i2).copied(),
+                                global_id: globals.get(i2).copied(),
+                                bit_set: bits05.get(i2).copied().unwrap_or(true),
+                            });
+                        }
+                    }
+                    // Owner-keyed side columns (`0x003` per-file triples on stock street owners,
+                    // `0xc12` counts, `0xc14` ranges): flatten (owner, key, slot) value rows.
+                    // `0x003` / `0xc14` are owned per NAV file, not per street owner — no
+                    // tiling exists here; flatten the raw value stream in 64-value chunks.
+                    // `0xc12` is keyed per owner slot, but the (lost) exporter did not map
+                    // street elements for it — keep owner NULL, key_idx = owner slot index.
+                    {
+                        let v = stream(0xc12, 0);
+                        let sbits: Vec<bool> = blk
+                            .streams
+                            .iter()
+                            .find(|x| x.col == 0xc12 && x.flags == 0x4000)
+                            .map(|x| x.bits.clone())
+                            .unwrap_or_default();
+                        let sstarts = stream(0xc12, 0x8000);
+                        if !v.is_empty() && !sbits.is_empty() && !sstarts.is_empty() {
+                            let so: Vec<u32> =
+                                (0..sbits.len() as u32).filter(|&i3| sbits[i3 as usize]).collect();
+                            if so.len() == sstarts.len() {
+                                for (jj, _) in so.iter().enumerate() {
+                                    let ka = sstarts[jj] as usize;
+                                    let kb = sstarts
+                                        .get(jj + 1)
+                                        .copied()
+                                        .unwrap_or(v.len() as u32) as usize;
+                                    for (k2, &val) in
+                                        v[ka.min(v.len())..kb.min(v.len())].iter().enumerate()
+                                    {
+                                        ex.cellmap.push(sqlite_export::CellmapRow {
+                                            block: bi,
+                                            owner_elem: None,
+                                            key_idx: jj as u32,
+                                            col: 0xc12,
+                                            k: k2 as u32,
+                                            value: Some(val),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `0x003` / `0xc14` are owned per NAV file, not per street owner — no owner
+                    // tiling exists; split the raw value stream on its own key starts (0x8000).
+                    for col in [0x0003u32, 0xc14] {
+                        let v = stream(col, 0);
+                        let starts_k = stream(col, 0x8000);
+                        let mut bounds: Vec<u32> = starts_k;
+                        if bounds.first() != Some(&0) {
+                            bounds.insert(0, 0);
+                        }
+                        bounds.push(v.len() as u32);
+                        for (jj, wk) in bounds.windows(2).enumerate() {
+                            let (ka, kb) = (wk[0] as usize, wk[1] as usize);
+                            for (k2, &val) in
+                                v[ka.min(v.len())..kb.min(v.len())].iter().enumerate()
+                            {
+                                ex.cellmap.push(sqlite_export::CellmapRow {
+                                    block: bi,
+                                    owner_elem: None,
+                                    key_idx: jj as u32,
+                                    col,
+                                    k: k2 as u32,
+                                    value: Some(val),
+                                });
+                            }
                         }
                     }
                     continue;
@@ -730,8 +853,38 @@ fn dump_binary(
                                         .map(|x| x.values.clone())
                                         .unwrap_or_default()
                                 };
-                                to_street.extend(col(0x002, 0x8000));
-                                number.extend(col(0x00c, 0x8000));
+                                {
+                                    let (Some(b0), Some(s1)) = (
+                                        blk.streams.iter().find(|x| x.col == 0xc01 && x.flags == 0x4000),
+                                        blk.streams.iter().find(|x| x.col == 0xc01 && x.flags == 0x8000),
+                                    ) else {
+                                        continue;
+                                    };
+                                    let base = col(0xc01, 0x0);
+                                    let owners: Vec<u32> = (0..b0.bits.len() as u32)
+                                        .filter(|&i| b0.bits[i as usize])
+                                        .collect();
+                                    if s1.values.len() == owners.len()
+                                        && s1.values.first() == Some(&0)
+                                    {
+                                        for (k, &o) in owners.iter().enumerate() {
+                                            let a = s1.values[k] as usize;
+                                            let e = s1.values
+                                                .get(k + 1)
+                                                .copied()
+                                                .unwrap_or(base.len() as u32) as usize;
+                                            for r in a..e.min(base.len()).max(a) {
+                                                to_street.push(blk.elem_start + o);
+                                                number.push(base[r]);
+                                            }
+                                        }
+                                    } else if s1.values.len() == base.len() {
+                                        for (r, &o) in s1.values.iter().enumerate() {
+                                            to_street.push(blk.elem_start + o);
+                                            number.push(base[r]);
+                                        }
+                                    }
+                                }
                                 bd.push(json!({
                                     "block": bi,
                                     "elem_start": blk.elem_start,

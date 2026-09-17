@@ -32,6 +32,8 @@ fn list(name: &str, list_id: u16, elements: Vec<ExportElement>) -> ExportFile {
         elements,
         rel: None,
         hnr: Vec::new(),
+        block_cells: Vec::new(),
+        cellmap: Vec::new(),
         mirrors: Vec::new(),
     }
 }

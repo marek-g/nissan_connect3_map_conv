@@ -161,6 +161,19 @@ what are they". Our `src/lid_format/` reader decodes all of the above against `P
 encoders are proven device-faithful** — re-encoding every read block reproduces the authoring tool's bytes
 exactly (133 blocks), so the `write.rs` writer's output is byte-valid for the device.
 
+### 4.4c The one-cell model: house numbers bound to RNW road segments
+
+On the device a found house number does not just resolve to a street — it resolves to a **road
+segment** the car can navigate to. The GenAttr file therefore also ships a per-block **cell table**
+(one row per RNW *onecell* = a 2-node segment from an `osm2rnw`-style build, carrying its local and
+global/cluster ids) and a per-record **`0xc11` column** that points each house-number record at its
+segment's table row — one row shared by the even and odd side of the same segment
+(details + device call chain: `LID_format.md` §11.6b). `osm2lid` builds both sides itself: it
+replicates the `osm2rnw` segment walk and cluster split on the same OSM extract, so the generated
+`LID40006.DAT` and the road tiles index identical one-cell/cluster sets by construction. `lid2dump
+--sqlite` decodes the tables (`block_cells`), the per-record joins (`cellmap`) and the per-record
+cell/side columns (`hnr`).
+
 ### 4.5 Blocks, entries, and columns
 
 Address name-list content is nested a little differently from the landmark content:

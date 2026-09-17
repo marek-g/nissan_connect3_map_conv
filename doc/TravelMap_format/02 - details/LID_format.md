@@ -628,6 +628,35 @@ even/odd parity bits per record, `0xc03..06` = HNR string VLs (`enGetHnr` `00e0d
 stock POL ships them empty). The on-device `NLHnrToTree` matcher cannot be run here — the offline device
 read-model (`gen_attr_writer_roundtrip_device_model`) replays `enGetHnrIndices`/`enGetHnr` only.
 
+**11.6b HNR cell columns + the RNW one-cell model (CONFIRMED: `SetDataBlock` `00e09b60`,
+`enDecodeCells` `00e0c584`, `enGetHnrCellIndices` `00e0c8bc`, `NLCellIdAttrVector::enGetCells`
+`00e08448`).** Every `NLHnr` block carries a cell table — one row ↔ one RNW **onecell** (a 2-node
+road segment) of an `osm2rnw`-style build — plus per-record columns that index it:
+
+| selector | slot | content |
+|---|---:|---|
+| `0x001` | +0x4dc | per-record author cell id (`u32`, unique; stock scale reaches the 240 k range — [OPEN] exact id space) |
+| `0x002/0x004/0x005` | +0x530 | cell table: per-row NAV-file-local id, global id (the cluster id `bCreateOutput` `00b8ae40` emits as `fi_tcl_Cell`), existence bit |
+| `0x003` | +0x200 | per-NAV-file key lists (207 triples per Kraków block on stock — name-path extra, [OPEN]) |
+| `0x003/0x8003/0x8004` | +0x40.. | recorddescription starts/global starts (binary-search domains in `enGetCells`) |
+| `0xc11` | +0x380 | **per-record cell-row ordinal** — exactly one value per record (`enGetHnrCellReferences`); both parity records of a segment cite the same row |
+| `0xc0b/0xc0c/0xc0d` | +0x2c0/0x2e0/0x300 | per-record bits: stock mirrors the parity bits (`0xc0b == 0xc09`, `0xc0c == 0xc0a`) and keeps a direction-class flag in `0xc0d` ([OPEN]; ~half of stock records set) |
+| `0xc12/0xc14` | +0x3d4/0xc14 | owner-keyed counts / ranges — read by `enDecodeCells` only, unused by the HNR→cell path |
+
+Placement path: `bGetHnrCellIDs 00ce686c` → `enGetHnrCellIndices` reads `0xc11` per record (values
+are ordinals into the block table, validated `< domain+0x88`) → `enGetCells` assembles
+`NLCellID{local, recdesc, global_id, bit}`. Stock ground-truth (LID40006 block 65, ul. GRÓJECKA):
+each numbered segment is one table row; even/odd sides are separate records (own `0x001` ids, e.g.
+93585/93586) sharing one `0xc11` row. [OPEN] stock `global_id`s are an author registry numbering
+(1..~674, not the raw u16 RNW cluster ids 20000..59000 seen via `rnw2osm`) — the stock→RNW registry
+rule is undecoded; our `osm2lid` emits **raw `osm2rnw` cluster ids** (stack-DFS ordinal + 1), so its
+self-generated pairs — `LID40006.DAT` from `osm2lid` + `NAV*.DAT` from `osm2rnw` on the same OSM
+extract — match by construction (verified: 34 169 segments / 121 clusters identical in both tools).
+`osm2lid` replicates the `osm2rnw` segment walk (`windows(2)`, missing-node skip, bbox on the first
+node only) and `build_clusters` bbox quad-split (target 700 onecells/cluster). `lid2dump --sqlite`
+decodes all of this into `block_cells` (table rows; `cell_ord` = the `0xc11`/PA cell space),
+`cellmap` (flattened `0xc11/0xc12/0x003/0xc14` values) and the `hnr` side/cell columns.
+
 ### 11.7 `PA_%05u` (point addresses) and `REL_%05u` (relations)
 
 - `PA` (fileType 0x18, `bGetFileNameFromDataAddress 00bc4d54` → `PA_%05u` keyed by the **base** name-list

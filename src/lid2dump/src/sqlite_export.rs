@@ -71,6 +71,35 @@ pub struct HnrRow {
     pub even: Option<bool>,
     /// `0xc0a` hasOddParity (NLHnrStatus::bHasOddParity).
     pub odd: Option<bool>,
+    /// `0xc0b/0xc0c/0xc0d`: stock mirrors the parity bits in `0xc0b/0xc0c` and keeps a
+    /// direction-class flag in `0xc0d` ([OPEN] exact semantics; ~half of stock records set).
+    pub side: Option<(bool, bool, bool)>,
+    /// `0x001` per-record cell id (author cell vector; table rows in `block_cells`).
+    pub cell: Option<u32>,
+}
+
+/// One decoded `NLCellIdAttrVector` table row of a GenAttr block (§11.6c: `0x002` NAV-file local
+/// ids, `0x004` global/cell ids, `0x005` existence bits, `0x003` per-row description element).
+#[derive(Debug, Clone)]
+pub struct BlockCellRow {
+    pub block: usize,
+    pub cell_ord: u32,
+    pub elem: Option<u32>,
+    pub local_id: Option<u32>,
+    pub global_id: Option<u32>,
+    pub bit_set: bool,
+}
+
+/// One value of a keyed GenAttr cell column (`0xc11` per-record row ordinals, `0x003`/`0xc12`/
+/// `0xc14` owner-keyed side lists), flattened: owner element × key ordinal × value slot.
+#[derive(Debug, Clone)]
+pub struct CellmapRow {
+    pub block: usize,
+    pub owner_elem: Option<u32>,
+    pub key_idx: u32,
+    pub col: u32,
+    pub k: u32,
+    pub value: Option<u32>,
 }
 
 /// One LID element, exactly as `lid_format::read` decoded it (no transformations).
@@ -103,6 +132,8 @@ pub struct ExportFile {
     pub elements: Vec<ExportElement>,
     pub rel: Option<RelOut>,
     pub hnr: Vec<HnrRow>,
+    pub block_cells: Vec<BlockCellRow>,
+    pub cellmap: Vec<CellmapRow>,
     pub mirrors: Vec<MirrorTable>,
 }
 
@@ -153,8 +184,32 @@ CREATE TABLE hnr(
   house_number_to  INTEGER,                         -- 0xc02 upper bound (to); legacy osm2lid files: NULL
   hn_even          INTEGER,                         -- 0xc09 hasEvenParity; device step = 2 when it differs from odd
   hn_odd           INTEGER,                         -- 0xc0a hasOddParity
+  hn_c0b           INTEGER,                         -- 0xc0b bit at the record (cell-path status 0)
+  hn_c0c           INTEGER,                         -- 0xc0c bit at the record (cell-path status 1)
+  hn_c0d           INTEGER,                         -- 0xc0d bit at the record (cell-path status 2)
+  cell             INTEGER,                         -- record's cell id (0x001 vector; table in block_cells)
   street_file_id   INTEGER REFERENCES file(id),     -- resolved in-run (NULL = no street file in run)
   PRIMARY KEY(file_id, elem)
+);
+CREATE TABLE block_cells(
+  file_id    INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  block      INTEGER NOT NULL,                    -- GenAttr block index (cell ordinals restart per block)
+  cell_ord   INTEGER NOT NULL,                    -- ordinal in the block cell table (= device PA cell id space)
+  elem       INTEGER,                             -- 0x003 per-row description element id
+  local_id   INTEGER,                             -- 0x002 local cell id (u16 member @+0x530)
+  global_id  INTEGER,                             -- 0x004 global cell id (member @+0x80)
+  bit_set    INTEGER NOT NULL,                    -- 0x005 existence bit
+  PRIMARY KEY(file_id, block, cell_ord)
+);
+CREATE TABLE cellmap(
+  file_id    INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  block      INTEGER NOT NULL,
+  owner_elem INTEGER,                             -- owning street elem (record-tiling streams; NULL = raw key)
+  key_idx    INTEGER NOT NULL,                    -- key ordinal in the stream's key domain
+  col        INTEGER NOT NULL,                    -- 0xc11 / 0xc12 / 0x003
+  k          INTEGER NOT NULL,                    -- value slot inside the key's list
+  value      INTEGER NOT NULL,
+  PRIMARY KEY(file_id, block, col, key_idx, k)
 );
 CREATE TABLE addr(
   id           INTEGER PRIMARY KEY,
@@ -664,8 +719,8 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
         let fid = ids[fi];
         let mut stmt = tx
             .prepare_cached(
-                "INSERT INTO hnr(file_id,elem,addr_to_street,house_number,house_number_to,hn_even,hn_odd,street_file_id)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO hnr(file_id,elem,addr_to_street,house_number,house_number_to,hn_even,hn_odd,hn_c0b,hn_c0c,hn_c0d,cell,street_file_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             )
             .map_err(|e| e.to_string())?;
         for h in &f.hnr {
@@ -677,6 +732,10 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
                 h.house_number_to.map(|x| x as i64),
                 h.even.map(|x| x as i64),
                 h.odd.map(|x| x as i64),
+                h.side.map(|(b, _, _)| b as i64),
+                h.side.map(|(_, c, _)| c as i64),
+                h.side.map(|(_, _, d)| d as i64),
+                h.cell.map(|x| x as i64),
                 if h.addr_to_street.is_some() {
                     street_fid
                 } else {
@@ -684,6 +743,54 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
                 },
             ])
             .map_err(|err| format!("hnr {}: {err}", h.elem))?;
+        }
+    }
+
+    // GenAttr cell tables + keyed cell columns (decoded block streams, §11.6c)
+    for (fi, f) in files.iter().enumerate() {
+        if f.block_cells.is_empty() && f.cellmap.is_empty() {
+            continue;
+        }
+        let fid = ids[fi];
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO block_cells(file_id,block,cell_ord,elem,local_id,global_id,bit_set)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                )
+                .map_err(|e| e.to_string())?;
+            for c in &f.block_cells {
+                stmt.execute(rusqlite::params![
+                    fid,
+                    c.block as i64,
+                    c.cell_ord as i64,
+                    c.elem.map(|x| x as i64),
+                    c.local_id.map(|x| x as i64),
+                    c.global_id.map(|x| x as i64),
+                    c.bit_set as i64,
+                ])
+                .map_err(|err| format!("block_cells {}: {err}", c.cell_ord))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO cellmap(file_id,block,owner_elem,key_idx,col,k,value)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                )
+                .map_err(|e| e.to_string())?;
+            for m in &f.cellmap {
+                stmt.execute(rusqlite::params![
+                    fid,
+                    m.block as i64,
+                    m.owner_elem.map(|x| x as i64),
+                    m.key_idx as i64,
+                    m.col as i64,
+                    m.k as i64,
+                    m.value.map(|x| x as i64),
+                ])
+                .map_err(|err| format!("cellmap {:#x}: {err}", m.col))?;
+            }
         }
     }
 

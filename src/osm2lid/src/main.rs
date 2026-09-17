@@ -60,6 +60,8 @@ struct Data {
     places: Vec<(String, (i64, i64), String)>, // (name, coord, place-kind)
     pois: Vec<(String, (i64, i64))>,           // (name, coord)
     streets: Vec<(String, Vec<i64>)>,          // (name, node refs) — Phase-2 (not emitted)
+    // every routable-class highway, parse order, for onecell/cluster replication (osm2rnw rules)
+    hw: Vec<(Vec<i64>, Option<String>)>,
     addrs: Vec<(String, (i64, i64), String)>,  // (housenumber, coord, street) — GenAttr source
 }
 
@@ -70,6 +72,7 @@ impl Data {
             places: Vec::new(),
             pois: Vec::new(),
             streets: Vec::new(),
+            hw: Vec::new(),
             addrs: Vec::new(),
         }
     }
@@ -298,9 +301,10 @@ fn parse_pbf(path: &str, d: &mut Data) {
                         }
                     }
                     let street = tags.contains_key("highway") && tags.contains_key("name");
+                    let hw = tags.get("highway").is_some_and(|h| routable(h));
                     let addr =
                         tags.contains_key("addr:housenumber") && tags.contains_key("addr:street");
-                    if street || addr {
+                    if street || addr || hw {
                         pways.push((w.way_nodes.iter().map(|wn| wn.id).collect(), tags));
                     }
                 }
@@ -452,7 +456,10 @@ fn tag_way(d: &mut Data, ids: Vec<i64>, t: &HashMap<String, String>) {
     if ids.len() < 2 {
         return;
     }
-    if t.contains_key("highway") {
+    if let Some(hw) = t.get("highway") {
+        if routable(hw) {
+            d.hw.push((ids.clone(), t.get("name").cloned()));
+        }
         if let Some(name) = t.get("name") {
             d.streets.push((name.clone(), ids.clone()));
         }
@@ -684,14 +691,137 @@ fn hnr_number(s: &str) -> Option<u32> {
 /// GenAttr house-number attribute block chunk size (street elements per TOC block; stock ≈4–19 k).
 const HN_ATTR_CHUNK: usize = 8192;
 
-/// Emit `LID40006.DAT` — the house-number GenAttr file (+20000, §11.6) in the **stock device
-/// layout** (`SetDataBlock 00e09b60` / `enGetHnrIndices 00e0c3a0` / `enGetHnr 00e0d078`, §11.6b):
-/// block element ranges tile the STREET name-list `0..nst`; `0xc01` (+0x28) = per-street house
-/// number lower bounds (existence/offsets/values), `0xc02` (+0x7c) per-record upper bound (`to`;
-/// equals the number for a single-number record), `0xc03..
-/// 0xc06` empty per-record string lists (card requires them decodable), `0xc09/0xc0a/0xc0b/0xc0d`
-/// per-record parity bits, `0xc11` (+0x380) per-record existence domain (the `enGetHnr` gate).
-/// One record per numeric `addr:housenumber` joined to a street in `LID20006`.
+/// Point-address block width (street elements per DETAIL block; stock block sizes were ~k-10k).
+const PA_CHUNK: usize = 4096;
+
+/// OSM `highway` values that osm2rnw treats as routable (classify() acceptance set — the only
+/// tag that decides inclusion; junction/oneway affect attributes, not membership).
+fn routable(hw: &str) -> bool {
+    matches!(
+        hw.strip_suffix("_link").unwrap_or(hw),
+        "motorway"
+            | "trunk"
+            | "primary"
+            | "secondary"
+            | "tertiary"
+            | "unclassified"
+            | "road"
+            | "residential"
+            | "living_street"
+            | "service"
+    )
+}
+
+/// One RNW onecell (2-node OSM way window), built exactly as `osm2rnw` builds its `segs` vector,
+/// including the parse-order walk, the missing-node skip, the bbox check on the FIRST node only,
+/// and the equal-node-id skip. `cluster` = the RNW cluster id the segment lands in: osm2rnw
+/// numbers clusters by the order `build_clusters` pops them in its stack-DFS (write_nav passes
+/// `index + 1`) — replicated here bit-for-bit so LID cell ids match a same-source RNW build.
+#[derive(Clone)]
+struct OneCell {
+    ca: (i64, i64),
+    cb: (i64, i64),
+    mid: (i64, i64),
+    name: Option<String>,
+    cluster: u32,
+}
+
+fn build_onecells(d: &Data, bbox: Option<(f64, f64, f64, f64)>) -> Vec<OneCell> {
+    let bb = bbox.map(|(w, s, e, n)| (deg2pau(w), deg2pau(s), deg2pau(e), deg2pau(n)));
+    let mut segs: Vec<OneCell> = Vec::new();
+    for (ids, name) in &d.hw {
+        for pair in ids.windows(2) {
+            let (ca, cb) = match (d.nodes.get(&pair[0]), d.nodes.get(&pair[1])) {
+                (Some(a), Some(b)) => (*a, *b),
+                _ => continue,
+            };
+            if let Some((w, s, e, n)) = bb {
+                if ca.0 < w || ca.0 > e || ca.1 < s || ca.1 > n {
+                    continue;
+                }
+            }
+            if pair[0] == pair[1] {
+                continue;
+            }
+            segs.push(OneCell {
+                ca,
+                cb,
+                mid: ((ca.0 + cb.0) / 2, (ca.1 + cb.1) / 2),
+                name: name.clone(),
+                cluster: 0,
+            });
+        }
+    }
+    if segs.is_empty() {
+        return segs;
+    }
+    // Root box = extent of the used nodes (osm2rnw `extent(&gnodes)` of the segment endpoints).
+    let (mut w, mut e, mut s, mut n) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    for sg in &segs {
+        for c in [sg.ca, sg.cb] {
+            w = w.min(c.0);
+            e = e.max(c.0);
+            s = s.min(c.1);
+            n = n.max(c.1);
+        }
+    }
+    // osm2rnw build_clusters(): recursive bbox quad-split, target 700 onecells/cluster, stack DFS.
+    const TARGET_OC: usize = 700;
+    let all: Vec<usize> = (0..segs.len()).collect();
+    let mut stack = vec![(0usize, w, e, s, n, all)];
+    let mut ncl = 0u32;
+    while let Some((depth, x0, x1, y0, y1, mem)) = stack.pop() {
+        if mem.len() <= TARGET_OC || depth >= 16 || x0 >= x1 || y0 >= y1 {
+            if !mem.is_empty() {
+                ncl += 1;
+                for &i in &mem {
+                    segs[i].cluster = ncl;
+                }
+            }
+            continue;
+        }
+        let mw = x0 + (x1 - x0) / 2;
+        let mh = y0 + (y1 - y0) / 2;
+        let mut q: [Vec<usize>; 4] = [vec![], vec![], vec![], vec![]];
+        for &i in &mem {
+            let (x, y) = segs[i].mid;
+            q[(if x >= mw { 1 } else { 0 }) + if y >= mh { 2 } else { 0 }].push(i);
+        }
+        let cells = [(x0, mw, y0, mh), (mw, x1, y0, mh), (x0, mw, mh, y1), (mw, x1, mh, y1)];
+        for (cell, (cw, ce, cs, cn)) in q.into_iter().zip(cells) {
+            if !cell.is_empty() {
+                stack.push((depth + 1, cw, ce, cs, cn, cell));
+            }
+        }
+    }
+    segs
+}
+
+/// Squared PAU distance from a point to a segment chord (i128 to survive PAU-sized squares).
+fn pt_seg_d2(p: (i64, i64), a: (i64, i64), b: (i64, i64)) -> i128 {
+    let (px0, py0) = (p.0 as i128, p.1 as i128);
+    let (ax, ay) = (a.0 as i128, a.1 as i128);
+    let (bx, by) = (b.0 as i128, b.1 as i128);
+    let (vx, vy) = (bx - ax, by - ay);
+    let len2 = (vx * vx + vy * vy).max(1);
+    let t = ((px0 - ax) * vx + (py0 - ay) * vy).clamp(0, len2);
+    let dx = px0 - (ax + vx * t / len2);
+    let dy = py0 - (ay + vy * t / len2);
+    dx * dx + dy * dy
+}
+
+/// One record per numeric `addr:housenumber` joined to a street in `LID20006`. Cell model as
+/// reverse-engineered from the card stock (§11.6c `enGetHnrCellIndices 00e0c8bc` +
+/// `enDecodeCells 00e0c584`): the block table row = one RNW **onecell segment** (0x004 = the RNW
+/// cluster id a same-source `osm2rnw` build writes — verified equal segment/cluster counts on a
+/// shared extract), records = one per (segment, parity) with `0xc01..0xc02` min..max and parity
+/// bits `0xc09/0xc0a` (mirrored into `0xc0b/0xc0c`), `0xc11` = per-record row ordinal (both
+/// parities of a segment cite the same row — the stock GRÓJECKA shape), and `0x001` = a unique
+/// per-record author id. Addresses are assigned to the nearest segment of their street; streets
+/// whose ways never passed the routable filter get one synthetic row (their own cluster id) so
+/// their numbers are still shipped. [OPEN] stock hnr cluster ids are an author-side registry
+/// numbering, not raw RNW ids — pairing our own osm2rnw + osm2lid output is self-consistent but
+/// not card-verified.
 fn write_gen_attr(
     path: &Path,
     d: &Data,
@@ -701,10 +831,31 @@ fn write_gen_attr(
     region: u16,
 ) -> usize {
     use lid_format::write::{write_gen_attr_file, BlockData, ColData, ColKind};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    // street element id -> its house numbers (numeric only, street present in the name-list, in bbox).
-    let mut by_street: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let segs = build_onecells(d, bbox);
+    let ncl = segs.iter().map(|s| s.cluster).max().unwrap_or(0);
+    eprintln!("onecells: {} clusters: {}", segs.len(), ncl);
+    let cluster_next = ncl + 1;
+
+    // street element id -> its onecells (global segment ordinals, in segment order)
+    let mut segs_by_sid: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, sg) in segs.iter().enumerate() {
+        if let Some(nm) = &sg.name {
+            if let Some(&sid) = street_idx.get(nm.trim()) {
+                segs_by_sid.entry(sid).or_default().push(i);
+            }
+        }
+    }
+
+    // Numeric addresses in bbox joined to the name list -> even/odd number buckets per segment
+    // (key VIRT+sid = street without any routable segment, one synthetic row for the whole way).
+    const VIRT: usize = usize::MAX / 2;
+    let mut seg_even: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut seg_odd: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut virt_cluster: HashMap<u32, u32> = HashMap::new(); // streetless sid -> synthetic cluster
+    let mut virt_cnt: HashMap<u32, (i128, i128, u32)> = HashMap::new();
+    let mut owned: BTreeSet<u32> = BTreeSet::new(); // streets with at least one numeric address
     let mut nrec_all = 0usize;
     for (num, c, street) in &d.addrs {
         if !in_bbox(*c, bbox) {
@@ -714,17 +865,47 @@ fn write_gen_attr(
             continue;
         };
         let Some(n) = hnr_number(num) else { continue };
-        by_street.entry(sid).or_default().push(n);
+        let key = match segs_by_sid.get(&sid) {
+            Some(list) if !list.is_empty() => {
+                let mut best = list[0];
+                let mut bd = pt_seg_d2(*c, segs[best].ca, segs[best].cb);
+                for &i in list.iter().skip(1) {
+                    let dd = pt_seg_d2(*c, segs[i].ca, segs[i].cb);
+                    if dd < bd {
+                        bd = dd;
+                        best = i;
+                    }
+                }
+                best
+            }
+            _ => {
+                let e = virt_cnt.entry(sid).or_insert((0, 0, 0));
+                e.0 += i128::from(c.0);
+                e.1 += i128::from(c.1);
+                e.2 += 1;
+                VIRT + sid as usize
+            }
+        };
+        if n % 2 == 0 {
+            seg_even.entry(key).or_default().push(n);
+        } else {
+            seg_odd.entry(key).or_default().push(n);
+        }
+        owned.insert(sid);
         nrec_all += 1;
     }
     if nst < 2 || nrec_all == 0 {
         return 0;
     } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
+    for &sid in virt_cnt.keys() {
+        virt_cluster.insert(sid, cluster_next);
+    }
 
     // Always >= 2 blocks tiling [0, nst).
     let nblk = (nst as usize).div_ceil(HN_ATTR_CHUNK).max(2);
     let w = (nst as usize).div_ceil(nblk);
     let mut blocks = Vec::new();
+    let mut gid = 0u32; // author-space id for column 0x001: unique per record, ever-increasing
     for lo in (0..nst as usize).step_by(w) {
         let hi = (lo + w).min(nst as usize);
         let width = (hi - lo) as u32;
@@ -734,31 +915,47 @@ fn write_gen_attr(
         let mut tos: Vec<u32> = Vec::new(); // 0xc02 per-record `to` bound (NLHnr+0xc)
         let mut ev: Vec<bool> = Vec::new();
         let mut od: Vec<bool> = Vec::new();
-        for (&sid, list) in by_street.range(lo as u32..hi as u32) {
+        let mut rec_row: Vec<u32> = Vec::new(); // 0xc11 per-record table row (both sides share one)
+        let mut rec_id: Vec<u32> = Vec::new(); // 0x001 per-record author id
+        let mut row_cluster: Vec<u32> = Vec::new(); // table row -> RNW cluster id (0x004)
+        for &sid in owned.range(lo as u32..hi as u32) {
+            // rows for this street: its segments that actually carry numbers, else the synthetic
+            let mut street_rows: Vec<(usize, u32)> = Vec::new(); // (seg idx | VIRT+sid, cluster)
+            if let Some(list) = segs_by_sid.get(&sid) {
+                for &i in list {
+                    if seg_even.contains_key(&i) || seg_odd.contains_key(&i) {
+                        street_rows.push((i, segs[i].cluster));
+                    }
+                }
+            }
+            if street_rows.is_empty() && virt_cluster.contains_key(&sid) {
+                street_rows.push((VIRT + sid as usize, virt_cluster[&sid]));
+            }
+            if street_rows.is_empty() {
+                continue;
+            }
             exists[(sid - lo as u32) as usize] = true;
             offs.push(nums.len() as u32);
-            let mut list = list.clone();
-            list.sort_unstable();
-            for &n in &list {
-                nums.push(n);
-                tos.push(n);
-                ev.push(n % 2 == 0);
-                od.push(n % 2 == 1);
+            for &(seg, cl) in &street_rows {
+                let base = row_cluster.len() as u32;
+                row_cluster.push(cl);
+                for (odd, bucket) in [(false, seg_even.get(&seg)), (true, seg_odd.get(&seg))] {
+                    let Some(list) = bucket else { continue };
+                    let mut list = list.clone();
+                    list.sort_unstable();
+                    let (mn, mx) = (list[0], *list.last().unwrap());
+                    nums.push(mn);
+                    tos.push(mx);
+                    ev.push(!odd);
+                    od.push(odd);
+                    rec_row.push(base);
+                    gid += 1;
+                    rec_id.push(gid);
+                }
             }
         }
         let nrec = nums.len();
-        let dom1 = |n: u32| ColData {
-            selector: 0xc11,
-            kind: ColKind::ValueList,
-            domain: n,
-            exists: vec![true; n as usize],
-            counts: (0..n).collect(),
-            values: (0..n).collect(),
-            bits: vec![],
-            code_8000: 0x16,
-            code_0000: 0x14,
-            range_from_to: None,
-        };
+        let nrow = row_cluster.len();
         let bits_col = |selector: u16, bits: Vec<bool>| ColData {
             selector,
             kind: ColKind::Binary,
@@ -783,7 +980,50 @@ fn write_gen_attr(
             code_0000: 0x11,
             range_from_to: None,
         };
+        let simple = |selector: u16, values: Vec<u32>, code: u16| ColData {
+            selector,
+            kind: ColKind::Simple32,
+            domain: 0,
+            exists: vec![],
+            counts: vec![],
+            values,
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: code,
+            range_from_to: None,
+        };
+        // 0xc11: per-record ROW ordinal, exactly one value per record (stock shape: one flat
+        // ValueList over the record domain; both parities of a segment cite the same row).
+        let c11 = ColData {
+            selector: 0xc11,
+            kind: ColKind::ValueList,
+            domain: nrec as u32,
+            exists: vec![true; nrec],
+            counts: (0..nrec as u32).collect(),
+            values: rec_row,
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        };
+        // Block cell table (kolumny bound to NLCellIdAttrVector @+0x40/+0x530, §11.6c):
+        // one row per segment; 0x002 = source NAV file no. (0 = single NAV file build),
+        // 0x004 = RNW cluster id, 0x005 = per-row existence bits.
+        let one_per_row: Vec<u32> = vec![1; nrow];
+        let row_ord: Vec<u32> = (0..nrow as u32).collect();
         let mut cols = vec![
+            ColData {
+                selector: 0x0001,
+                kind: ColKind::ValueList,
+                domain: width,
+                exists: exists.clone(),
+                counts: offs.clone(),
+                values: rec_id,
+                bits: vec![],
+                code_8000: 0x16,
+                code_0000: 0x14,
+                range_from_to: None,
+            },
             ColData {
                 selector: 0xc01,
                 kind: ColKind::ValueList,
@@ -808,16 +1048,68 @@ fn write_gen_attr(
                 code_0000: 0x14,
                 range_from_to: None,
             },
-            dom1(nrec as u32),
+            c11,
             bits_col(0xc09, ev),
-            bits_col(0xc0a, od),
-            bits_col(0xc0b, vec![false; nrec]),
-            bits_col(0xc0d, vec![false; nrec]),
+            bits_col(0xc0a, od.clone()),
+            bits_col(0xc0b, od.clone()), // parity mirror (stock: c0b==c09, c0c==c0a)
+            bits_col(0xc0c, od),
+            bits_col(0xc0d, vec![false; nrec]), // direction flag: [OPEN], stock writes ~half set
             es_col(0xc03),
             es_col(0xc04),
             es_col(0xc05),
             es_col(0xc06),
         ];
+        cols.push(ColData {
+            selector: 0x4003,
+            kind: ColKind::Rows(vec![(0x4003, 0x03, nrow as u32, Vec::new())]),
+            domain: nrow as u32,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        });
+        cols.push(ColData {
+            selector: 0x0002,
+            kind: ColKind::Simple16,
+            domain: 0,
+            exists: vec![],
+            counts: vec![],
+            values: vec![0; nrow],
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x11,
+            range_from_to: None,
+        });
+        cols.push(simple(0x8003, one_per_row.clone(), 0x16));
+        cols.push(simple(0x0003, row_ord.clone(), 0x14));
+        cols.push(simple(0x8004, one_per_row, 0x16));
+        cols.push(ColData {
+            selector: 0x0004,
+            kind: ColKind::Simple32,
+            domain: 0,
+            exists: vec![],
+            counts: vec![],
+            values: row_cluster,
+            bits: vec![],
+            code_8000: 0x16,
+            code_0000: 0x18,
+            range_from_to: None,
+        });
+        cols.push(ColData {
+            selector: 0x0005,
+            kind: ColKind::Binary,
+            domain: nrow as u32,
+            exists: vec![],
+            counts: vec![],
+            values: vec![],
+            bits: vec![true; nrow],
+            code_8000: 0x16,
+            code_0000: 0x14,
+            range_from_to: None,
+        });
         cols.retain(|c| nrec > 0 || c.selector == 0xc01);
         blocks.push(BlockData {
             elem_start: lo as u32,
@@ -834,16 +1126,6 @@ fn write_gen_attr(
     nrec_all
 }
 
-/// Point-address block width (street elements per DETAIL block; stock block sizes were ~k-10k).
-const PA_CHUNK: usize = 4096;
-
-/// Emit `PA_20006.DAT` — the point-address (fileType 0x18) sidecar of the STREET list: one access
-/// point per street element. Device model (§11.7b, `bGetPACells 00be072c` / `00e0f8c4`): DETAIL
-/// rows `0xd0b..0xd0f` = cell id / left / right / ratio / RELATIVE position; the device ADDS the
-/// street element's own name-list anchor, so we store `house − street_centroid`. `cell` and `ratio`
-/// existence bitmaps are all-set ([OPEN] NLCellID semantics unknown ⇒ neutral 0; ratio 100).
-/// Position only for streets that have a numeric address — every other element keeps `None`, and
-/// the device falls back to the anchor itself (= same result as shipping no PA file at all).
 fn write_pa(
     path: &Path,
     d: &Data,

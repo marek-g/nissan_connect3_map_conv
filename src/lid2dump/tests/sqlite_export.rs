@@ -37,6 +37,8 @@ fn export_file(name: &str, kind: &str, list_id: Option<u16>) -> ExportFile {
         elements: Vec::new(),
         rel: None,
         hnr: Vec::new(),
+        block_cells: Vec::new(),
+        cellmap: Vec::new(),
         mirrors: Vec::new(),
     }
 }
@@ -90,6 +92,8 @@ fn export_views_and_joins() {
             house_number_to: Some(7),
             even: Some(false),
             odd: Some(true),
+            side: Some((false, true, false)),
+            cell: Some(1),
         },
         HnrRow {
             elem: 1,
@@ -98,6 +102,8 @@ fn export_views_and_joins() {
             house_number_to: Some(9),
             even: Some(false),
             odd: Some(true),
+            side: Some((false, true, false)),
+            cell: Some(1),
         },
     ];
     let mut poi = export_file("GLOB_POI", "sqlite", None);
