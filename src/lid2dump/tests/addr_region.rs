@@ -35,6 +35,7 @@ fn list(name: &str, list_id: u16, elements: Vec<ExportElement>) -> ExportFile {
         block_cells: Vec::new(),
         cellmap: Vec::new(),
         mirrors: Vec::new(),
+        crossings: Vec::new(),
     }
 }
 
@@ -46,11 +47,7 @@ fn car_view_city_streets_via_addr_regions() {
         2,
         vec![
             elem(0, "KRZESZOWICE", "08 500 KRZESZOWICE"),
-            elem(
-                3,
-                "KRAKOW",
-                "43 198 KRAKOW\t43 198 KRAKOW\tKRAKÓW",
-            ),
+            elem(3, "KRAKOW", "43 198 KRAKOW\t43 198 KRAKOW\tKRAKÓW"),
             elem(7, "MAZOWIECKI, GRODZISK", "08 505 GRODZISK"),
             elem(8, "GRODZISK", "08 506 GRODZISK"),
         ],
@@ -68,7 +65,11 @@ fn car_view_city_streets_via_addr_regions() {
         "LID20000",
         129,
         vec![
-            elem(1, "KRZESZOWICE, ULICA ZBICKA 3", "KRZESZOWICE, ULICA ZBICKA 3"),
+            elem(
+                1,
+                "KRZESZOWICE, ULICA ZBICKA 3",
+                "KRZESZOWICE, ULICA ZBICKA 3",
+            ),
             elem(
                 2,
                 "KRAKOW, ULICA GROMADY GRUDZIAZ 21",
@@ -86,34 +87,23 @@ fn car_view_city_streets_via_addr_regions() {
     let empty = list("LID40002", 2, Vec::new());
 
     let mut conn = Connection::open_in_memory().unwrap();
-    lid2dump::sqlite_export::write_to(
-        &mut conn,
-        &[
-            city,
-            region,
-            addr,
-            empty,
-        ],
-    )
-    .unwrap();
+    lid2dump::sqlite_export::write_to(&mut conn, &[city, region, addr, empty]).unwrap();
 
     let addr_rows: Vec<(String, String, Option<String>)> = conn
         .prepare("SELECT city, street, house_number FROM addr ORDER BY elem")
         .unwrap()
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-            ))
-        })
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(
         addr_rows,
         vec![
-            ("KRZESZOWICE".into(), "ULICA ZBICKA".into(), Some("3".into())),
+            (
+                "KRZESZOWICE".into(),
+                "ULICA ZBICKA".into(),
+                Some("3".into())
+            ),
             (
                 "KRAKOW".into(),
                 "ULICA GROMADY GRUDZIAZ".into(),
@@ -172,7 +162,10 @@ fn car_view_city_streets_via_addr_regions() {
         .unwrap()
         .query_row([], |r| r.get(0))
         .unwrap();
-    assert_eq!(krakow, 0, "KRAKOW addr entry must NOT alias KRAKÓW diacritic name");
+    assert_eq!(
+        krakow, 0,
+        "KRAKOW addr entry must NOT alias KRAKÓW diacritic name"
+    );
     let krakow_ascii: i64 = conn
         .prepare(
             "SELECT COUNT(*) FROM v_city_street WHERE city_name = 'KRAKOW' AND name = 'ULICA GROMADY GRUDZIAZ'",
@@ -180,5 +173,8 @@ fn car_view_city_streets_via_addr_regions() {
         .unwrap()
         .query_row([], |r| r.get(0))
         .unwrap();
-    assert_eq!(krakow_ascii, 1, "ASCII city name must carry the address-derived street");
+    assert_eq!(
+        krakow_ascii, 1,
+        "ASCII city name must carry the address-derived street"
+    );
 }

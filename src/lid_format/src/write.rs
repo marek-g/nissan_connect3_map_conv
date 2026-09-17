@@ -119,7 +119,12 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
         match &c.kind {
             ColKind::ValueList => {
                 let xc = ex_code(&c.exists);
-                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector | 0x4000,
+                    xc,
+                    c.domain,
+                    exist_bytes(&c.exists, xc),
+                ));
                 rows.push((
                     c.selector | 0x8000,
                     c.code_8000,
@@ -139,7 +144,12 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
                     .as_ref()
                     .expect("Range column needs range_from_to");
                 let xc = ex_code(&c.exists);
-                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector | 0x4000,
+                    xc,
+                    c.domain,
+                    exist_bytes(&c.exists, xc),
+                ));
                 rows.push((
                     c.selector | 0x8000,
                     0x16,
@@ -155,7 +165,12 @@ pub fn build_block(blk: &BlockData) -> Vec<u8> {
             }
             ColKind::SingleValue => {
                 let xc = ex_code(&c.exists);
-                rows.push((c.selector | 0x4000, xc, c.domain, exist_bytes(&c.exists, xc)));
+                rows.push((
+                    c.selector | 0x4000,
+                    xc,
+                    c.domain,
+                    exist_bytes(&c.exists, xc),
+                ));
                 rows.push((
                     c.selector,
                     c.code_0000,
@@ -243,7 +258,7 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
     out[..reuse].copy_from_slice(&outer[..reuse]);
     out[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
     out[0x14..0x18].copy_from_slice(&(hdr as u32 + toc_size as u32).to_le_bytes()); // sub-header region size
-                                                                                     // Sub-header @hdr: elem_count, x (reuse or computed), toc_count.
+                                                                                    // Sub-header @hdr: elem_count, x (reuse or computed), toc_count.
     out[hdr..hdr + 4].copy_from_slice(&element_count.to_le_bytes());
     out[hdr + 8..hdr + 12].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
     // Blocks.

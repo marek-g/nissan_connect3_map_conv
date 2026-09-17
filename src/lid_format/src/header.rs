@@ -26,6 +26,10 @@ pub const NL_AUTHOR_BLOCK: [u8; 0x5F] = [
 pub const KIND_NAME_LIST: u32 = 1;
 /// GenAttr (`LID4nnnn`).
 pub const KIND_GEN_ATTR: u32 = 3;
+/// Crossing file (`LID3nnnn` = fileID+10000); kind observed on modern-gen stock DEU `LID30006`.
+pub const KIND_CROSSING: u32 = 2;
+/// LID5 (`LID5nnnn` = fileID+30000) id/list container (kind 4 on stock DEU `LID50001`).
+pub const KIND_ID_LIST: u32 = 4;
 /// REL relation matrix.
 pub const KIND_REL: u32 = 6;
 /// `PA_%05u` container class stored at header `u32@0x0c`. No stock card ships a PA file, so the

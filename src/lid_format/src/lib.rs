@@ -485,6 +485,192 @@ pub fn read_gen_attr(b: &[u8]) -> Result<GenAttrIndex, String> {
         .ok_or_else(|| "not a GenAttr file (TOC element ranges do not tile)".into())
 }
 
+/// A crossing (`LID3%05u` = fileID+10000) file index. Elements are the crossings themselves and
+/// live in the *street list's* element-id domain (DEU `LID30006` `elem_count` = the
+/// `LID20006` element count). Header kind `2`; sub-header (`NLCrossingFile::DecodeSubHeader`
+/// @0xe08eb0) = `{u32 elem_count, u32 X, u32 file_size, u32 block_count, TOC[block_count]
+/// {u32 block_off, NLInterval{u32 elem_start, u32 elem_end_incl}}}` — same TOC shape as GenAttr,
+/// 4 bytes of extra sub-header fields. RE-verified 2026-09 against stock DEU (test
+/// `crossing_re.rs`); the LEGACY-variant cards (author @0x0c, `02 77 ?? ??` @0x08 — e.g. the POL
+/// card) fail this parse by design: their sub-header slot holds author garbage.
+pub struct CrossingIndex {
+    pub element_count: u32,
+    /// Sub-header `X` (= GenAttr `x`: file_size − first block_off on stock modern-gen DEU).
+    pub x: u32,
+    pub blocks: Vec<GenAttrTocEntry>,
+}
+
+fn crossing_toc(b: &[u8]) -> Option<(u32, u32, Vec<GenAttrTocEntry>)> {
+    let n = b.len();
+    let hdr = u32(b, 0x10) as usize;
+    if hdr + 32 > n || u32(b, 0x0c) != header::KIND_CROSSING {
+        return None;
+    }
+    let (elem_count, x, fsize, toccount) = (
+        u32(b, hdr),
+        u32(b, hdr + 4),
+        u32(b, hdr + 8),
+        u32(b, hdr + 12),
+    );
+    if !(2..=1_000_000).contains(&toccount) || !(1..=0x7fff_ffff).contains(&elem_count) {
+        return None;
+    }
+    let toc_end = hdr.checked_add(16)?.checked_add(12 * toccount as usize)?;
+    let mut p = hdr + 16;
+    let mut blocks: Vec<GenAttrTocEntry> = Vec::with_capacity((toccount as usize).min(n / 12));
+    for i in 0..toccount {
+        if p + 12 > n {
+            break;
+        }
+        let (o, a, c) = (u32(b, p), u32(b, p + 4), u32(b, p + 8));
+        p += 12;
+        let contiguous = i == 0 || a == blocks[i as usize - 1].elem_end + 1;
+        let off_ok = (o as usize) >= toc_end
+            && (o as usize) < n
+            && (i == 0 || o > blocks[i as usize - 1].block_off);
+        if !contiguous || a > c || c >= elem_count || !off_ok {
+            break;
+        }
+        let _ = fsize;
+        blocks.push(GenAttrTocEntry {
+            elem_start: a,
+            elem_end: c,
+            block_off: o,
+        });
+    }
+    // accept only a full tiling of [0, elem_count) and complete TOC consumption
+    if blocks.len() != toccount as usize
+        || blocks[0].elem_start != 0
+        || blocks.last().unwrap().elem_end != elem_count - 1
+    {
+        return None;
+    }
+    Some((elem_count, x, blocks))
+}
+
+/// True if `b` is a modern-gen crossing file with a sane first block (descriptor table leading
+/// with the existence-bitmap row of column 0x801 — the street-index column).
+pub fn is_crossing(b: &[u8]) -> bool {
+    match crossing_toc(b) {
+        None => false,
+        Some((_, _, blocks)) => {
+            let bs = blocks[0].block_off as usize;
+            if bs + 14 > b.len() {
+                return false;
+            }
+            let num_desc = u16(b, bs) as usize;
+            (1..=200).contains(&num_desc) && u16(b, bs + 2) & 0xfff == 0x801
+        }
+    }
+}
+
+/// Parse a crossing file index (modern-gen `LID3%05u` containers only).
+pub fn read_crossings(b: &[u8]) -> Result<CrossingIndex, String> {
+    crossing_toc(b)
+        .map(|(element_count, x, blocks)| CrossingIndex {
+            element_count,
+            x,
+            blocks,
+        })
+        .ok_or_else(|| "not a modern-gen crossing file (kind != 2 or TOC does not tile)".into())
+}
+
+/// One decoded crossing: its element id (street-list id space) and the crossing's street
+/// element-ids (indices into the name list read by `read`, via `enDecodeCrossings` member +0x28 /
+/// `enGetCrossingStreetIndex 0x00e07af0`).
+#[derive(Debug, Clone)]
+pub struct Crossing {
+    pub element: u32,
+    pub streets: Vec<u32>,
+}
+
+impl CrossingIndex {
+    /// Decode the crossings of block `bi` = the column-0x801 `NLValueListAttrVector`
+    /// (existence bitmap 0x4801 / value-starts 0x8801 / values 0x0801; `starts` are absolute
+    /// offsets into `values`, the final row's end implicit at `values.len()`). Street-ids resolve
+    /// against the street name list of the same partition (`fileID`).
+    pub fn decode_crossings(&self, b: &[u8], bi: usize) -> Result<Vec<Crossing>, String> {
+        let e = *self.blocks.get(bi).ok_or("block index out of range")?;
+        let n = b.len();
+        let bs = e.block_off as usize;
+        let be = if bi + 1 < self.blocks.len() {
+            self.blocks[bi + 1].block_off as usize
+        } else {
+            n
+        };
+        if bs + 2 > n {
+            return Err("truncated crossing block".into());
+        }
+        let num_desc = u16(b, bs) as usize;
+        let mut descs: Vec<Desc> = Vec::with_capacity(num_desc);
+        let mut p = bs + 2;
+        for _ in 0..num_desc {
+            if p + 12 > be {
+                break;
+            }
+            let k = u16(b, p);
+            descs.push(Desc {
+                kind: k & 0xfff,
+                flags: k & 0xf000,
+                code: u16(b, p + 2),
+                off: u32(b, p + 4),
+                param: u32(b, p + 8),
+            });
+            p += 12;
+        }
+        let offs: Vec<u32> = descs.iter().map(|d| d.off).collect();
+        let span_end = |i: usize| -> usize {
+            if i + 1 < offs.len() {
+                bs + offs[i + 1] as usize
+            } else {
+                be
+            }
+        };
+        let mut bits: Vec<bool> = Vec::new();
+        let mut starts: Vec<u32> = Vec::new();
+        let mut values: Vec<u32> = Vec::new();
+        for (i, d) in descs.iter().enumerate() {
+            if d.kind != 0x801 || d.flags == 0xc000 {
+                continue;
+            }
+            let (s, en) = (bs + d.off as usize, span_end(i));
+            let count = d.param as usize;
+            if matches!(d.flags, 0x4000) {
+                bits = bitfield(b, d.code, s, en, count);
+            } else if matches!(d.flags, 0x8000) {
+                starts = decode_u32(b, d.code, s, en, count);
+            } else {
+                values = decode_u32(b, d.code, s, en, count);
+            }
+        }
+        if starts.is_empty() || values.is_empty() {
+            return Err(format!("block {bi}: no column-0x801 value list"));
+        }
+        let n_elem = e.elem_end - e.elem_start + 1;
+        let mut out = Vec::new();
+        let mut j = 0usize;
+        for local in 0..n_elem as usize {
+            if bits.get(local).copied().unwrap_or(true) {
+                let st = starts.get(j).copied().unwrap_or(values.len() as u32) as usize;
+                let en = starts
+                    .get(j + 1)
+                    .map(|x| *x as usize)
+                    .unwrap_or_else(|| values.len())
+                    .max(st);
+                if en > values.len() {
+                    return Err(format!("block {bi}: VL range {st}..{en} past values"));
+                }
+                out.push(Crossing {
+                    element: e.elem_start + local as u32,
+                    streets: values[st..en].to_vec(),
+                });
+                j += 1;
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// One decoded descriptor stream of a `NLGeneralAttributeBlock`. `NLGeneralAttributeBlock::SetDataBlock`
 /// (@0xe09b60) reads `[u16 num_desc]` then `num_desc × {u16 kind, u16 code, u32 off, u32 param}`,
 /// and dispatches `kind & 0xfff` to an attribute-vector slot and `kind & 0xf000` to that vector's
@@ -612,6 +798,9 @@ pub fn is_name_list(b: &[u8]) -> bool {
         return false;
     }
     if is_gen_attr(b) {
+        return false;
+    }
+    if is_crossing(b) {
         return false;
     }
     let hdr = u32(b, 0x10);
@@ -806,12 +995,21 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         // index). `NLInputStep::bStepDown` (00cecf78) then RE-HOMES the search to that node in that
         // block while the accumulator string keeps running — the namelist trie is a DAG spanning
         // blocks (`enGetNodeBlockLink` + `poGetContainer`). Names therefore need the cross-block walk.
-        let mut links: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+        let mut links: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
         if let (Some(bd), Some(vd)) = (get(0x402, 0x4000), get(0x402, 0)) {
             let nn = (bd.param as usize).min(node_count);
             let bits = bitfield(b, bd.code, bs + bd.off as usize, span_end(bd), nn);
-            let ones: Vec<usize> = (0..node_count.min(bits.len())).filter(|&i| bits[i]).collect();
-            let vals = decode_u32(b, vd.code, bs + vd.off as usize, span_end(vd), vd.param as usize * 2);
+            let ones: Vec<usize> = (0..node_count.min(bits.len()))
+                .filter(|&i| bits[i])
+                .collect();
+            let vals = decode_u32(
+                b,
+                vd.code,
+                bs + vd.off as usize,
+                span_end(vd),
+                vd.param as usize * 2,
+            );
             for (k, &nd) in ones.iter().enumerate() {
                 if 2 * k + 1 < vals.len() {
                     links.insert(nd, (vals[2 * k] as usize, vals[2 * k + 1] as usize));
@@ -931,7 +1129,8 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     // forward, so one ascending sweep resolves every reached terminal's full raw string. Terminals
     // of subtrees that no link addresses keep their block-local spelling (their string starts at
     // the local root, empty prefix — identical to the old per-block reading).
-    let mut global: std::collections::HashMap<(usize, usize), Vec<u8>> = std::collections::HashMap::new();
+    let mut global: std::collections::HashMap<(usize, usize), Vec<u8>> =
+        std::collections::HashMap::new();
     let mut entries: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); bp.len()];
     if let Some(first) = bp.first() {
         for &r in &first.roots {
@@ -1008,7 +1207,11 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
                 (0, 0)
             };
             let belonging = if blk.belongs_flag.get(ei).copied().unwrap_or(false) {
-                let v = blk.belongs_vals.get(bel_rank).copied().unwrap_or(0xffff_ffff);
+                let v = blk
+                    .belongs_vals
+                    .get(bel_rank)
+                    .copied()
+                    .unwrap_or(0xffff_ffff);
                 bel_rank += 1;
                 v
             } else {
@@ -1288,12 +1491,20 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     let mut leaf_of = vec![0usize; entries.len()];
     for (ei, e) in entries.iter().enumerate() {
         let mut h = 0usize;
+        let last = e.label.len();
         for &b in e.label.as_bytes().iter().chain(std::iter::once(&0u8)) {
+            // Prefix edges merge like in any trie. The terminating 0x00 edge NEVER merges:
+            // duplicate names are PARALLEL leaf edges — that is how stock stores several
+            // same-name elements in one block (CHECKED on POL stock: 843k (name,city) groups
+            // with >1 element, up to 105; DEBINY x12; the device enumerates elements per
+            // edge, so each duplicate is its own element/coordinate row).
             let mut nxt = None;
-            for &(eb, ch) in nodes[h].child.iter() {
-                if eb == b {
-                    nxt = Some(ch);
-                    break;
+            if b != 0 {
+                for &(eb, ch) in nodes[h].child.iter() {
+                    if eb == b {
+                        nxt = Some(ch);
+                        break;
+                    }
                 }
             }
             let ch = match nxt {
@@ -1412,7 +1623,7 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     let descs: Vec<(u16, u16, &[u8], u32)> = vec![
         (0x0401, 0x11, &od_bytes, nc as u32),     // outDegree (raw u16)
         (0x4402, 0x01, &bl_bits, nc as u32),      // block-link bitmap (raw bits, flags 0x4000)
-        (0x0402, 0x14, &[] as &[u8], 0),          // block-link targets: k=0 pairs (stock emits both rows, even empty)
+        (0x0402, 0x14, &[] as &[u8], 0), // block-link targets: k=0 pairs (stock emits both rows, even empty)
         (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob (raw bytes)
         (0x4403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (VLE, flags 0x4000)
         (pos_wf, pos_code, pos_bytes, elem_count as u32), // has-position sub-stream (flags 0x4000, tie off)
@@ -1443,6 +1654,45 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_duplicate_names_roundtrip() {
+        // Parallel-terminal-edge model (stock shape): same label + same city must survive
+        // encode->decode as SEPARATE elements with their own coordinates, in input order.
+        let e = |nm: &str, x: i32, cy: i32| NameEntry {
+            label: nm.into(),
+            x_pau: x,
+            y_pau: 5,
+            city: Some((100, cy)),
+        };
+        let entries = vec![
+            e("Osada", 10, 1),
+            e("X", 20, 1),
+            e("Osada", 30, 1), // SAME label AND city as entry 0
+            e("Osada", 40, 2), // same label, other city (stock DEBINY pattern)
+        ];
+        let bytes = encode_id(0x402, 3, &entries);
+        let nl = read(&bytes).expect("decode");
+        assert_eq!(nl.elements.len(), 4, "duplicates are distinct elements");
+        let osada: Vec<_> = nl.elements.iter().filter(|x| x.name == "Osada").collect();
+        assert_eq!(osada.len(), 3);
+        // Coordinates come back as per-city-anchor deltas (§12.5). City groups keep input order:
+        // city1 [Osada(10)->-90, X, Osada(30)->-70], city2 [Osada(40)->-60].
+        let names_x: Vec<_> = nl
+            .elements
+            .iter()
+            .map(|x| (x.name.clone(), x.x_pau))
+            .filter(|(n, _)| n == "Osada")
+            .collect();
+        assert_eq!(
+            names_x,
+            vec![
+                ("Osada".into(), -90i32),
+                ("Osada".into(), -70),
+                ("Osada".into(), -60)
+            ]
+        );
+    }
 
     /// A synthetic `NLGenAttrFile`: 0x26 outer header (`hdr_size`@0x10), then the sub-header
     /// `{elem_count, x, toc_count, block_count}` at `hdr`, then `toc_count` 12-byte TOC entries
@@ -1549,11 +1799,19 @@ mod tests {
         assert_eq!(blk.elem_end, 7903);
         // Correct TOC window ⇒ 0xc01 owner domain == block width (the historic −4 grouping read
         // this block's numbers from the NEXT block's table and saw domain 4027 "shifted").
-        let c01 = blk.streams.iter().find(|s| s.col == 0xc01 && s.flags == 0x4000).unwrap();
+        let c01 = blk
+            .streams
+            .iter()
+            .find(|s| s.col == 0xc01 && s.flags == 0x4000)
+            .unwrap();
         assert_eq!(c01.param, 7904);
         // parity bitmap col 0xc09 is per-**record**: its length must equal the 0xc01 value count.
         let par = blk.streams.iter().find(|s| s.col == 0xc09).unwrap();
-        let val = blk.streams.iter().find(|s| s.col == 0xc01 && s.flags == 0).unwrap();
+        let val = blk
+            .streams
+            .iter()
+            .find(|s| s.col == 0xc01 && s.flags == 0)
+            .unwrap();
         assert_eq!(par.bits.len(), val.values.len());
         assert_eq!(par.bits.len(), 9665);
         let set = par.bits.iter().filter(|&&x| x).count();
@@ -1681,7 +1939,12 @@ mod tests {
                     0,
                     4,
                     3,
-                    vl(5, vec![false, true, true, false, false], vec![0, 2], vec![3, 4, 7]),
+                    vl(
+                        5,
+                        vec![false, true, true, false, false],
+                        vec![0, 2],
+                        vec![3, 4, 7],
+                    ),
                     vec![100, 101, 102],
                     vec![false, true, false], // 3:odd 4:even 7:odd
                     vec![true, false, true],

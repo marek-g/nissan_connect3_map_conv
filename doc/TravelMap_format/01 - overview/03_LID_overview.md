@@ -198,12 +198,13 @@ stock card's structure, CHECKED on `stock_CCP_POL.db`:
    entry, split into 1200 m settlement clusters — exactly the stock shape (“DEBINY” ×12 entries with
    distinct coordinates, ordinary `addr_to_street`+`0xc11` bindings; CHECKED: those rows carry **no
    special attributes** — element `category` is NULL like any street and their hnr bit-mix equals
-   city streets; they are structurally plain streets). Each cluster anchors to its nearest city
-   (stock's 12 DEBINY entries anchor to *different* cities — a stock street may even carry several
-city pairs; our ASF encoder indexes elements by trie-leaf, so
-   same-name+same-city would collapse — merging per (label, city); intra-block true duplicates stay
-   an encoder-side [OPEN]). Its cell row binds to the nearest real routable segment's cluster ≤
-   **300 m** (stock village rows cite real road cell ids), else a synthetic id.
+    city streets; they are structurally plain streets). Each cluster anchors to its nearest city and
+    same-name+same-city duplicates are stored as PARALLEL 0x00 trie leaf edges (CONFIRMED on stock:
+    843k (name,city) groups hold >1 element, up to 105 — a stock street can also carry several city
+    REL pairs; encoder + `SidMap` binding per element: `encode_duplicate_names_roundtrip`,
+    numbers/PA/REL never pile onto the first duplicate). Its cell row binds to the nearest real
+    routable segment's cluster ≤
+    **300 m** (stock village rows cite real road cell ids), else a synthetic id.
 4. **Segment choice**: `min pt_seg_d2` over the target street's own segments only; both parity
    records of a segment share one cell-table row (`0xc11`/`block_cells`). A registered street whose
    ways never routed gets one row per whole element, clustered as in ③/3.

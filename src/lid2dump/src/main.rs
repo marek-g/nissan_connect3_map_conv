@@ -22,7 +22,9 @@ use std::process::exit;
 
 use serde_json::{json, Map, Value};
 
-use lid2dump::sqlite_export::{self, Cell, ExportElement, ExportFile, MirrorTable, RelOut};
+use lid2dump::sqlite_export::{
+    self, Cell, CrossingRow, ExportElement, ExportFile, MirrorTable, RelOut,
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -152,8 +154,8 @@ fn usage() {
     eprintln!(
         "Usage: lid2dump [opts] <file-or-dir>...\n\
         \t-o FILE          write JSON here (default stdout)\n\
-        \t--sqlite OUT.db  also write one relational SQLite db (tables file/element/rel/hnr,\n\
-        \t                   views v_element/v_city/v_street/v_address/v_completeness,\n\
+        \t--sqlite OUT.db  also write one relational SQLite db (tables file/element/rel/hnr/crossing,\n\
+        \t                   views v_element/v_city/v_street/v_address/v_crossing/v_completeness,\n\
         \t                   bundled SELECTs in table `queries`)\n\
         \t--country XXX    country label for the export (default: path segment after CCP/)\n\
         \t--coords MODE    abs lat/lon model: auto (single-block+origin), file-origin\n\
@@ -206,6 +208,7 @@ fn decode_for_export(
         block_cells: Vec::new(),
         cellmap: Vec::new(),
         mirrors: Vec::new(),
+        crossings: Vec::new(),
     };
 
     if data.starts_with(b"SQLite format 3") {
@@ -306,6 +309,24 @@ fn decode_for_export(
             Err(e) => Err(format!("rel parse: {e}")),
         };
     }
+    // Crossing file (`LID3%05u`): per-element street-id sets; checked before the name-list heuristic
+    // (a crossing sub-header otherwise passes it — the element ids would decode as names).
+    if u32le(&buf, 0x0c) == lid_format::header::KIND_CROSSING && lid_format::is_crossing(&buf) {
+        let ci = lid_format::read_crossings(&buf).map_err(|e| format!("crossing: {e}"))?;
+        let mut ex = mk("crossing");
+        ex.list_id = list_id;
+        ex.block_count = Some(ci.blocks.len());
+        for bi in 0..ci.blocks.len() {
+            match ci.decode_crossings(&buf, bi) {
+                Ok(cs) => ex.crossings.extend(cs.into_iter().map(|c| CrossingRow {
+                    elem: c.element,
+                    streets: c.streets,
+                })),
+                Err(e) => eprintln!("crossing block {bi}: {e}, skipped"),
+            }
+        }
+        return Ok(Some(ex));
+    }
     if lid_format::is_name_list(&buf) {
         let nl = lid_format::read(&buf).map_err(|e| format!("namelist: {e}"))?;
         let mut ex = mk("namelist");
@@ -385,8 +406,8 @@ fn decode_for_export(
                 continue;
             }
             let hv = stream(0xc01, 0);
-                let cv = stream(0xc11, 0); // flat per-record 0xc11 values (row ordinals)
-                let c1v = stream(0x0001, 0); // flat 0x001 per-entry ids (meaning [OPEN], no device consumer)
+            let cv = stream(0xc11, 0); // flat per-record 0xc11 values (row ordinals)
+            let c1v = stream(0x0001, 0); // flat 0x001 per-entry ids (meaning [OPEN], no device consumer)
             if !hv.is_empty() {
                 let bits = blk
                     .streams
@@ -408,7 +429,8 @@ fn decode_for_export(
                 // `0xc02` carries an existence bitmap; its value stream is packed in bitmap-set
                 // order. Stock has every record present (all bits set) so ordinal == record ordinal,
                 // but honor a sparse bitmap too.
-                let to_prefix: Vec<u32> = if !to_exists.is_empty() && !to_exists.iter().all(|&x| x) {
+                let to_prefix: Vec<u32> = if !to_exists.is_empty() && !to_exists.iter().all(|&x| x)
+                {
                     let mut p = Vec::with_capacity(to_exists.len() + 1);
                     let mut acc = 0u32;
                     p.push(0);
@@ -434,7 +456,9 @@ fn decode_for_export(
                         .find(|x| x.col == col && x.flags == 0)
                         .map(|x| *x.bits.get(r).unwrap_or(&false))
                 };
-                let owners: Vec<u32> = (0..bits.len() as u32).filter(|&i| bits[i as usize]).collect();
+                let owners: Vec<u32> = (0..bits.len() as u32)
+                    .filter(|&i| bits[i as usize])
+                    .collect();
                 if owners.len() == starts.len() && starts.first().copied() == Some(0) {
                     for (k, &o) in owners.iter().enumerate() {
                         let a = starts[k] as usize;
@@ -447,11 +471,7 @@ fn decode_for_export(
                                 house_number_to: to_at(r),
                                 even: bit_at(0xc09, r),
                                 odd: bit_at(0xc0a, r),
-                                side: match (
-                                    bit_at(0xc0b, r),
-                                    bit_at(0xc0c, r),
-                                    bit_at(0xc0d, r),
-                                ) {
+                                side: match (bit_at(0xc0b, r), bit_at(0xc0c, r), bit_at(0xc0d, r)) {
                                     (Some(b), Some(c), Some(d)) => Some((b, c, d)),
                                     _ => None,
                                 },
@@ -517,15 +537,14 @@ fn decode_for_export(
                             .unwrap_or_default();
                         let sstarts = stream(0xc12, 0x8000);
                         if !v.is_empty() && !sbits.is_empty() && !sstarts.is_empty() {
-                            let so: Vec<u32> =
-                                (0..sbits.len() as u32).filter(|&i3| sbits[i3 as usize]).collect();
+                            let so: Vec<u32> = (0..sbits.len() as u32)
+                                .filter(|&i3| sbits[i3 as usize])
+                                .collect();
                             if so.len() == sstarts.len() {
                                 for (jj, _) in so.iter().enumerate() {
                                     let ka = sstarts[jj] as usize;
-                                    let kb = sstarts
-                                        .get(jj + 1)
-                                        .copied()
-                                        .unwrap_or(v.len() as u32) as usize;
+                                    let kb = sstarts.get(jj + 1).copied().unwrap_or(v.len() as u32)
+                                        as usize;
                                     for (k2, &val) in
                                         v[ka.min(v.len())..kb.min(v.len())].iter().enumerate()
                                     {
@@ -554,8 +573,7 @@ fn decode_for_export(
                         bounds.push(v.len() as u32);
                         for (jj, wk) in bounds.windows(2).enumerate() {
                             let (ka, kb) = (wk[0] as usize, wk[1] as usize);
-                            for (k2, &val) in
-                                v[ka.min(v.len())..kb.min(v.len())].iter().enumerate()
+                            for (k2, &val) in v[ka.min(v.len())..kb.min(v.len())].iter().enumerate()
                             {
                                 ex.cellmap.push(sqlite_export::CellmapRow {
                                     block: bi,
@@ -786,6 +804,25 @@ fn dump_binary(
             }
         }
     }
+    // Crossing file (LID3): index summary only here (street-id sets ship via the SQLite export).
+    if u32le(&buf, 0x0c) == lid_format::header::KIND_CROSSING && lid_format::is_crossing(&buf) {
+        match lid_format::read_crossings(&buf) {
+            Ok(ci) => {
+                obj.insert("kind".into(), json!("crossing"));
+                obj.insert(
+                    "crossing".into(),
+                    json!({
+                        "element_count": ci.element_count,
+                        "x": ci.x,
+                        "blocks": ci.blocks.len(),
+                    }),
+                );
+            }
+            Err(e) => {
+                obj.insert("crossing_error".into(), json!(e));
+            }
+        }
+    }
     // If this is an ASF name-list (the LID*.DAT address trie), decode it into a
     // per-element gazetteer (names + PAU position deltas + hierarchy) via lid_format.
     if u32le(&buf, 0x0c) != 6 && lid_format::is_name_list(&buf) {
@@ -855,8 +892,12 @@ fn dump_binary(
                                 };
                                 {
                                     let (Some(b0), Some(s1)) = (
-                                        blk.streams.iter().find(|x| x.col == 0xc01 && x.flags == 0x4000),
-                                        blk.streams.iter().find(|x| x.col == 0xc01 && x.flags == 0x8000),
+                                        blk.streams
+                                            .iter()
+                                            .find(|x| x.col == 0xc01 && x.flags == 0x4000),
+                                        blk.streams
+                                            .iter()
+                                            .find(|x| x.col == 0xc01 && x.flags == 0x8000),
                                     ) else {
                                         continue;
                                     };
@@ -869,10 +910,12 @@ fn dump_binary(
                                     {
                                         for (k, &o) in owners.iter().enumerate() {
                                             let a = s1.values[k] as usize;
-                                            let e = s1.values
+                                            let e = s1
+                                                .values
                                                 .get(k + 1)
                                                 .copied()
-                                                .unwrap_or(base.len() as u32) as usize;
+                                                .unwrap_or(base.len() as u32)
+                                                as usize;
                                             for r in a..e.min(base.len()).max(a) {
                                                 to_street.push(blk.elem_start + o);
                                                 number.push(base[r]);

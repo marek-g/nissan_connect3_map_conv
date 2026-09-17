@@ -103,4 +103,25 @@ fn coverage_chain_and_pseudo_streets() {
         vec![(3u32, 5), (21, 23)],
         "stock-step merge: consecutive odd singles coalesce per settlement record"
     );
+
+    // 4) SAME label + SAME city: duplicates are separate elements (stock parallel-edge model)
+    //    and each cluster's numbers bind to ITS element, never to the first one.
+    let chrusty: Vec<u32> = elems.iter().filter(|(_, n)| n == "Chrusty").map(|(i, _)| *i).collect();
+    assert_eq!(chrusty.len(), 2, "same-name same-city pseudo duplicates coexist");
+    let nums: Vec<Vec<u32>> = chrusty
+        .iter()
+        .map(|id| {
+            let mut v: Vec<u32> = per_street
+                .iter()
+                .find(|(s, _)| s == id)
+                .map(|(_, recs)| recs.iter().map(|(f, _)| *f).collect())
+                .unwrap_or_default();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    assert!(nums.iter().all(|v| v.len() == 1), "numbers split per duplicate element: {nums:?}");
+    let mut all: Vec<u32> = nums.iter().flatten().copied().collect();
+    all.sort_unstable();
+    assert_eq!(all, vec![4u32, 6]);
 }

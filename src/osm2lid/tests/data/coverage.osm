@@ -47,4 +47,15 @@
     <tag k="addr:housenumber" v="23"/>
     <tag k="addr:place" v="Osada"/>
   </node>
+
+  <!-- same label AND same city (Ceszin), clusters 11 km apart: parallel-edge duplicates,
+       numbers must bind to the SEPARATE elements, not pile on the first one -->
+  <node id="11" lat="52.15000" lon="21.04500">
+    <tag k="addr:housenumber" v="4"/>
+    <tag k="addr:place" v="Chrusty"/>
+  </node>
+  <node id="12" lat="52.05000" lon="21.04700">
+    <tag k="addr:housenumber" v="6"/>
+    <tag k="addr:place" v="Chrusty"/>
+  </node>
 </osm>

@@ -17,8 +17,11 @@
 // adjective key; `city_prefixed` splits 'ADJ, CITY' city entries (same-name cities in different
 // provinces - the car's "which province?" disambiguation) and links them to `region`.
 //
+//   crossing  LID3 street-id sets per crossing element (streets = csv of ids into the partition's
+//             list_id-10000 street namelist; only modern-gen containers decode)
+//
 // Views (`v_element`, `v_city`, `v_street`, `v_address`, `v_hnr_offered`, `v_city_street`,
-// `v_completeness`) carry the joins; `v_hnr_offered` expands every record with the device rule
+// `v_crossing`, `v_completeness`) carry the joins; `v_hnr_offered` expands every record with the device rule
 // absolute lat/lon is exposed ONLY where it is honestly computable (`coords_valid` =
 // file anchor known and a single block; multi-block stock files keep per-block anchors
 // that are not decoded yet, so their lat/lon stay NULL by design — raw deltas always ship).
@@ -136,6 +139,14 @@ pub struct ExportFile {
     pub block_cells: Vec<BlockCellRow>,
     pub cellmap: Vec<CellmapRow>,
     pub mirrors: Vec<MirrorTable>,
+    pub crossings: Vec<CrossingRow>,
+}
+
+/// One decoded `LID3%05u` crossing: element id + the crossing's street element-ids.
+#[derive(Debug, Clone)]
+pub struct CrossingRow {
+    pub elem: u32,
+    pub streets: Vec<u32>,
 }
 
 pub const SCHEMA_SQL: &str = r#"
@@ -144,7 +155,7 @@ CREATE TABLE file(
   name          TEXT NOT NULL UNIQUE,          -- display label (stem, deduped)
   path          TEXT,                          -- full input path
   list_id       INTEGER,                       -- canonical header rIdxListID (2=city, 3=street, ...)
-  kind          TEXT NOT NULL,                 -- namelist|gen_attr|rel|sqlite
+  kind          TEXT NOT NULL,                 -- namelist|gen_attr|rel|crossing|sqlite
   country       TEXT,
   block_count   INTEGER,
   origin_x      INTEGER,                       -- file tNLHPosition (PAU); NULL = no anchor
@@ -192,6 +203,13 @@ CREATE TABLE hnr(
   street_file_id   INTEGER REFERENCES file(id),     -- resolved in-run (NULL = no street file in run)
   PRIMARY KEY(file_id, elem)
 );
+CREATE TABLE crossing(
+  file_id INTEGER NOT NULL REFERENCES file(id),
+  elem    INTEGER NOT NULL,                    -- crossing element id (file element ordinal)
+  streets TEXT    NOT NULL,                    -- csv of street element ids (list_id-10000 domain)
+  PRIMARY KEY(file_id, elem)
+);
+CREATE INDEX ix_crossing_elem ON crossing(file_id, elem);
 CREATE TABLE block_cells(
   file_id    INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
   block      INTEGER NOT NULL,                    -- GenAttr block index (cell ordinals restart per block)
@@ -343,6 +361,23 @@ JOIN element e ON e.name = a.city
 JOIN file f    ON f.id = e.file_id AND f.list_id = 2 AND f.kind = 'namelist'
 WHERE a.street IS NOT NULL;
 
+CREATE VIEW v_crossing AS
+WITH RECURSIVE split(file_id, elem, tok, rest) AS (
+  SELECT file_id, elem, '', streets || ',' FROM crossing
+  UNION ALL
+  SELECT file_id, elem, substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
+    FROM split WHERE rest <> ''
+)
+SELECT cf.name AS crossing_file, s.elem AS crossing_elem,
+       sf.name AS street_file, e.elem AS street_elem, e.name AS street, ce.name AS city
+FROM split s
+JOIN file cf ON cf.id = s.file_id
+JOIN file sf ON sf.kind = 'namelist' AND sf.list_id = cf.list_id
+            AND (sf.country IS cf.country)
+JOIN element e ON e.file_id = sf.id AND e.elem = CAST(s.tok AS INTEGER)
+LEFT JOIN file kf ON kf.kind = 'namelist' AND kf.list_id = 2 AND (kf.country IS cf.country)
+LEFT JOIN element ce ON ce.file_id = kf.id AND ce.elem = e.belonging
+WHERE s.tok <> '';
 CREATE VIEW v_completeness AS
 SELECT f.id AS file_id, f.name AS file, f.kind AS kind, f.list_id AS list_id,
        f.element_count AS elements,
@@ -592,8 +627,14 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
 
     // derived province / prefixed-city / address tables (see header comment; raw tables untouched)
     {
-        let mut provs: Vec<(i64, u32, String, Option<String>, Option<String>, Option<String>)> =
-            Vec::new();
+        let mut provs: Vec<(
+            i64,
+            u32,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = Vec::new();
         for (fi, f) in files.iter().enumerate() {
             if f.kind == "namelist" && f.list_id == Some(9) {
                 for e in &f.elements {
@@ -635,8 +676,12 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
                 continue;
             }
             for e in &f.elements {
-                let Some((adj, base)) = e.name.split_once(", ") else { continue };
-                let Some(&(rf, re)) = adj_of.get(adj.trim()) else { continue };
+                let Some((adj, base)) = e.name.split_once(", ") else {
+                    continue;
+                };
+                let Some(&(rf, re)) = adj_of.get(adj.trim()) else {
+                    continue;
+                };
                 pc.execute(rusqlite::params![
                     ids[fi],
                     e.elem as i64,
@@ -744,6 +789,27 @@ pub fn write_to(conn: &mut Connection, files: &[ExportFile]) -> Result<(), Strin
                 },
             ])
             .map_err(|err| format!("hnr {}: {err}", h.elem))?;
+        }
+    }
+
+    // LID3 crossing street-id sets
+    for (fi, f) in files.iter().enumerate() {
+        if f.crossings.is_empty() {
+            continue;
+        }
+        let fid = ids[fi];
+        let mut stmt = tx
+            .prepare_cached("INSERT INTO crossing(file_id,elem,streets) VALUES(?1,?2,?3)")
+            .map_err(|e| e.to_string())?;
+        for c in &f.crossings {
+            let csv = c
+                .streets
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            stmt.execute(rusqlite::params![fid, c.elem as i64, csv])
+                .map_err(|err| format!("crossing {}: {err}", c.elem))?;
         }
     }
 
@@ -898,12 +964,19 @@ fn province_adjectives(name: &str) -> (Option<String>, Option<String>, Option<St
         return (None, None, None);
     }
     let adj = neuter.strip_suffix('E').unwrap_or(neuter).to_string();
-    (Some(neuter.to_string()), Some(adj.clone()), Some(ascii_fold(&adj)))
+    (
+        Some(neuter.to_string()),
+        Some(adj.clone()),
+        Some(ascii_fold(&adj)),
+    )
 }
 
 /// Split an address-list display name `CITY, STREET ...` on the longest `CITY` that is a known
 /// city-name form (city names may themselves carry a `ADJ, ` province prefix).
-fn split_city_prefix<'a>(name: &'a str, city_forms: &HashSet<String>) -> Option<(&'a str, &'a str)> {
+fn split_city_prefix<'a>(
+    name: &'a str,
+    city_forms: &HashSet<String>,
+) -> Option<(&'a str, &'a str)> {
     let mut first: Option<(&'a str, &'a str)> = None;
     let mut best: Option<(&'a str, &'a str)> = None;
     for (pos, _) in name.match_indices(", ") {

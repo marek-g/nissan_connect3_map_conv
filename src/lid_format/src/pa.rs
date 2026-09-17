@@ -206,13 +206,25 @@ pub fn decode_pa_detail_block(b: &[u8], off: usize, size: usize) -> Result<PaDet
     };
     let values = |i: usize, count: usize| -> Vec<u32> {
         let r = &rows[i];
-        decode_u32(b, r.code, (off + r.off as usize).min(be), span_end(i).min(be), count)
+        decode_u32(
+            b,
+            r.code,
+            (off + r.off as usize).min(be),
+            span_end(i).min(be),
+            count,
+        )
     };
     let bits = |kind: u32| -> Vec<bool> {
         match row(kind, 0) {
             Some(i) => {
                 let r = &rows[i];
-                bitfield(b, r.code, (off + r.off as usize).min(be), span_end(i).min(be), width)
+                bitfield(
+                    b,
+                    r.code,
+                    (off + r.off as usize).min(be),
+                    span_end(i).min(be),
+                    width,
+                )
             }
             None => vec![false; width],
         }
@@ -245,7 +257,13 @@ pub fn decode_pa_detail_block(b: &[u8], off: usize, size: usize) -> Result<PaDet
     let pos_bits = match row(0xd0f, 0x4000) {
         Some(i) => {
             let r = &rows[i];
-            bitfield(b, r.code, (off + r.off as usize).min(be), span_end(i).min(be), width)
+            bitfield(
+                b,
+                r.code,
+                (off + r.off as usize).min(be),
+                span_end(i).min(be),
+                width,
+            )
         }
         None => vec![false; width],
     };
@@ -338,7 +356,13 @@ struct RowSpec {
 /// `FillBlockDescription` bounds check), while blocks are lazily read by absolute offset.
 /// `region`/`list_id` go into the outer header; the file name uses the *base* list fileID
 /// (`bGetFileNameFromDataAddress 00bc4d54` fileType 0x18 ⇒ street list ⇒ `PA_20006.DAT` for POL).
-pub fn write_pa_file(region: u16, list_id: u16, domain: u32, coord_mode: u16, blocks: &[PaDetailBlock]) -> Vec<u8> {
+pub fn write_pa_file(
+    region: u16,
+    list_id: u16,
+    domain: u32,
+    coord_mode: u16,
+    blocks: &[PaDetailBlock],
+) -> Vec<u8> {
     assert!(!blocks.is_empty(), "pa: need at least one block");
     let hdr = crate::header::NL_HEADER_LEN;
     let table_off = (hdr + 12 + 16) as u32; // after sub-header + the single group entry
@@ -364,18 +388,59 @@ pub fn write_pa_file(region: u16, list_id: u16, domain: u32, coord_mode: u16, bl
         let pc = pos_bits.iter().filter(|&&x| x).count();
         let pc_code = exist_code(&pos_bits);
         let rows = [
-            RowSpec { kind: 0x4d0b, code: 0x03, param: w as u32, bytes: Vec::new() }, // cells exist all-set
-            RowSpec { kind: 0x0d0b, code: 0x11, param: w as u32, bytes: cell_bytes },
-            RowSpec { kind: 0x0d0c, code: 0x01, param: w as u32, bytes: dense_bits(&left) },
-            RowSpec { kind: 0x0d0d, code: 0x01, param: w as u32, bytes: dense_bits(&right) },
-            RowSpec { kind: 0x4d0e, code: 0x03, param: w as u32, bytes: Vec::new() }, // ratio exist all-set
-            RowSpec { kind: 0x0d0e, code: 0x11, param: w as u32, bytes: ratio },
-            RowSpec { kind: 0x4d0f, code: pc_code, param: w as u32, bytes: exist_bytes(&pos_bits, pc_code) },
-            RowSpec { kind: 0x0d0f, code: 0x11, param: (2 * pc) as u32, bytes: pos_bytes },
+            RowSpec {
+                kind: 0x4d0b,
+                code: 0x03,
+                param: w as u32,
+                bytes: Vec::new(),
+            }, // cells exist all-set
+            RowSpec {
+                kind: 0x0d0b,
+                code: 0x11,
+                param: w as u32,
+                bytes: cell_bytes,
+            },
+            RowSpec {
+                kind: 0x0d0c,
+                code: 0x01,
+                param: w as u32,
+                bytes: dense_bits(&left),
+            },
+            RowSpec {
+                kind: 0x0d0d,
+                code: 0x01,
+                param: w as u32,
+                bytes: dense_bits(&right),
+            },
+            RowSpec {
+                kind: 0x4d0e,
+                code: 0x03,
+                param: w as u32,
+                bytes: Vec::new(),
+            }, // ratio exist all-set
+            RowSpec {
+                kind: 0x0d0e,
+                code: 0x11,
+                param: w as u32,
+                bytes: ratio,
+            },
+            RowSpec {
+                kind: 0x4d0f,
+                code: pc_code,
+                param: w as u32,
+                bytes: exist_bytes(&pos_bits, pc_code),
+            },
+            RowSpec {
+                kind: 0x0d0f,
+                code: 0x11,
+                param: (2 * pc) as u32,
+                bytes: pos_bytes,
+            },
         ];
         let nd = rows.len() as u16;
         let tbl = 4 + 2 + 11 * rows.len();
-        let mut bb: Vec<u8> = Vec::with_capacity(tbl + rows.iter().map(|r| r.bytes.len()).sum::<usize>());
+        let mut bb: Vec<u8> =
+            Vec::with_capacity(tbl + rows.iter().map(|r| r.bytes.len()).sum::<usize>());
         bb.extend_from_slice(&(w as u32).to_le_bytes());
         bb.extend_from_slice(&nd.to_le_bytes());
         let mut ro = tbl as u32;
@@ -452,8 +517,12 @@ mod tests {
     #[test]
     fn pa_device_model() {
         let blocks: Vec<PaDetailBlock> = vec![
-            PaDetailBlock { entries: (0..5).map(entry).collect() },
-            PaDetailBlock { entries: (5..11).map(entry).collect() },
+            PaDetailBlock {
+                entries: (0..5).map(entry).collect(),
+            },
+            PaDetailBlock {
+                entries: (5..11).map(entry).collect(),
+            },
         ];
         let f = write_pa_file(2, 3, 11, 1, &blocks);
         let idx = parse_pa(&f).unwrap();
@@ -467,7 +536,11 @@ mod tests {
             }
             let blk = &cache.as_ref().unwrap().1;
             assert!((start..start + width).contains(&e), "walk range {e}");
-            assert_eq!(blk.entries[(e - start) as usize], entry(e as usize), "elem {e}");
+            assert_eq!(
+                blk.entries[(e - start) as usize],
+                entry(e as usize),
+                "elem {e}"
+            );
         }
         // block ranges tile the domain: [0..4], [5..10]
         let b0 = PaIndex::locate(dl, 0).unwrap();
@@ -486,7 +559,15 @@ mod tests {
         // not enough bytes
         assert!(parse_pa(&[0u8; 0x20]).is_err());
         // sub-header pointer out of bounds
-        let mut f = write_pa_file(2, 3, 4, 1, &[PaDetailBlock { entries: (0..4).map(entry).collect() }]);
+        let mut f = write_pa_file(
+            2,
+            3,
+            4,
+            1,
+            &[PaDetailBlock {
+                entries: (0..4).map(entry).collect(),
+            }],
+        );
         let hdr = u32(&f, 0x10) as usize;
         f[hdr + 16..hdr + 20].copy_from_slice(&(80_000_000u32).to_le_bytes()); // table_off ⇒ EOF
         assert!(parse_pa(&f).is_err());

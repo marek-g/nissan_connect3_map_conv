@@ -1058,12 +1058,38 @@ any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card te
    `rIdxListID` identity (`lid_format::header`, byte-verified against stock); `osm2lid/tests/genattr.rs` and
    `osm2lid/tests/point_addr.rs` assert identities + REL matrix + PA device-walk end-to-end.
    **Nothing is on-device-validated yet — first card test pending.**
-   **Still pending:** crossing files (+10000), own META writer,
-   and on-device acceptance (`NLHnrToTree` against a real card).
-   (Crossing status: the reviewer side exists — `NLCrossingBlock::enGetCells 00e085ec` shows the
-   crossing block's own `NLCellIdAttrVector` at the block member `+0x230` with identical selectors —
-   but the POL card ships no `LID1*`/+10000 file, so an own writer has no byte-level comparator and
-   the device model for crossing reads is only partly replayable offline.)
+     **Still pending:** own META writer and on-device acceptance
+     (`NLHnrToTree` against a real card). The crossing family (+10000) is **DECODED** (2026-09, golden
+     DEU `LID30006`+`LID20006`; scratch decoder `src/lid_format/tests/crossing_re.rs`, `#[ignore]`).
+     LID3 elements = the crossings themselves on the street list's element-id domain (DEU
+     `elem_count` = 1 932 918 = LID20006 element count). Generic header `NLFileBase::LoadHeader
+     0x00ce08d8`: `[0]u16 region, [2]u16 listID, [4]u16 0, [6]u16 partition key, [8]u32 0, [0xc]u32
+     kind` (1 namelist, 2 crossing, 3 GenAttr, 4 LID5), `[0x10]u32 hdr_size=0x77`, `[0x14]u32
+     meta_len`, u16 string-offset table @`0x18..0x26` + author strings till 0x77. Sub-header
+     `NLCrossingFile::DecodeSubHeader 0x00e08eb0` @0x77: `{u32 elem_count, u32 X, u32 file_size,
+     u32 block_count, TOC[block_count]{u32 file_off, u32 elem_start, u32 elem_end_incl}}`. Blocks
+     (`NLCrossingBlock::SetDataBlock 0x00e07260` via `GetBlockDescr 0x00e08828`) use the **§11.3
+     GenAttr descriptor table** — u16 count + `{u16 kind, u16 code, u32 off, u32 param}` rows with
+     row-order spans, §12 codecs — where kind = selector | flag bit (`0x4000` = existence bitmap,
+     `0x8000` = VL start-prefixes as abs offsets into values, `0` = values; SV = 2 rows). Selectors
+     `0x801..0x808` feed the six `enDecodeCrossings 0x00e0792c` members (+0x28 streets — read back by
+     `enGetCrossingStreetIndex 0x00e07af0`; +0xd0/+0x104 = enGet{,Crossing}StreetMainIndex, counts
+     @+0xd8/+0x10c; +0x138 owner-descr `0x00e07850`; +0x198 `NLCrossingStatusAttrVector::Decode
+     0x00e077cc` [stream not yet decoded]; +0x1dc); status column `0x8001` is sparse; cell columns
+     share selectors `0x0001..0x0005` with HNR cells (+0x230, `enDecode 0x00e07e7c`). **Verified
+     end-to-end:** column 0x801 = per-crossing **street element-ids into LID20006's name space**;
+     DEU block 1's bitmap (233 words, pop 5504 over 7441 elems) + starts + values decode with the
+     crate's `decode_u32_probe` and the first crossings name-resolve to plausible pairs
+     (BACCHUSWEG × LINGENER STRASSE, multi-way residential clusters…); full-file replay via the new
+     `lid_format::read_crossings`/`CrossingIndex::decode_crossings` decodes all 252 DEU blocks
+     (1 221 570 crossings) and `lid2dump --sqlite` exports them as `crossing` + `v_crossing`.
+     POL card `LID30006.DAT` is a
+     **legacy variant** (author block shifted to 0x0c, `02 77 ?? ??` @0x08 — the sub-header @0x77 is
+     author garbage, broken under the modern parser; block signature `17 00 01 48 01 00` ×61 from
+     0x6caf5 with only desc0 sane ⇒ meta `0x6b..0x6caf4` + payloads are coded, scheme unknown; not
+     CPRNAV — no v5 stream in first 0x90 B; POL `LID0000x` use a different `0d 00 77 27…` container).
+     POL `LID50001`/`LID20006`/`LID40006` DO carry clean 0x77 headers ⇒ the legacy LID30006 likely
+     never worked on-card; writer target generation follows from the first device card test.)
 
 > The trie **structure** (forest, `f2` trees/block, cross-block `0x402` link-DAG naming), **element order +
 > walk-stack names** (`CalculateTerminatingElementIndex`), **edge labels** (`0x403` per-EDGE offsets + TAB

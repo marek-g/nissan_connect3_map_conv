@@ -260,7 +260,9 @@ pub fn write_rel(
     let tgt_bands = tgt_elems.div_ceil(REL_BAND);
     let d6 = src_bands.div_ceil(REL_CELL_BANDS);
     let d7 = tgt_bands.div_ceil(REL_CELL_BANDS);
-    write_rel_grid(src_elems, tgt_elems, list_a, list_b, REL_BAND, REL_BAND, d6, d7, rels)
+    write_rel_grid(
+        src_elems, tgt_elems, list_a, list_b, REL_BAND, REL_BAND, d6, d7, rels,
+    )
 }
 
 /// `write_rel` with the **explicit device grid** (`d4`/`d5` elements per source/target band,
@@ -320,10 +322,7 @@ pub fn write_rel_grid(
         let (rows, _, _) = tcs_of(g);
         let ci = (tb % bpc) * rows + (sb % bpr);
         // position is band-pair relative: src = rowBase + pos % d4, tgt = colBase + pos / d4
-        runs[g as usize].push((
-            ci as usize,
-            ((t % d5) * d4 + s % d4) as u32,
-        ));
+        runs[g as usize].push((ci as usize, ((t % d5) * d4 + s % d4) as u32));
     }
 
     // one tile per matrix cell: u16 CSR head table, then the concatenated delta streams

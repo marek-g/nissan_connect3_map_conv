@@ -183,42 +183,26 @@ fn main() {
     // Register village/pseudo streets exactly like the stock card: author label as its own
     // name-list entry per 1200 m settlement cluster, city = nearest place (stock: "DEBINY" x12).
     {
-        // Group clusters by (label, city): our ASF encoder indexes elements by trie-leaf, so two
-        // elements with identical name AND city cannot coexist in one block — and stock never
-        // needs that: the "DEBINY" x12 settlements anchor to DIFFERENT cities (a stock street
-        // can even carry several city REL pairs) and land in different city blocks. (True
-        // intra-block duplicate names remain an encoder-side [OPEN].)
+        // One entry per settlement cluster — same label AND city repeats are separate elements:
+        // the ASF model stores duplicate names as PARALLEL 0x00 leaf edges (encoder-side FIX
+        // `encode_duplicate_names_roundtrip`; CHECKED stock: 843k (name,city) duplicate groups,
+        // up to 105 per group). Entry order is deterministic (cluster sort).
         let places: Vec<(&String, (i64, i64))> = data.places.iter().map(|(n, c, _)| (n, *c)).collect();
-        let mut by_city: std::collections::BTreeMap<
-            (String, Option<(i32, i32)>),
-            (i128, i128, u32, Option<String>),
-        > = std::collections::BTreeMap::new();
         for (label, (cx, cy)) in &pseudo_settlements {
             let (city_coord, city_name) = match nearest_place(&places, *cx, *cy) {
                 Some((nm, c)) => (Some(c), Some(nm.clone())),
                 None => (None, None),
             };
-            let e = by_city.entry((label.clone(), city_coord)).or_insert((0, 0, 0, city_name));
-            e.0 += i128::from(*cx);
-            e.1 += i128::from(*cy);
-            e.2 += 1;
-        }
-        // deterministic output order: by city anchor, then label
-        let mut ordered: Vec<_> = by_city.into_iter().collect();
-        ordered.sort_by(|a, b| a.0.cmp(&b.0));
-        for ((label, city_coord), (sx, sy, n, city_name)) in ordered {
-            let (cx, cy) = (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64);
             city_of.push(city_name);
             st_entries.push(lid_format::NameEntry {
-                label,
-                x_pau: cx as i32,
-                y_pau: cy as i32,
+                label: label.clone(),
+                x_pau: *cx as i32,
+                y_pau: *cy as i32,
                 city: city_coord,
             });
         }
     }
-    let (nst, street_idx) =
-        write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
+    let (nst, streets) = write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
     // city coordinate registry (first node per unique name — same order `write_cities` numbers elements)
     let city_coords: std::collections::BTreeMap<&String, (i64, i64)> = {
         let mut m = std::collections::BTreeMap::new();
@@ -231,14 +215,14 @@ fn main() {
         &outdir.join("REL00001.DAT"),
         &st_entries,
         &city_of,
-        &street_idx,
+        &streets.sid_of_entry,
         &city_idx,
         &city_coords,
     );
     let (naddr, street_cell) = if no_genattr {
         (0, Default::default())
     } else {
-        write_gen_attr(&outdir.join("LID40006.DAT"), &addr_hits, &segs, &street_idx, nst, region_id)
+        write_gen_attr(&outdir.join("LID40006.DAT"), &addr_hits, &segs, &streets, nst, region_id)
     };
     let npa = if no_pa {
         0
@@ -247,7 +231,7 @@ fn main() {
             &outdir.join("PA_20006.DAT"),
             &addr_hits,
             &st_entries,
-            &street_idx,
+            &streets,
             &street_cell,
             nst,
             region_id,
@@ -711,24 +695,101 @@ fn nearest_place<'a>(
 /// Write the street name-list and return the **device element ids** of its entries (name → element index).
 /// The index must be read back from the *encoded* file — the element order is the trie's terminating-leaf
 /// DFS order, not the insertion order (the GenAttr street-domain columns join through it, §11.6).
+/// Street labels ⇄ DECODED element ids. `encode_id` regroups entries by city (first-seen) and
+/// the block trie reorders leaves by DFS, so decoded element order generally differs from input
+/// order — and duplicate labels (stock-style pseudo-streets on parallel 0x00 leaf edges, up to
+/// 105 per (name,city) group on the POL card) make a single label→id map unsound: numbers, PA
+/// and REL must bind to the right DUPLICATE element. Alignment: within one label, the encoder
+/// emits occurrences in (city first-seen rank, input order); decode ids ascend in exactly that
+/// order (blocks follow the chunk sequence, parallel edges keep insertion order) — zip the two.
+struct SidMap {
+    /// label -> (decoded id, absolute entry pos) ascending by decoded id
+    by_label: BTreeMap<String, Vec<(u32, (i64, i64))>>,
+    /// input entry index -> decoded element id
+    sid_of_entry: Vec<u32>,
+}
+
+impl SidMap {
+    fn pick(&self, label: &str, c: (i64, i64)) -> Option<u32> {
+        self.by_label
+            .get(label)
+            .and_then(|v| v.iter().min_by_key(|(_, p)| pt_seg_d2(c, *p, *p)).map(|(i, _)| *i))
+    }
+    fn first(&self, label: &str) -> Option<u32> {
+        self.by_label.get(label).and_then(|v| v.first()).map(|(i, _)| *i)
+    }
+}
+
 fn write_name_list_idx(
     path: &Path,
     entries: &[lid_format::NameEntry],
     region: u16,
     list_id: u16,
-) -> (usize, HashMap<String, u32>) {
+) -> (usize, SidMap) {
     let bytes = lid_format::encode_id(region, list_id, entries);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
-        return (0, HashMap::new());
+        return (
+            0,
+            SidMap {
+                by_label: BTreeMap::new(),
+                sid_of_entry: vec![],
+            },
+        );
     }
-    let mut idx = HashMap::new();
-    if let Ok(nl) = lid_format::read(&bytes) {
+    let mut decode_ids: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
+    let nl = lid_format::read(&bytes).ok();
+    if let Some(nl) = &nl {
         for (i, e) in nl.elements.iter().enumerate() {
-            idx.entry(e.name.clone()).or_insert(i as u32);
+            decode_ids.entry(e.name.as_str()).or_default().push(i as u32);
         }
     }
-    (entries.len(), idx)
+    // city first-seen ranks (mirrors encode_id's grouping)
+    let mut city_rank: HashMap<Option<(i32, i32)>, u32> = HashMap::new();
+    for e in entries {
+        let r = city_rank.len() as u32;
+        city_rank.entry(e.city).or_insert(r);
+    }
+    let mut occ: BTreeMap<&str, Vec<(u32, usize, usize)>> = BTreeMap::new(); // label -> (rank, seq, input idx)
+    let mut seq_cnt: HashMap<(&str, Option<(i32, i32)>), usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let rank = city_rank[&e.city];
+        let s = seq_cnt.entry((e.label.as_str(), e.city)).or_default();
+        occ.entry(e.label.as_str()).or_default().push((rank, *s, i));
+        *s += 1;
+    }
+    let mut by_label: BTreeMap<String, Vec<(u32, (i64, i64))>> = BTreeMap::new();
+    let mut sid_of_entry = vec![u32::MAX; entries.len()];
+    let mut degraded = false;
+    for (label, mut o) in occ {
+        let ids = decode_ids.get(label).cloned().unwrap_or_default();
+        o.sort_unstable();
+        if o.len() == ids.len() {
+            for (&id, &(_, _, ei)) in ids.iter().zip(&o) {
+                sid_of_entry[ei] = id;
+                by_label
+                    .entry(label.to_string())
+                    .or_default()
+                    .push((id, (i64::from(entries[ei].x_pau), i64::from(entries[ei].y_pau))));
+            }
+        } else {
+            degraded = true; // decode disagrees with grouping model: fall back to first-wins
+        }
+        if let Some(v) = by_label.get_mut(label) {
+            v.sort_unstable();
+        }
+    }
+    if degraded {
+        eprintln!("WARNING: name-list decode alignment mismatch, duplicate labels may mis-bind");
+        for (i, e) in entries.iter().enumerate() {
+            if sid_of_entry[i] == u32::MAX {
+                if let Some(f) = decode_ids.get(e.label.as_str()).and_then(|v| v.first().copied()) {
+                    sid_of_entry[i] = f;
+                }
+            }
+        }
+    }
+    (entries.len(), SidMap { by_label, sid_of_entry })
 }
 
 /// Housenumber "12" → 12; "12A"/"3/5"/"31a"/"" → None (stock GenAttr is a *numeric* record column;
@@ -809,15 +870,39 @@ mod hn_tests {
     }
 }
 
-/// Normalize a street/place label into comparable tokens: lowercased alphanumeric runs,
-/// Polish address-type prefixes dropped (`ul.`, `al.`, `os.` ...). Initials survive as
-/// one-letter tokens (`K. Wyki` -> [k, wyki]).
+/// Fold a lowercased Polish character to its diacritic-free base (folding = collapsing the
+/// variants, not ignoring case): a`\u{0105}`->a, c`\u{0107}`->c, e`\u{0119}`->e, `\u{0142}`->l,
+/// n`\u{0144}`->n, o`\u{00f3}`->o, s`\u{015b}`->s, z`\u{017a}`/z`\u{017c}`->z. OSM `addr:street`
+/// is free text and is very often typed without Polish accents while the road `name` carries
+/// them — folding both sides lets "Kosciuszki" find "Kościuszki". Risk (two real streets
+/// differing ONLY by diacritics in one town) is covered by the nearest-candidate tie-break.
+fn fold_diacritics(t: &str) -> String {
+    t.chars()
+        .map(|c| {
+            match c {
+                '\u{0105}' => 'a',
+                '\u{0107}' => 'c',
+                '\u{0119}' => 'e',
+                '\u{0142}' => 'l',
+                '\u{0144}' => 'n',
+                '\u{00f3}' => 'o',
+                '\u{015b}' => 's',
+                '\u{017a}' | '\u{017c}' => 'z',
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Normalize a street/place label into comparable tokens: lowercased alphanumeric runs with
+/// diacritics folded, Polish address-type prefixes dropped (`ul.`, `al.`, `os.` ...). Initials
+/// survive as one-letter tokens (`K. Wyki` -> [k, wyki]).
 fn street_tokens(label: &str) -> Vec<String> {
     label
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty() && !matches!(*t, "ul" | "al" | "aleja" | "alei" | "os" | "ulica"))
-        .map(str::to_string)
+        .map(fold_diacritics)
+        .filter(|t| !t.is_empty() && !matches!(t.as_str(), "ul" | "al" | "aleja" | "alei" | "os" | "ulica"))
         .collect()
 }
 
@@ -860,7 +945,11 @@ mod match_tests {
         assert!(t("K. Wyki", "Kazimierza Wyki"));
         assert!(t("T. Kościuszki", "Tadeusza Kościuszki"));
         assert!(t("Kazimierza Pułaskiego", "Generała Kazimierza Pułaskiego"));
-        assert!(t("ul. Piłsudskiego", "Piłsudskiego"));
+        assert!(t("ul. Piłsudskiego", "Pi\u{0142}sudskiego"));
+        assert!(t("T. Kosciuszki", "Tadeusza Ko\u{015b}ciuszki")); // diacritic-free addr side
+        assert!(t("slask", "\u{015a}l\u{0105}sk")); // folding is symmetric
+        assert!(!t("W. Wladystawy", "\u{0141}adysława")); // w != ł-folded-l: correct reject
+        assert!(t("W. Lokietka", "W\u{0142}adysława \u{0141}okietka")); // folded real initial matches
         assert!(!t("Zielona", "Kazimierza Wyki"));
         assert!(!t("Wyki K.", "Kazimierza Wyki")); // order matters (out-of-order is rarer; be strict)
         assert!(t("Wyki", "Kazimierza Wyki"));
@@ -1170,7 +1259,7 @@ fn write_gen_attr(
     path: &Path,
     hits: &[AddrHit],
     segs: &[OneCell],
-    street_idx: &HashMap<String, u32>,
+    streets: &SidMap,
     nst: usize,
     region: u16,
 ) -> (usize, BTreeMap<u32, u32>) {
@@ -1184,7 +1273,7 @@ fn write_gen_attr(
     let mut segs_by_sid: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     for (i, sg) in segs.iter().enumerate() {
         if let Some(nm) = &sg.name {
-            if let Some(&sid) = street_idx.get(nm.trim()) {
+            if let Some(sid) = streets.first(nm.trim()) {
                 segs_by_sid.entry(sid).or_default().push(i);
             }
         }
@@ -1200,7 +1289,7 @@ fn write_gen_attr(
     let mut owned: BTreeSet<u32> = BTreeSet::new(); // streets with at least one numeric address
     let mut nrec_all = 0usize;
     for hit in hits {
-        let Some(sid) = street_idx.get(hit.label.as_str()).copied() else {
+        let Some(sid) = streets.pick(&hit.label, hit.coord) else {
             continue;
         };
         let key = match hit.seg {
@@ -1475,7 +1564,7 @@ fn write_pa(
     path: &Path,
     hits: &[AddrHit],
     entries: &[lid_format::NameEntry],
-    street_idx: &HashMap<String, u32>,
+    streets: &SidMap,
     street_cell: &BTreeMap<u32, u32>,
     nst: usize,
     region: u16,
@@ -1485,7 +1574,7 @@ fn write_pa(
     // street element -> lowest numeric address point (coords), if any.
     let mut best: BTreeMap<u32, (u32, (i64, i64))> = BTreeMap::new();
     for hit in hits {
-        let Some(sid) = street_idx.get(hit.label.as_str()).copied() else {
+        let Some(sid) = streets.pick(&hit.label, hit.coord) else {
             continue;
         };
         match best.get(&sid) {
@@ -1510,11 +1599,8 @@ fn write_pa(
         nst
     ];
     let mut npa = 0usize;
-    for e in entries {
-        let Some(&sid) = street_idx.get(e.label.as_str()) else {
-            continue;
-        };
-        if sid as usize >= nst {
+    for (e, &sid) in entries.iter().zip(streets.sid_of_entry.iter()) {
+        if sid == u32::MAX || sid as usize >= nst {
             continue;
         }
         if let Some((_, (ax, ay))) = best.get(&sid) {
@@ -1560,18 +1646,18 @@ fn write_street_city_rel(
     path: &Path,
     entries: &[lid_format::NameEntry],
     city_of: &[Option<String>],
-    street_idx: &HashMap<String, u32>,
+    sid_of_entry: &[u32],
     city_idx: &HashMap<String, u32>,
     city_coords: &std::collections::BTreeMap<&String, (i64, i64)>,
 ) -> usize {
-    let src_elems = street_idx.len() as u64;
+    let src_elems = sid_of_entry.iter().copied().filter(|&s| s != u32::MAX).max().map_or(0, |m| m + 1) as u64;
     let tgt_elems = city_idx.len() as u64;
     let mut rels: Vec<(u32, u32)> = Vec::new();
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-    for (e, city) in entries.iter().zip(city_of) {
-        let Some(s) = street_idx.get(e.label.as_str()).copied() else {
+    for ((e, city), &s) in entries.iter().zip(city_of).zip(sid_of_entry) {
+        if s == u32::MAX {
             continue;
-        };
+        }
         if let Some(t) = city.as_ref().and_then(|cn| city_idx.get(cn.as_str())) {
             seen.insert((s, *t));
             rels.push((s, *t));

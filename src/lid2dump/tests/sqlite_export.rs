@@ -40,6 +40,7 @@ fn export_file(name: &str, kind: &str, list_id: Option<u16>) -> ExportFile {
         block_cells: Vec::new(),
         cellmap: Vec::new(),
         mirrors: Vec::new(),
+        crossings: Vec::new(),
     }
 }
 
