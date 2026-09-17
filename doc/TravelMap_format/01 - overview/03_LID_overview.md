@@ -176,6 +176,35 @@ identical one-cell/cluster sets by construction — no LID→RNW file consultati
 --sqlite` decodes the tables (`block_cells`), the per-record joins (`cellmap`) and the per-record
 cell/side columns (`hnr`).
 
+### 4.4d How `osm2lid` binds house numbers to one-cells: matching, density, measured error
+
+The binding (inside `write_gen_attr`) is deliberately dumb and deterministic:
+
+1. All routable segments (`rnw_model::walk_onecells`) are bucketed by street name.
+2. Each `addr:housenumber` node with **purely numeric** value (`hnr_number`; "1A" fails) and an
+   `addr:street` that hits the street name list is matched by **brute-force closest segment**:
+   `min pt_seg_d2` (squared i128 PAU point-to-segment distance, clamped projection, ties → first
+   in parse order) **over that street's own segments only** — a number never jumps to another street.
+3. The number lands in the segment's even/odd bucket (parity = street side); both buckets of a
+   segment share one cell-table row (`0xc11`/`block_cells`). A street without any routable segment
+   gets one synthetic "virtual" row at the address centroid.
+
+**House numbers per segment** (Krzeszowice sample, our writer): median **2**, p95 **4**, max 4 —
+`osm2lid` materialises a row only for segments that actually received numbers and OSM coverage is
+sparse. The **stock** card is the opposite regime (dense city block): median **85**, p95 95, max 107
+numbers per row — the authors coarsely aggregated whole apartment fronts onto one one-cell.
+
+**Real positional error**: the device re-locates an address only by its one-cell, so the distance
+from the OSM address node to the line of its matched segment *is* the address-placement error.
+Measured over 1143 matched numeric addresses (Krzeszowice): **median 17 m**, mean 35 m,
+**p90 83 m**, p99 206 m, max 533 m, >150 m in 2.8 % of cases. The median is dominated by the
+*lateral* offset (building setback from the road centreline, typically 5–25 m); the long tail is the
+*along-street* error on sparse rural runs where one segment covers hundreds of metres. Stock
+carries an error of the same shape (worse, given its ~85-per-row aggregation) — this is a property
+of the one-cell address model, not a writer defect. Coverage caveat: matching requires a purely
+numeric number *and* a named routable street, so in the sample only ~23 % of `addr:*` objects enter
+GenAttr at all (letter suffixes and unnamed-street addresses are dropped).
+
 ### 4.5 Blocks, entries, and columns
 
 Address name-list content is nested a little differently from the landmark content:
