@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <!-- city anchors -->
+  <node id="900" lat="52.17700" lon="21.04700"><tag k="place" v="city"/><tag k="name" v="Ceszin"/></node>
+  <!-- second city right at the northern Osada settlement (stock DEBINY clusters anchor to different cities) -->
+  <node id="901" lat="52.20350" lon="21.04950"><tag k="place" v="city"/><tag k="name" v="Bemowo"/></node>
+
+  <!-- real street for the initials chain -->
+  <node id="1" lat="52.20000" lon="21.0000"/>
+  <node id="2" lat="52.20090" lon="21.0000"/>
+  <way id="100">
+    <nd ref="1"/><nd ref="2"/>
+    <tag k="highway" v="residential"/><tag k="name" v="Kazimierza Testowej"/>
+  </way>
+  <node id="3" lat="52.20020" lon="21.00030">
+    <tag k="addr:housenumber" v="12"/>
+    <tag k="addr:street" v="K. Testowej"/>
+  </node>
+
+  <!-- far from any NAMED street (nearest named ~600 m), near an UNNAMED road:
+       no chain step matches -> pseudo-street "Zgubiona" -->
+  <node id="4" lat="52.19000" lon="21.02000"/>
+  <node id="5" lat="52.19090" lon="21.02000"/>
+  <way id="101">
+    <nd ref="4"/><nd ref="5"/>
+    <tag k="highway" v="residential"/>
+  </way>
+  <node id="6" lat="52.19040" lon="21.02030">
+    <tag k="addr:housenumber" v="7"/>
+    <tag k="addr:street" v="Zgubiona"/>
+  </node>
+
+  <!-- village addressing: addr:place=Osada, two settlements ~2.6 km apart -> two pseudo entries -->
+  <node id="7" lat="52.18000" lon="21.05000">
+    <tag k="addr:housenumber" v="3"/>
+    <tag k="addr:place" v="Osada"/>
+  </node>
+  <node id="8" lat="52.18020" lon="21.05030">
+    <tag k="addr:housenumber" v="5"/>
+    <tag k="addr:place" v="Osada"/>
+  </node>
+  <node id="9" lat="52.20400" lon="21.05000">
+    <tag k="addr:housenumber" v="21"/>
+    <tag k="addr:place" v="Osada"/>
+  </node>
+  <node id="10" lat="52.20420" lon="21.05030">
+    <tag k="addr:housenumber" v="23"/>
+    <tag k="addr:place" v="Osada"/>
+  </node>
+</osm>

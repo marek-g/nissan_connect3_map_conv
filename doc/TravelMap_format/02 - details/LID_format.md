@@ -984,23 +984,34 @@ gazetteer, which itself links 8–38 times per block and starts trees `f2` up to
   blocks → 10482 elements back**, diacritics intact.
 
 **12.10 House-number GenAttr writer (`LID40006.DAT`).** Same crate, different container (§11.6b). `osm2lid`
-collects `addr:housenumber` objects (nodes or building/entrance ways; the street comes from `addr:street`,
-falling back to `addr:place`) that land within `--bbox`, keeps **numeric** numbers only (the authoring tool
-too dropped suffixed/compound numbers such as `11A` — they cannot live in the `u32` number column), and joins
-each to the *same* street-element order as `LID20006.DAT`. Element domain = the **street elements**
+collects `addr:housenumber` objects (nodes or building/entrance ways; the label comes from `addr:street` or
+`addr:place`, kept apart — `addr:place` never gets geometry-renamed) that land within `--bbox`. Numbers go
+through `parse_hn`: alpha suffixes are cut (`1a`→`1`, single parity from the number; the author stock cannot
+store letters at all — `house_number`/`house_number_to` are u32 columns), dash/slash compounds (`12-16`,
+`1/2`, `1A/2`) become one `from..to` record with BOTH parity bits (the mass stock range shape), and at export
+consecutive equal-parity singles merge step-2 into single-parity range records (`3,5` → odd `3..5`). Street
+targeting is the `resolve_addresses` chain — exact register name → token/initial subsequence (“K. Wyki” →
+“Kazimierza Wyki”) → nearest named routable segment ≤ 120 m → **pseudo-street**: the author label becomes its
+own `LID20006` entry (village clusters of 1200 m, stock “DEBINY ×12” shape; CHECKED: those entries carry no
+special attributes at all — element `category` NULL and hnr bit-mix identical to city streets), cell row =
+nearest real cluster ≤ 300 m else synthetic. Element domain = the **street elements**
 (`0..nst`, chunked `HN_ATTR_CHUNK`=8192; ≥ 2 TOC blocks the container requires; empty blocks still emit the
 `0xc01` triple so tiling never breaks) and writes the device column set (§11.6b): `0xc01`(+0x28)
 house-number list per street (`4000` existence bitmap over the block's street-domain width, `8000` cumulative
-starts, `0000` the numbers), `0xc02`(+0x7c) SV per-record `TO` bound (= the number — synthetic records are
-singles, so `TO == FROM`), `0xc11`(+0x380) gate
+starts, `0000` the numbers), `0xc02`(+0x7c) SV per-record `TO` bound (= the number unless the parse/merge
+produced a range), `0xc11`(+0x380) gate
 existence domain = record count (bounds every `enGetHnr`), `0xc09/0c0a`(+0x260/0x280) even/odd parity bits
-per record, `0xc0b/0c0d` zero binaries, `0xc03..0xc06` empty byte-VLs (stock-`POL` shape — decoder must still
+per record, `0xc0b/0c0d` zero binaries (parity mirror + [OPEN] direction flag), `0xc03..0xc06` empty byte-VLs (stock-`POL` shape — decoder must still
 find all four). Validation is offline (no card in the loop): `lid_format`'s `gen_attr_*` tests (byte-exact
 rebuild oracle over **all 134 blocks** of `POL/LID40006` + device read-model round-trip) and
 `osm2lid/tests/genattr.rs`, which runs the real binary on the real fixture, re-reads every column, and
-replays `enGetHnrIndices`/`enGetHnr` semantics. `osm2lid` also writes **`PA_20006.DAT`** (§11.7 — one access
-point per street element, `pos` = lowest numeric address − name-list anchor, cell 0 / ratio 100; disabled
-with `--no-pa`) and **`REL00001.DAT`** (street↔city, stock grid via `write_rel_grid`; the `#[ignore]`
+replays `enGetHnrIndices`/`enGetHnr` semantics; `tests/coverage.rs` covers the resolver chain and the
+pseudo-street registration. `osm2lid` also writes **`PA_20006.DAT`** (§11.7 — one access
+point per street element, `pos` = lowest-numbered address point − name-list anchor, `cell` = the `0xc11`
+table row of that lowest record (pa_cells.rs asserts the join), ratio 100; disabled
+with `--no-pa`) and **`REL00001.DAT`** (street↔city — pseudo-streets included; one pair per city
+within 3 km of the street position, the stock shape — CHECKED: 12 “DEBINY” entries = 44 pairs;
+stock grid via `write_rel_grid`; the `#[ignore]`
 `rel_stock_roundtrip_equivalence` oracle proves decode(write(decode)) == decode for all 6 stock REL files —
 byte equality is impossible because stock tails carry the exporter artifact, see §11.7). **Still pending:**
 crossing files (+10000) and an own META writer; the on-device `NLHnrToTree` matcher and

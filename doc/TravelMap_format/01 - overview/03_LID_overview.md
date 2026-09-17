@@ -178,32 +178,54 @@ cell/side columns (`hnr`).
 
 ### 4.4d How `osm2lid` binds house numbers to one-cells: matching, density, measured error
 
-The binding (inside `write_gen_attr`) is deliberately dumb and deterministic:
+The binding (`resolve_addresses` → `write_gen_attr`, deterministic and order-stable) replicates the
+stock card's structure, CHECKED on `stock_CCP_POL.db`:
 
-1. All routable segments (`rnw_model::walk_onecells`) are bucketed by street name.
-2. Each `addr:housenumber` node with **purely numeric** value (`hnr_number`; "1A" fails) and an
-   `addr:street` that hits the street name list is matched by **brute-force closest segment**:
-   `min pt_seg_d2` (squared i128 PAU point-to-segment distance, clamped projection, ties → first
-   in parse order) **over that street's own segments only** — a number never jumps to another street.
-3. The number lands in the segment's even/odd bucket (parity = street side); both buckets of a
-   segment share one cell-table row (`0xc11`/`block_cells`). A street without any routable segment
-   gets one synthetic "virtual" row at the address centroid.
+1. **Number parsing** (`parse_hn`): stock `house_number`/`house_number_to` are plain u32 columns —
+   letters are impossible there, so alpha suffixes are *cut* (`1a`→`1`, parity from the number;
+   `1a`+`1b` dedup to one record, same building). Dash ranges (`12-16`, en/em dash too) and slash
+   unions (`1/2`, `3/7`, `1A/2`) become one `from..to` record with **both** parity bits — the mass
+   stock range pattern (hn_even & hn_odd, 467k rows in the POL hnr table). At export, consecutive
+   equal-parity singles merge step-2 (3,5 → one odd record `3..5`, the stock `5..9` odd shape).
+2. **Street targeting** for `addr:street`, in ORDER (string before geometry — the Pułaskiego/Rejtana
+   corner case shows pure geometry picks the wrong street): ① exact register hit; ② token
+   match — ordered subsequence with one-letter *initial* tokens matching first letters
+   (“K. Wyki”→“Kazimierza Wyki”, “T. Kościuszki”→“Tadeusza Kościuszki”, ties→nearest); ③ nearest
+   **named** routable segment ≤ **120 m** (median lateral offset 17 m, p90 83 m); ④ else a
+   pseudo-street. `addr:place` skips ①–③: stock deliberately does NOT rename village houses after
+   the through-road they sit at.
+3. **Pseudo-streets** (`addr:place`, or nothing matches): the author string becomes its own LID20006
+   entry, split into 1200 m settlement clusters — exactly the stock shape (“DEBINY” ×12 entries with
+   distinct coordinates, ordinary `addr_to_street`+`0xc11` bindings; CHECKED: those rows carry **no
+   special attributes** — element `category` is NULL like any street and their hnr bit-mix equals
+   city streets; they are structurally plain streets). Each cluster anchors to its nearest city
+   (stock's 12 DEBINY entries anchor to *different* cities — a stock street may even carry several
+city pairs; our ASF encoder indexes elements by trie-leaf, so
+   same-name+same-city would collapse — merging per (label, city); intra-block true duplicates stay
+   an encoder-side [OPEN]). Its cell row binds to the nearest real routable segment's cluster ≤
+   **300 m** (stock village rows cite real road cell ids), else a synthetic id.
+4. **Segment choice**: `min pt_seg_d2` over the target street's own segments only; both parity
+   records of a segment share one cell-table row (`0xc11`/`block_cells`). A registered street whose
+   ways never routed gets one row per whole element, clustered as in ③/3.
 
-**House numbers per segment** (Krzeszowice sample, our writer): median **2**, p95 **4**, max 4 —
-`osm2lid` materialises a row only for segments that actually received numbers and OSM coverage is
-sparse. The **stock** card is the opposite regime (dense city block): median **85**, p95 95, max 107
-numbers per row — the authors coarsely aggregated whole apartment fronts onto one one-cell.
+**Coverage** (krzeszowice.osm, 5017 objects carrying `addr:housenumber` + street/place): before the
+chain/pseudo work 4190/5017 = 83.5 % shipped; with it **5017/5017 ship** (3689 GenAttr records after
+parity/range merge, 703 of them multi-number ranges; +6 name-list entries — 5 villages + 1 orphan
+street). The earlier “~23 %” figure in this section was measured against purely-numeric-AND-named-
+street matching only and was misleading.
+
+**House numbers per segment** (our writer): median **2**, p95 **4** — we materialise a row only for
+segments that actually received numbers. The **stock** card is the opposite regime (dense city
+block): median **85**, p95 95, max 107 numbers per row — the authors coarsely aggregated whole
+apartment fronts onto one one-cell.
 
 **Real positional error**: the device re-locates an address only by its one-cell, so the distance
 from the OSM address node to the line of its matched segment *is* the address-placement error.
-Measured over 1143 matched numeric addresses (Krzeszowice): **median 17 m**, mean 35 m,
-**p90 83 m**, p99 206 m, max 533 m, >150 m in 2.8 % of cases. The median is dominated by the
-*lateral* offset (building setback from the road centreline, typically 5–25 m); the long tail is the
-*along-street* error on sparse rural runs where one segment covers hundreds of metres. Stock
-carries an error of the same shape (worse, given its ~85-per-row aggregation) — this is a property
-of the one-cell address model, not a writer defect. Coverage caveat: matching requires a purely
-numeric number *and* a named routable street, so in the sample only ~23 % of `addr:*` objects enter
-GenAttr at all (letter suffixes and unnamed-street addresses are dropped).
+Measured (Krzeszowice): **median 17 m**, mean 35 m, **p90 83 m**, p99 206 m, max 533 m, >150 m in
+2.8 % of cases. The median is dominated by the *lateral* offset (building setback from the road
+centreline, typically 5–25 m); the long tail is the *along-street* error on sparse rural runs where
+one segment covers hundreds of metres. Stock carries an error of the same shape (worse, given its
+~85-per-row aggregation) — this is a property of the one-cell address model, not a writer defect.
 
 ### 4.5 Blocks, entries, and columns
 

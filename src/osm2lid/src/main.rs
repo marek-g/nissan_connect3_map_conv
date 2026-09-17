@@ -7,12 +7,15 @@
 // by the reader `lid2dump` (round-trip). Coordinates are PAU = deg * 2^31 / 180.
 //
 // Scope note: writes the SQLite half (cities + POIs), the street + city name-lists
-// (`LID20006.DAT` / `LID20000.DAT`, the ASF columnar trie, §12) built by `src/lid_format::encode`, and the
+// (`LID20006.DAT` / `LID20000.DAT`, the ASF columnar trie, §12) built by `src/lid_format::encode`, the
 // house-number GenAttr half (`LID40006.DAT`, §11.6) built by `src/lid_format::write` from OSM
-// `addr:housenumber` objects joined to their `addr:street`. Point-address (`PA_%05u`) tables and crossing
-// (+10000) files are still pending. The street/city name-lists are validated by `lid2dump`
-// (full OSM -> LID -> dump round-trip, position- and name-exact); the GenAttr writer is validated offline by
-// `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle + a device read-model round-trip).
+// `addr:housenumber` objects, and the point-access (`PA_20006.DAT`, §11.7) half. Addresses are
+// joined to streets through the resolver chain (`resolve_addresses`): exact name -> token/initial
+// match -> near-named-segment fallback -> pseudo-street registration for `addr:place`/orphans
+// (stock "DEBINY" model). Crossing (+10000) files are still pending. The street/city name-lists are
+// validated by `lid2dump` (full OSM -> LID -> dump round-trip, position- and name-exact); the GenAttr
+// writer is validated offline by `lid_format`'s `gen_attr_*` tests (byte-exact rebuild oracle + a
+// device read-model round-trip) and end-to-end by `tests/{genattr,pa_cells,coverage}.rs`.
 //
 // Usage: osm2lid <in.osm.pbf|in.osm> -o OUTDIR [--region POL] [--lang 22] [--bbox W,S,E,N] [--no-poi] [--no-genattr]
 
@@ -62,7 +65,7 @@ struct Data {
     streets: Vec<(String, Vec<i64>)>,          // (name, node refs) — Phase-2 (not emitted)
     // every routable-class highway, parse order, for onecell/cluster replication (osm2rnw rules)
     hw: Vec<(Vec<i64>, Option<String>)>,
-    addrs: Vec<(String, (i64, i64), String)>,  // (housenumber, coord, street) — GenAttr source
+    addrs: Vec<(String, (i64, i64), String, bool)>, // (housenumber, coord, label, from_addr_place) — GenAttr source
 }
 
 impl Data {
@@ -172,34 +175,77 @@ fn main() {
     );
     let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
     let (ncit, city_idx) = write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2);
-    let (st_entries, city_of) = collect_street_entries(&data, bbox);    let (nst, street_idx) =
+    let segs = build_onecells(&data, bbox);
+    eprintln!("onecells: {} clusters: {}", segs.len(), segs.iter().map(|x| x.cluster).max().unwrap_or(0));
+    let (mut st_entries, mut city_of) = collect_street_entries(&data, bbox);
+    let real_labels: Vec<String> = st_entries.iter().map(|e| e.label.clone()).collect();
+    let (addr_hits, pseudo_settlements) = resolve_addresses(&data, bbox, &segs, &real_labels);
+    // Register village/pseudo streets exactly like the stock card: author label as its own
+    // name-list entry per 1200 m settlement cluster, city = nearest place (stock: "DEBINY" x12).
+    {
+        // Group clusters by (label, city): our ASF encoder indexes elements by trie-leaf, so two
+        // elements with identical name AND city cannot coexist in one block — and stock never
+        // needs that: the "DEBINY" x12 settlements anchor to DIFFERENT cities (a stock street
+        // can even carry several city REL pairs) and land in different city blocks. (True
+        // intra-block duplicate names remain an encoder-side [OPEN].)
+        let places: Vec<(&String, (i64, i64))> = data.places.iter().map(|(n, c, _)| (n, *c)).collect();
+        let mut by_city: std::collections::BTreeMap<
+            (String, Option<(i32, i32)>),
+            (i128, i128, u32, Option<String>),
+        > = std::collections::BTreeMap::new();
+        for (label, (cx, cy)) in &pseudo_settlements {
+            let (city_coord, city_name) = match nearest_place(&places, *cx, *cy) {
+                Some((nm, c)) => (Some(c), Some(nm.clone())),
+                None => (None, None),
+            };
+            let e = by_city.entry((label.clone(), city_coord)).or_insert((0, 0, 0, city_name));
+            e.0 += i128::from(*cx);
+            e.1 += i128::from(*cy);
+            e.2 += 1;
+        }
+        // deterministic output order: by city anchor, then label
+        let mut ordered: Vec<_> = by_city.into_iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((label, city_coord), (sx, sy, n, city_name)) in ordered {
+            let (cx, cy) = (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64);
+            city_of.push(city_name);
+            st_entries.push(lid_format::NameEntry {
+                label,
+                x_pau: cx as i32,
+                y_pau: cy as i32,
+                city: city_coord,
+            });
+        }
+    }
+    let (nst, street_idx) =
         write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
+    // city coordinate registry (first node per unique name — same order `write_cities` numbers elements)
+    let city_coords: std::collections::BTreeMap<&String, (i64, i64)> = {
+        let mut m = std::collections::BTreeMap::new();
+        for (n, c, _) in &data.places {
+            m.entry(n).or_insert(*c);
+        }
+        m
+    };
     let nrel = write_street_city_rel(
         &outdir.join("REL00001.DAT"),
         &st_entries,
         &city_of,
         &street_idx,
         &city_idx,
+        &city_coords,
     );
     let (naddr, street_cell) = if no_genattr {
         (0, Default::default())
     } else {
-        write_gen_attr(
-            &outdir.join("LID40006.DAT"),
-            &data,
-            bbox,
-            &street_idx,
-            nst,
-            region_id,
-        )
+        write_gen_attr(&outdir.join("LID40006.DAT"), &addr_hits, &segs, &street_idx, nst, region_id)
     };
     let npa = if no_pa {
         0
     } else {
         write_pa(
             &outdir.join("PA_20006.DAT"),
-            &data,
-            bbox,
+            &addr_hits,
             &st_entries,
             &street_idx,
             &street_cell,
@@ -246,7 +292,7 @@ fn parse_pbf(path: &str, d: &mut Data) {
             .parse::<f64>()
             .unwrap_or_else(|_| nd as f64 / 1e9)
     }
-    const REL: [&str; 8] = [
+    const REL: [&str; 9] = [
         "name",
         "place",
         "amenity",
@@ -255,6 +301,7 @@ fn parse_pbf(path: &str, d: &mut Data) {
         "craft",
         "addr:housenumber",
         "addr:street",
+        "addr:place",
     ];
     let mut pnodes: Vec<((i64, i64), HashMap<String, String>)> = Vec::new();
     let mut pways: Vec<(Vec<i64>, HashMap<String, String>)> = Vec::new();
@@ -274,8 +321,7 @@ fn parse_pbf(path: &str, d: &mut Data) {
                     d.nodes.insert(n.id, c);
                     let mut tags: HashMap<String, String> = HashMap::new();
                     for t in &n.tags {
-                        let k: &str = &t.key;
-                        let k = if k == "addr:place" { "addr:street" } else { k }; // addr:place fallback
+                        let k: &str = &t.key; // addr:place fallback
                         if REL.contains(&k) {
                             tags.insert(k.to_string(), t.value.clone());
                         }
@@ -447,9 +493,14 @@ fn tag_node(d: &mut Data, c: (i64, i64), t: &HashMap<String, String>) {
         }
     }
     if let Some(num) = t.get("addr:housenumber") {
-        if let Some(street) = t.get("addr:street").or_else(|| t.get("addr:place")) {
-            d.addrs.push((num.clone(), c, street.clone()));
-        }
+        // addr:street (urban) and addr:place (village addressing) are kept apart: stock models
+        // the place string as a pseudo-street name-list entry (DEBINY x12), never renames it.
+        let (label, from_place) = match (t.get("addr:street"), t.get("addr:place")) {
+            (Some(st), _) => (st.clone(), false),
+            (None, Some(pl)) => (pl.clone(), true),
+            _ => return,
+        };
+        d.addrs.push((num.clone(), c, label, from_place));
     }
 }
 
@@ -466,9 +517,11 @@ fn tag_way(d: &mut Data, ids: Vec<i64>, t: &HashMap<String, String>) {
         }
     }
     // address on a building/entrance way: street from tags, coordinate = node centroid
-    if let (Some(num), Some(street)) = (
+    let addr_street = t.get("addr:street").cloned();
+    let addr_place = t.get("addr:place").cloned();
+    if let (Some(num), Some((label, from_place))) = (
         t.get("addr:housenumber"),
-        t.get("addr:street").or_else(|| t.get("addr:place")),
+        addr_street.map(|v| (v, false)).or_else(|| addr_place.map(|v| (v, true))),
     ) {
         let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
         for &r in &ids {
@@ -480,7 +533,7 @@ fn tag_way(d: &mut Data, ids: Vec<i64>, t: &HashMap<String, String>) {
         }
         if k > 0 {
             d.addrs
-                .push((num.clone(), (sx / k, sy / k), street.clone()));
+                .push((num.clone(), (sx / k, sy / k), label, from_place));
         }
     }
 }
@@ -680,14 +733,365 @@ fn write_name_list_idx(
 
 /// Housenumber "12" → 12; "12A"/"3/5"/"31a"/"" → None (stock GenAttr is a *numeric* record column;
 /// suffixed/compound numbers have no place in the `u32` number column — author tooling dropped them too).
-fn hnr_number(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-        s.parse().ok()
-    } else {
-        None
+/// Parsed `addr:housenumber` (GenAttr cols `0xc01`/`0xc02` + parity mask `0xc09/0xc0a`).
+/// Stock has no way to encode letters — both columns are u32 (CHECKED on POL stock: DEBINY rows
+/// and city rows alike) — so alpha suffixes are cut away (`1a`/`11b` -> `1`/`11`, single parity
+/// taken from the number; identical cut-offs on a segment dedup to one record, they are the same
+/// building). Dash ranges (`12-16`, also en/em dash) and slash unions (`1/2`, `3/7`, `1A/2`)
+/// become a `from..to` range with BOTH parity flags — the mass stock pattern for ranges
+/// (hn_even & hn_odd both set, 467k rows in the POL card).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct HN {
+    from: u32,
+    to: u32,
+    even: bool,
+    odd: bool,
+}
+
+fn parse_hn(s: &str) -> Option<HN> {
+    let mut parts: Vec<&str> = Vec::new();
+    for piece in s.split(['-', '\u{2013}', '\u{2014}', '/']) {
+            let digits: &str = {
+            let t = piece.trim();
+            let end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+            &t[..end]
+        };
+        if !digits.is_empty() {
+            parts.push(digits);
+        }
+    }
+    let num = |p: &&str| p.parse::<u32>().ok();
+    match parts.len() {
+        0 => None,
+        1 => {
+            let n = num(&parts[0])?;
+            Some(HN { from: n, to: n, even: n % 2 == 0, odd: n % 2 == 1 })
+        }
+        _ => {
+            let (from, to) = (
+                parts.iter().map(|p| num(p)).collect::<Option<Vec<u32>>>()?.into_iter().min()?,
+                parts.iter().map(|p| num(p)).collect::<Option<Vec<u32>>>()?.into_iter().max()?,
+            );
+            Some(HN { from, to, even: true, odd: true })
+        }
     }
 }
+
+#[cfg(test)]
+mod hn_tests {
+    use super::parse_hn;
+
+    #[test]
+    fn hn_parsing() {
+        use super::HN;
+        let cases: &[(&str, Option<HN>)] = &[
+            ("7", Some(HN { from: 7, to: 7, even: false, odd: true })),
+            ("8 ", Some(HN { from: 8, to: 8, even: true, odd: false })),
+            ("1a", Some(HN { from: 1, to: 1, even: false, odd: true })),
+            ("1A", Some(HN { from: 1, to: 1, even: false, odd: true })),
+            ("11b", Some(HN { from: 11, to: 11, even: false, odd: true })),
+            ("31 A", Some(HN { from: 31, to: 31, even: false, odd: true })),
+            ("12-16", Some(HN { from: 12, to: 16, even: true, odd: true })),
+            ("12 \u{2013} 16", Some(HN { from: 12, to: 16, even: true, odd: true })),
+            ("1/2", Some(HN { from: 1, to: 2, even: true, odd: true })),
+            ("3/7", Some(HN { from: 3, to: 7, even: true, odd: true })),
+            ("2/1", Some(HN { from: 1, to: 2, even: true, odd: true })),
+            ("1A/2", Some(HN { from: 1, to: 2, even: true, odd: true })),
+            ("5-", Some(HN { from: 5, to: 5, even: false, odd: true })),
+            ("", None),
+            ("b5", None),
+            ("b", None),
+            ("?", None),
+        ];
+        for (src, want) in cases {
+            assert_eq!(parse_hn(src), *want, "parse_hn({src:?})");
+        }
+    }
+}
+
+/// Normalize a street/place label into comparable tokens: lowercased alphanumeric runs,
+/// Polish address-type prefixes dropped (`ul.`, `al.`, `os.` ...). Initials survive as
+/// one-letter tokens (`K. Wyki` -> [k, wyki]).
+fn street_tokens(label: &str) -> Vec<String> {
+    label
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && !matches!(*t, "ul" | "al" | "aleja" | "alei" | "os" | "ulica"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `addr` tokens must appear as an ORDERED subsequence of the street's tokens; a one-letter
+/// addr token (OSM initial style) matches any street token starting with the same letter
+/// (diacritic-exact). "K. Wyki" <= "Kazimierza Wyki"; "Kazimierza Pułaskiego" <=
+/// "Generała Kazimierza Pułaskiego". Rejects unrelated strings.
+fn tokens_subsequence(addr: &[String], street: &[String]) -> bool {
+    if addr.is_empty() || street.is_empty() {
+        return false;
+    }
+    let mut it = street.iter();
+    'next: for a in addr {
+        for b in it.by_ref() {
+            let ok = if a.chars().count() == 1 {
+                b.chars().next() == a.chars().next()
+            } else {
+                a == b
+            };
+            if ok {
+                continue 'next;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+fn _tokens_subseq_test(a: &str, b: &str) -> bool {
+    tokens_subsequence(&street_tokens(a), &street_tokens(b))
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::_tokens_subseq_test as t;
+
+    #[test]
+    fn street_token_matching() {
+        assert!(t("K. Wyki", "Kazimierza Wyki"));
+        assert!(t("T. Kościuszki", "Tadeusza Kościuszki"));
+        assert!(t("Kazimierza Pułaskiego", "Generała Kazimierza Pułaskiego"));
+        assert!(t("ul. Piłsudskiego", "Piłsudskiego"));
+        assert!(!t("Zielona", "Kazimierza Wyki"));
+        assert!(!t("Wyki K.", "Kazimierza Wyki")); // order matters (out-of-order is rarer; be strict)
+        assert!(t("Wyki", "Kazimierza Wyki"));
+    }
+}
+
+/// One address that passed number parsing and street targeting (before final element-index
+/// binding, which needs the encoded name-list order).
+struct AddrHit {
+    /// Target street label — real register name (after the exact/token/geometry chain) or,
+    /// for pseudo-streets, the author string itself (registered as a DEBINY-style name
+    /// entry before `write_name_list_idx`, so label lookup binds it like any street).
+    label: String,
+    coord: (i64, i64),
+    hn: HN,
+    /// Segment chosen among the target street's onecells; None => target has no own onecells
+    /// (registered-but-unroutable street, or village pseudo-street) -> synthetic table row.
+    seg: Option<usize>,
+}
+
+/// PAU-rectangular distance thresholds used by the resolver (1 m ~ 107.3 PAU).
+const PAU_PER_M: f64 = PAU / 111_320.0;
+fn m2d2(m: f64) -> i128 {
+    let p = (m * PAU_PER_M) as i128;
+    p * p
+}
+
+/// Bucket HNs into emitted records: single numbers of equal parity merge when consecutive
+/// at step 2 (11,13,15 -> one odd record 11..15 — the stock `0xc01..0xc02` + single-parity
+/// shape, cf. POL stock row 5..9 odd); gaps split runs; parsed multi-number ranges
+/// (slash/dash, both parities) are kept verbatim. Sorted by (from, to), deduped.
+fn compose_records(src: &[HN]) -> Vec<HN> {
+    let mut out: Vec<HN> = Vec::new();
+    let mut ev: Vec<u32> = Vec::new();
+    let mut od: Vec<u32> = Vec::new();
+    for h in src {
+        if h.from == h.to && !(h.even && h.odd) {
+            if h.odd {
+                od.push(h.from);
+            } else {
+                ev.push(h.from);
+            }
+        } else {
+            out.push(*h);
+        }
+    }
+    for (mut list, even, odd) in [(ev, true, false), (od, false, true)] {
+        list.sort_unstable();
+        list.dedup();
+        let mut i = 0usize;
+        while i < list.len() {
+            let from = list[i];
+            let mut last = from;
+            let mut j = i + 1;
+            while j < list.len() && list[j] == last + 2 {
+                last = list[j];
+                j += 1;
+            }
+            out.push(HN { from, to: last, even, odd });
+            i = j;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Resolve every valid address to a street LABEL + (optionally) a segment, replicating what the
+/// stock card encodes structurally (see module notes / LID_format §11.6b):
+///  * `addr:street`:    1. label EXACTLY a register name -> that street;
+///                      2. token subsequence/initial match against register names
+///                      ("K. Wyki" -> "Kazimierza Wyki"; ties -> nearest candidate);
+///                      3. else nearest NAMED routable segment within 120 m (median lateral
+///                         offset of house points is 17 m, p90 83 m — 120 m is the measured
+///                         safety net for initial/abbreviated tags);
+///                      4. else pseudo-street (author string registered as its own name entry).
+///  * `addr:place`:     pseudo-street straight away — stock models village addressing as
+///                      name-list entries under the VILLAGE label split into spatial clusters,
+///                      one entry per settlement ("DEBINY" x12 on the POL card), NOT geometry
+///                      renaming (a village house sits at a through-road's segment and stock
+///                      deliberately does not call it by that road's name).
+/// Returns the hits (parse order, deterministic) plus the pseudo-street settlements to register:
+/// (label, centroid), each cluster = union-find group of the label's addresses at 1200 m.
+fn resolve_addresses(
+    d: &Data,
+    bbox: Option<(f64, f64, f64, f64)>,
+    segs: &[OneCell],
+    real_labels: &[String],
+) -> (Vec<AddrHit>, Vec<(String, (i64, i64))>) {
+    use std::collections::BTreeMap;
+    let real: std::collections::HashSet<&str> = real_labels.iter().map(|x| x.as_str()).collect();
+    // label -> its street's global segment ordinals (in segment order, ties -> first)
+    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, sg) in segs.iter().enumerate() {
+        if let Some(nm) = sg.name.as_deref().map(str::trim) {
+            if !nm.is_empty() {
+                by_name.entry(nm).or_default().push(i);
+            }
+        }
+    }
+    let tok_of: BTreeMap<&str, Vec<String>> =
+        real_labels.iter().map(|l| (l.as_str(), street_tokens(l))).collect();
+
+    fn nearest_seg(c: (i64, i64), list: &[usize], segs: &[OneCell]) -> (usize, i128) {
+        let mut best = list[0];
+        let mut bd = pt_seg_d2(c, segs[best].ca, segs[best].cb);
+        for &i in list.iter().skip(1) {
+            let dd = pt_seg_d2(c, segs[i].ca, segs[i].cb);
+            if dd < bd {
+                bd = dd;
+                best = i;
+            }
+        }
+        (best, bd)
+    }
+
+    // label of chain step 2/3 for a failing string (None = fall through to pseudo)
+    let mut fallback_cache: BTreeMap<String, Option<(String, Option<usize>)>> = BTreeMap::new();
+
+    let mut hits: Vec<AddrHit> = Vec::new();
+    let mut pseudo_groups: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+    for (num, c, label, from_place) in &d.addrs {
+        if !in_bbox(*c, bbox) {
+            continue;
+        }
+        let Some(parsed) = parse_hn(num) else { continue };
+        let label = label.trim().to_string();
+        if label.is_empty() || label.contains('\0') {
+            continue;
+        }
+        // stock pattern for addr:place: the village label is kept as-is and clustered — never
+        // geometry-renamed (a village house sits at a through-road segment and stock does NOT
+        // call it by that road's name). A place string that literally IS a registered street
+        // name binds to that street (same entry, no duplicate).
+        if *from_place && !real.contains(label.as_str()) {
+            pseudo_groups.entry(label.clone()).or_default().push(*c);
+            hits.push(AddrHit { label, coord: *c, hn: parsed, seg: None });
+            continue;
+        }
+        if real.contains(label.as_str()) {
+            let seg = by_name
+                .get(label.as_str())
+                .map(|list| nearest_seg(*c, list, segs).0);
+            hits.push(AddrHit { label, coord: *c, hn: parsed, seg });
+            continue;
+        }
+        let target = fallback_cache.entry(label.clone()).or_insert_with(|| {
+            let atok = street_tokens(&label);
+            let mut cands: Vec<(&str, usize, i128)> = Vec::new();
+            for name in real_labels {
+                if tokens_subsequence(&atok, tok_of.get(name.as_str()).unwrap_or(&Vec::new())) {
+                    if let Some(list) = by_name.get(name.as_str()) {
+                        let (si, dd) = nearest_seg(*c, list, segs);
+                        cands.push((name.as_str(), si, dd));
+                    }
+                }
+            }
+            if cands.len() == 1 {
+                let (n, si, _) = cands[0];
+                return Some((n.to_string(), Some(si)));
+            }
+            if cands.len() > 1 {
+                let (n, si, _) = *cands.iter().min_by_key(|(_, _, d)| *d)?;
+                return Some((n.to_string(), Some(si)));
+            }
+            // geometry fallback: nearest named routable segment within 120 m
+            let mut best: Option<(i128, usize)> = None;
+            for (i, sg) in segs.iter().enumerate() {
+                if sg.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    continue;
+                }
+                let dd = pt_seg_d2(*c, sg.ca, sg.cb);
+                if dd <= m2d2(120.0) && best.is_none_or(|(bd, _)| dd < bd) {
+                    best = Some((dd, i));
+                }
+            }
+            best.map(|(_, i)| {
+                let nm = segs[i].name.clone().unwrap_or_default().trim().to_string();
+                (nm, Some(i))
+            })
+        });
+        match target {
+            Some((nm, seg)) => {
+                hits.push(AddrHit { label: nm.clone(), coord: *c, hn: parsed, seg: *seg })
+            }
+            None => {
+                pseudo_groups.entry(label.clone()).or_default().push(*c);
+                hits.push(AddrHit { label, coord: *c, hn: parsed, seg: None });
+            }
+        }
+    }
+
+    // pseudo settlements: 1200 m union-find clusters per label, centroids, deterministic order
+    let mut pseudo: Vec<(String, (i64, i64))> = Vec::new();
+    for (label, pts) in pseudo_groups {
+        let mut pts = pts;
+        pts.sort_unstable();
+        let mut parent: Vec<usize> = (0..pts.len()).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for i in 0..pts.len() {
+            for j in i + 1..pts.len() {
+                if pt_seg_d2(pts[i], pts[j], pts[j]) <= m2d2(1200.0) {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    if a != b {
+                        parent[a.max(b)] = a.min(b);
+                    }
+                }
+            }
+        }
+        let mut clusters: BTreeMap<usize, (i128, i128, u32)> = BTreeMap::new();
+        for (i, p) in pts.iter().enumerate() {
+            let root = find(&mut parent, i);
+            let e = clusters.entry(root).or_insert((0, 0, 0));
+            e.0 += p.0 as i128;
+            e.1 += p.1 as i128;
+            e.2 += 1;
+        }
+        for (_, (sx, sy, n)) in clusters {
+            pseudo.push((label.clone(), (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64)));
+        }
+    }
+    pseudo.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    (hits, pseudo)
+}
+
 
 /// GenAttr house-number attribute block chunk size (street elements per TOC block; stock ≈4–19 k).
 const HN_ATTR_CHUNK: usize = 8192;
@@ -764,8 +1168,8 @@ fn pt_seg_d2(p: (i64, i64), a: (i64, i64), b: (i64, i64)) -> i128 {
 /// not card-verified.
 fn write_gen_attr(
     path: &Path,
-    d: &Data,
-    bbox: Option<(f64, f64, f64, f64)>,
+    hits: &[AddrHit],
+    segs: &[OneCell],
     street_idx: &HashMap<String, u32>,
     nst: usize,
     region: u16,
@@ -773,9 +1177,7 @@ fn write_gen_attr(
     use lid_format::write::{write_gen_attr_file, BlockData, ColData, ColKind};
     use std::collections::{BTreeMap, BTreeSet};
 
-    let segs = build_onecells(d, bbox);
     let ncl = segs.iter().map(|s| s.cluster).max().unwrap_or(0);
-    eprintln!("onecells: {} clusters: {}", segs.len(), ncl);
     let cluster_next = ncl + 1;
 
     // street element id -> its onecells (global segment ordinals, in segment order)
@@ -788,57 +1190,49 @@ fn write_gen_attr(
         }
     }
 
-    // Numeric addresses in bbox joined to the name list -> even/odd number buckets per segment
-    // (key VIRT+sid = street without any routable segment, one synthetic row for the whole way).
+    // Resolved addresses -> number buckets per segment (key VIRT+sid = street without any
+    // routable segment — unroutable register street or pseudo-street/village — one synthetic
+    // row for the whole element).
     const VIRT: usize = usize::MAX / 2;
-    let mut seg_even: HashMap<usize, Vec<u32>> = HashMap::new();
-    let mut seg_odd: HashMap<usize, Vec<u32>> = HashMap::new();
-    let mut virt_cluster: HashMap<u32, u32> = HashMap::new(); // streetless sid -> synthetic cluster
+    let mut seg_recs: HashMap<usize, Vec<HN>> = HashMap::new();
+    let mut virt_cluster: HashMap<u32, u32> = HashMap::new(); // streetless sid -> cluster (see below)
     let mut virt_cnt: HashMap<u32, (i128, i128, u32)> = HashMap::new();
     let mut owned: BTreeSet<u32> = BTreeSet::new(); // streets with at least one numeric address
     let mut nrec_all = 0usize;
-    for (num, c, street) in &d.addrs {
-        if !in_bbox(*c, bbox) {
-            continue;
-        }
-        let Some(sid) = street_idx.get(street.trim()).copied() else {
+    for hit in hits {
+        let Some(sid) = street_idx.get(hit.label.as_str()).copied() else {
             continue;
         };
-        let Some(n) = hnr_number(num) else { continue };
-        let key = match segs_by_sid.get(&sid) {
-            Some(list) if !list.is_empty() => {
-                let mut best = list[0];
-                let mut bd = pt_seg_d2(*c, segs[best].ca, segs[best].cb);
-                for &i in list.iter().skip(1) {
-                    let dd = pt_seg_d2(*c, segs[i].ca, segs[i].cb);
-                    if dd < bd {
-                        bd = dd;
-                        best = i;
-                    }
-                }
-                best
-            }
+        let key = match hit.seg {
+            Some(i) if segs_by_sid.get(&sid).is_some_and(|l| l.contains(&i)) => i,
             _ => {
                 let e = virt_cnt.entry(sid).or_insert((0, 0, 0));
-                e.0 += i128::from(c.0);
-                e.1 += i128::from(c.1);
+                e.0 += i128::from(hit.coord.0);
+                e.1 += i128::from(hit.coord.1);
                 e.2 += 1;
                 VIRT + sid as usize
             }
         };
-        if n % 2 == 0 {
-            seg_even.entry(key).or_default().push(n);
-        } else {
-            seg_odd.entry(key).or_default().push(n);
-        }
+        seg_recs.entry(key).or_default().push(hit.hn);
         owned.insert(sid);
         nrec_all += 1;
     }
     if nst < 2 || nrec_all == 0 {
         return (0, Default::default());
     } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
-    for &sid in virt_cnt.keys() {
-        virt_cluster.insert(sid, cluster_next);
+    // Synthetic-row (unroutable street / pseudo-street) cell clusters: prefer the REAL one-cell
+    // cluster of the nearest routable segment within 300 m (stock binds village addresses to
+    // real road cells, e.g. DEBINY rows -> global cell id 123); purely synthetic id otherwise.
+    for (&sid, &(sx, sy, n)) in &virt_cnt {
+        let c = (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64);
+        let mut near: Option<(i128, u32)> = None;
+        for sg in segs {
+            let dd = pt_seg_d2(c, sg.ca, sg.cb);
+            if dd <= m2d2(300.0) && near.is_none_or(|(bd, _)| dd < bd) {
+                near = Some((dd, sg.cluster));
+            }
+        }
+        virt_cluster.insert(sid, near.map(|(_, cl)| cl).unwrap_or(cluster_next));
     }
 
     // Always >= 2 blocks tiling [0, nst).
@@ -866,7 +1260,7 @@ fn write_gen_attr(
             let mut street_rows: Vec<(usize, u32)> = Vec::new(); // (seg idx | VIRT+sid, cluster)
             if let Some(list) = segs_by_sid.get(&sid) {
                 for &i in list {
-                    if seg_even.contains_key(&i) || seg_odd.contains_key(&i) {
+                    if seg_recs.contains_key(&i) {
                         street_rows.push((i, segs[i].cluster));
                     }
                 }
@@ -882,22 +1276,23 @@ fn write_gen_attr(
             for &(seg, cl) in &street_rows {
                 let base = row_cluster.len() as u32;
                 row_cluster.push(cl);
-                for (odd, bucket) in [(false, seg_even.get(&seg)), (true, seg_odd.get(&seg))] {
-                    let Some(list) = bucket else { continue };
-                    let mut list = list.clone();
-                    list.sort_unstable();
-                    let (mn, mx) = (list[0], *list.last().unwrap());
-                    nums.push(mn);
-                    tos.push(mx);
-                    ev.push(!odd);
-                    od.push(odd);
+                let Some(list) = seg_recs.get(&seg) else { continue };
+                // distinct parsed HNs (1a/1b dedup to one "1" — same building) merged into
+                // stock-style records: step-2 consecutive single numbers coalesce into one
+                // single-parity range record (stock `5..9` odd), parsed ranges stay as-is
+                let list = compose_records(list);
+                for hn in list.iter() {
+                    nums.push(hn.from);
+                    tos.push(hn.to);
+                    ev.push(hn.even);
+                    od.push(hn.odd);
                     rec_row.push(base);
                     gid += 1;
                     rec_id.push(gid);
                     match street_cell.get(&sid) {
-                        Some(&(mn0, _)) if mn0 <= mn => {}
+                        Some(&(mn0, _)) if mn0 <= hn.from => {}
                         _ => {
-                            street_cell.insert(sid, (mn, base));
+                            street_cell.insert(sid, (hn.from, base));
                         }
                     }
                 }
@@ -1078,8 +1473,7 @@ fn write_gen_attr(
 
 fn write_pa(
     path: &Path,
-    d: &Data,
-    bbox: Option<(f64, f64, f64, f64)>,
+    hits: &[AddrHit],
     entries: &[lid_format::NameEntry],
     street_idx: &HashMap<String, u32>,
     street_cell: &BTreeMap<u32, u32>,
@@ -1090,18 +1484,14 @@ fn write_pa(
 
     // street element -> lowest numeric address point (coords), if any.
     let mut best: BTreeMap<u32, (u32, (i64, i64))> = BTreeMap::new();
-    for (num, c, street) in &d.addrs {
-        if !in_bbox(*c, bbox) {
-            continue;
-        }
-        let Some(sid) = street_idx.get(street.trim()).copied() else {
+    for hit in hits {
+        let Some(sid) = street_idx.get(hit.label.as_str()).copied() else {
             continue;
         };
-        let Some(n) = hnr_number(num) else { continue };
         match best.get(&sid) {
-            Some(&(bn, _)) if bn <= n => {}
+            Some(&(bn, _)) if bn <= hit.hn.from => {}
             _ => {
-                best.insert(sid, (n, *c));
+                best.insert(sid, (hit.hn.from, hit.coord));
             }
         }
     }
@@ -1163,25 +1553,41 @@ fn write_pa(
 /// Emit `REL00001.DAT` — the street↔city relation matrix the stock META0000 relation table expects at
 /// index 1 (`{from=listID 2 TOWN, to=listID 3 STREET}`), which the file stores as d0=3/d1=2 (rows =
 /// street elements of `LID20006`, cols = city elements of `LID20001`; stock file 00001 = same shape).
-/// One pair per street: its element ↔ the city element of its anchor place (§11.7).
+/// Stock shape (CHECKED): a street carries a pair for EVERY city within 3 km of its reported
+/// position — the 12 "DEBINY" village entries hold 44 pairs (avg 3.7/street — through entries span
+/// several settlement anchors). The nearest city stays the entry's grouping anchor regardless.
 fn write_street_city_rel(
     path: &Path,
     entries: &[lid_format::NameEntry],
     city_of: &[Option<String>],
     street_idx: &HashMap<String, u32>,
     city_idx: &HashMap<String, u32>,
+    city_coords: &std::collections::BTreeMap<&String, (i64, i64)>,
 ) -> usize {
     let src_elems = street_idx.len() as u64;
     let tgt_elems = city_idx.len() as u64;
     let mut rels: Vec<(u32, u32)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     for (e, city) in entries.iter().zip(city_of) {
-        let (Some(s), Some(cn)) = (street_idx.get(e.label.as_str()), city) else {
+        let Some(s) = street_idx.get(e.label.as_str()).copied() else {
             continue;
         };
-        if let Some(t) = city_idx.get(cn.as_str()) {
-            rels.push((*s, *t));
+        if let Some(t) = city.as_ref().and_then(|cn| city_idx.get(cn.as_str())) {
+            seen.insert((s, *t));
+            rels.push((s, *t));
+        }
+        for (cn, cc) in city_coords {
+            if pt_seg_d2((e.x_pau as i64, e.y_pau as i64), *cc, *cc) <= m2d2(3000.0) {
+                if let Some(t) = city_idx.get(cn.as_str()) {
+                    if seen.insert((s, *t)) {
+                        rels.push((s, *t));
+                    }
+                }
+            }
         }
     }
+    rels.sort_unstable();
+    rels.dedup();
     if src_elems == 0 || tgt_elems == 0 || rels.is_empty() {
         return 0;
     }

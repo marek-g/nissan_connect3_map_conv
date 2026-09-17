@@ -188,8 +188,19 @@ fn genattr_osm_roundtrip() {
         (3, 2),
         "file stores (street, city) list ids"
     );
-    let pairs = lid_format::rel::get_relations(&rel, &ridx, true, 0, 2).unwrap();
-    assert_eq!(pairs.len(), 2, "one street->city pair per street");
+    let (street_marsz, street_nowo) = (marsz, nowo);
+    let mut pairs = lid_format::rel::get_relations(&rel, &ridx, true, 0, 2).unwrap();
+    pairs.sort_unstable();
+    // stock multiple-city shape (CHECKED on stock_CCP_POL.db): each street pairs with EVERY city
+    // within 3 km of its position — here both fixture cities are within range of both streets
+    let mut want: Vec<(u32, u32)> = vec![];
+    for s in [street_marsz, street_nowo] {
+        for t in 0..2u32 {
+            want.push((s, t));
+        }
+    }
+    want.sort_unstable();
+    assert_eq!(pairs, want, "street->city pairs = every city within 3 km (stock shape)");
     assert!(pairs.iter().all(|&(_, t)| t < 2), "city elems in range");
 
     std::fs::remove_dir_all(&out).ok();
