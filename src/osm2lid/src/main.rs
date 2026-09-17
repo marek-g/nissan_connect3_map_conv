@@ -992,8 +992,9 @@ fn write_gen_attr(
             code_0000: code,
             range_from_to: None,
         };
-        // 0xc11: per-record ROW ordinal, exactly one value per record (stock shape: one flat
-        // ValueList over the record domain; both parities of a segment cite the same row).
+        // 0xc11: per-record ROW ordinal(s) — the device ValueList allows 1..N values per record
+        // (`enGetHnrCellIndices` 00e0c8bc); we follow the stock shape: one flat value per record,
+        // both parities of a segment citing the same row.
         let c11 = ColData {
             selector: 0xc11,
             kind: ColKind::ValueList,

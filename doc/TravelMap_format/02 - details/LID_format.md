@@ -623,29 +623,34 @@ indexes it with `read_gen_attr`, and decodes each block's column streams with `G
 (bitmap `0x02`/`0x03` counts come from `param`, never from byte span). The owner VectorList column `0xc01`
 (starts ascending within the block range — ABS ranges, first = 0 — values = owner element offsets) joins
 each record → its street element; `0xc02` (SV) = per-record `TO` bound (range end; `== FROM` for singles),
-`0xc11` = existence gate, `0xc09/0c0a` =
+`0xc11` = per-record cell-reference VL (§11.6b), `0xc09/0c0a` =
 even/odd parity bits per record, `0xc03..06` = HNR string VLs (`enGetHnr` `00e0d078` decodes all four;
 stock POL ships them empty). The on-device `NLHnrToTree` matcher cannot be run here — the offline device
 read-model (`gen_attr_writer_roundtrip_device_model`) replays `enGetHnrIndices`/`enGetHnr` only.
 
 **11.6b HNR cell columns + the RNW one-cell model (CONFIRMED: `SetDataBlock` `00e09b60`,
-`enDecodeCells` `00e0c584`, `enGetHnrCellIndices` `00e0c8bc`, `NLCellIdAttrVector::enGetCells`
-`00e08448`).** Every `NLHnr` block carries a cell table — one row ↔ one RNW **onecell** (a 2-node
-road segment) of an `osm2rnw`-style build — plus per-record columns that index it:
+`enDecodeCells` `00e0c584`, `bGetHnrCellIDs` `00ce686c`, `enGetHnrCellReferences` `00e0c91c`,
+`enGetHnrCellIndices` `00e0c8bc`, `bGetElementCellIDs` `00ce6638`, `enGetEntryCellReferences`
+`00e0cb8c`, `NLCellIdAttrVector::enGetCells` `00e08448`).** Every `NLHnr` block carries a cell
+table — device-side the rows are `NLCellID`s joined to the RNW one-cell id types
+(`rnw_tclOnecellId`/`fi_tcl_LocalOneCellID` appear in the binary); on our side one row ↔ one RNW
+**onecell** (a 2-node road segment) of an `osm2rnw`-style build — plus VL columns that index it:
 
-| selector | slot | content |
+| selector | slot (device member) | content |
 |---|---:|---|
-| `0x001` | +0x4dc | per-record author cell id (`u32`, unique; stock scale reaches the 240 k range — [OPEN] exact id space) |
-| `0x002/0x004/0x005` | +0x530 | cell table: per-row NAV-file-local id, global id (the cluster id `bCreateOutput` `00b8ae40` emits as `fi_tcl_Cell`), existence bit |
-| `0x003` | +0x200 | per-NAV-file key lists (207 triples per Kraków block on stock — name-path extra, [OPEN]) |
-| `0x003/0x8003/0x8004` | +0x40.. | recorddescription starts/global starts (binary-search domains in `enGetCells`) |
-| `0xc11` | +0x380 | **per-record cell-row ordinal** — exactly one value per record (`enGetHnrCellReferences`); both parity records of a segment cite the same row |
-| `0xc0b/0xc0c/0xc0d` | +0x2c0/0x2e0/0x300 | per-record bits: stock mirrors the parity bits (`0xc0b == 0xc09`, `0xc0c == 0xc0a`) and keeps a direction-class flag in `0xc0d` ([OPEN]; ~half of stock records set) |
-| `0xc12/0xc14` | +0x3d4/0xc14 | owner-keyed counts / ranges — read by `enDecodeCells` only, unused by the HNR→cell path |
+| `0x001` | +0x4dc (`NLValueListAttrVector`) | per-address-element VL, decoded in `enDecodeCells` only behind gate `this+0x26==0`; **no device consumer found** (the two read-paths below use `0xc11`/`0xc12`). Stock: one unique u32 per record, scale reaching 240 k — [OPEN] meaning |
+| `0x002/0x003/0x004/0x005` (+ `0x8003`/`0x8004` variants) | +0x530 (`NLCellIdAttrVector`) | the cell table itself: local id list (+0x00 u16), global-recdesc search starts (+0x20, +0x60) over `NLRecordDescriptionAttrVector` +0x40, per-row extra list +0x80, row count +0x88, existence bit +0xa0 — assembled into `NLCellID{u16, u16, u32, bool}` by `enGetCells` |
+| `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record list of cell-row ordinals** (device model: 1..N — stock Kraków uses 1, other stock files up to 632); the ordinal < row-count (`+0x88`) check runs in `enGetCells` |
+| `0xc12` | +0x3d4 (`NLValueListAttrVector`) | **per-entry (name-list element: street/city) list of cell-row ordinals** — consumed by `bGetElementCellIDs` for element→cell lookup |
+| `0xc14` | +0x47c (`NLRangeAttrVector`) | range values **keyed by cell-row ordinal**; both read-paths look it up per ordinal (miss → `0xFFFFFFFF` sentinel) — [OPEN] what the value means |
+| `0xc0b/0xc0c/0xc0d` | +0x2c0/0x2e0/0x300 (`NLBinaryAttrVector`) | `NLHnrCellStatus` bytes {b0, b1, b2, u16=0xffff} — indexed **at the record's first `0xc11` value offset** (== row ordinal while 1 value/record), not by record number. Stock observation (data, not device): `0xc0b == 0xc09`, `0xc0c == 0xc0a` mirror the parity bits; `0xc0d` set on ~half the records — [OPEN] semantics |
 
-Placement path: `bGetHnrCellIDs 00ce686c` → `enGetHnrCellIndices` reads `0xc11` per record (values
-are ordinals into the block table, validated `< domain+0x88`) → `enGetCells` assembles
-`NLCellID{local, recdesc, global_id, bit}`. Stock ground-truth (LID40006 block 65, ul. GRÓJECKA):
+HNR placement path: `bGetHnrCellIDs` iterates the matching records → per record
+`enGetHnrCellReferences` → `enGetHnrCellIndices` reads the record's `0xc11` ordinal list →
+`enGetCells` assembles the `NLCellID`s (bounds-checked) → `0xc14::enGetValue` per ordinal →
+`0xc0b/0xc0c/0xc0d` bits at the `0xc11` value-offset window. Element path: `bGetElementCellIDs` →
+`enGetEntryCellReferences` reads `0xc12` per element and repeats the same `enGetCells`/`0xc14`
+steps (optionally filtered by `bHasValidOwner` against a street set). Stock ground-truth (LID40006 block 65, ul. GRÓJECKA):
 each numbered segment is one table row; even/odd sides are separate records (own `0x001` ids, e.g.
 93585/93586) sharing one `0xc11` row. [OPEN] stock `global_id`s are an author registry numbering
 (1..~674, not the raw u16 RNW cluster ids 20000..59000 seen via `rnw2osm`) — the stock→RNW registry

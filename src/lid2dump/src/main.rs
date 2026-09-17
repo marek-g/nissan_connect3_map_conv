@@ -386,7 +386,7 @@ fn decode_for_export(
             }
             let hv = stream(0xc01, 0);
                 let cv = stream(0xc11, 0); // flat per-record 0xc11 values (row ordinals)
-                let c1v = stream(0x0001, 0); // flat 0x001 author cell ids (when one per record)
+                let c1v = stream(0x0001, 0); // flat 0x001 per-entry ids (meaning [OPEN], no device consumer)
             if !hv.is_empty() {
                 let bits = blk
                     .streams

@@ -74,7 +74,8 @@ pub struct HnrRow {
     /// `0xc0b/0xc0c/0xc0d`: stock mirrors the parity bits in `0xc0b/0xc0c` and keeps a
     /// direction-class flag in `0xc0d` ([OPEN] exact semantics; ~half of stock records set).
     pub side: Option<(bool, bool, bool)>,
-    /// `0x001` per-record cell id (author cell vector; table rows in `block_cells`).
+    /// `0x001` per-entry id (meaning [OPEN]; device joins via `0xc11` -> `block_cells`).
+    /// Exported as `hnr.cell`.
     pub cell: Option<u32>,
 }
 
