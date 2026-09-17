@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <node id="101" lat="52.0000" lon="21.0000"/>
+  <node id="200" lat="52.0010" lon="21.0010"/>
+  <node id="102" lat="52.0020" lon="21.0020"/>
+  <node id="103" lat="52.0020" lon="21.0000"/>
+  <node id="104" lat="52.0000" lon="21.0020"/>
+  <node id="105" lat="52.0060" lon="21.0060"/>
+  <node id="106" lat="52.0070" lon="21.0070"/>
+  <node id="300" lat="52.0012" lon="21.0012">
+    <tag k="place" v="city"/>
+    <tag k="name" v="Krzyzowa"/>
+  </node>
+  <way id="200">
+    <nd ref="101"/><nd ref="200"/><nd ref="102"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Aleja Lipowa"/>
+  </way>
+  <way id="201">
+    <nd ref="103"/><nd ref="200"/><nd ref="104"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Polna"/>
+  </way>
+  <way id="202">
+    <nd ref="105"/><nd ref="106"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Samotna"/>
+  </way>
+</osm>

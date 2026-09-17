@@ -279,3 +279,155 @@ pub fn write_gen_attr_file(element_count: u32, outer: &[u8], blocks: &[BlockData
     }
     out
 }
+
+/// One `LID3%05u` crossing block: the element range plus the column-`0x801` `NLValueListAttrVector`
+/// content (`exists` over the block's element range, `starts` = abs offsets into `values`,
+/// `values` = partner street element-ids; a partner may repeat once per distinct meeting node,
+/// never the row's own element — all stock-DEU-verified shape rules).
+pub struct CrossingBlockData {
+    pub elem_start: u32,
+    pub elem_end: u32,
+    pub exists: Vec<bool>,
+    pub starts: Vec<u32>,
+    pub values: Vec<u32>,
+}
+
+/// Build one crossing block. Emits the stock 0x801 triple first (`0x4801` existence, `0x8801`
+/// VLE-delta `0x16` starts, `0x0801` VLE `0x14` values — the codecs `write.rs` proves byte-exact)
+/// and then the stock's per-value-slot *empty* columns (`0x803`/`0x804` empty VLs, `0x807`/`0x808`
+/// existence-only vectors with no bits, the `0x802` all-present/implicit VL triple) as
+/// zero-byte rows with stock codes/params, so the descriptor table mirrors stock block layouts.
+/// The not-yet-reversed columns are intentionally NOT emitted: `0x806` (unknown VL), `0x8001`
+/// (crossing status stream, `00e077cc` undecoded) and the `NLCellIdAttrVector` cell table
+/// `0x001..0x005` (crossing-side semantics unreversed, LID_format.md §11 note); the device's
+/// per-column decode gates skip absent vectors. [OPEN] crossing positions therefore cannot be
+/// served until the cell columns are written too.
+pub fn build_crossing_block(blk: &CrossingBlockData) -> Vec<u8> {
+    let domain = blk.exists.len() as u32;
+    let v = blk.values.len() as u32;
+    let xc = ex_code(&blk.exists);
+    let rows: Vec<(u16, u16, u32, Vec<u8>)> = vec![
+        (0x4801, xc, domain, exist_bytes(&blk.exists, xc)),
+        (
+            0x8801,
+            0x16,
+            blk.starts.len() as u32,
+            encode_numeric(&blk.starts, 0x16).expect("starts"),
+        ),
+        (
+            0x0801,
+            0x14,
+            v,
+            encode_numeric(&blk.values, 0x14).expect("values"),
+        ),
+        (0x4803, 0x02, v, Vec::new()),
+        (0x0803, 0x11, 0, Vec::new()),
+        (0x4804, 0x02, v, Vec::new()),
+        (0x0804, 0x11, 0, Vec::new()),
+        (0x0807, 0x02, v, Vec::new()),
+        (0x0808, 0x02, v, Vec::new()),
+        (0x4802, 0x03, v, Vec::new()),
+        (0x8802, 0x17, v, Vec::new()),
+        (0x0802, 0x18, v, Vec::new()),
+    ];
+    let n = rows.len() as u16;
+    let hdr = 2 + 12 * n as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(hdr + rows.iter().map(|r| r.3.len()).sum::<usize>());
+    out.extend_from_slice(&n.to_le_bytes());
+    let mut off = hdr as u32;
+    let mut body: Vec<u8> = Vec::new();
+    for (kind, code, param, bytes) in &rows {
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&param.to_le_bytes());
+        off += bytes.len() as u32;
+        body.extend_from_slice(bytes);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Build `LID3%05u` bytes (modern gen, header kind 2). Sub-header at `hdr` =
+/// `{u32 elem_count, u32 total_values, u32 block_bytes, u32 block_count}` then the same
+/// `NLBlockTocEntry` table as GenAttr at `hdr+16` (`NLCrossingFile::DecodeSubHeader 00e08eb0`;
+/// DEU `LID30006` field probe: `total_values` = Σ row lengths, `block_bytes` = filesize − first
+/// block offset). `elem_count` must equal the sibling street name-list element count (stock
+/// invariant: `LID3` and `LID2` share the element-id domain). `outer` = canonical header bytes.
+pub fn write_crossing_file(
+    element_count: u32,
+    outer: &[u8],
+    blocks: &[CrossingBlockData],
+) -> Vec<u8> {
+    let hdr = if outer.len() >= 0x14 {
+        u32(outer, 0x10) as usize
+    } else {
+        0x20
+    };
+    let toc_size = 16 + 12 * blocks.len();
+    let blocks_off = ((hdr + toc_size + 3) & !3).max(hdr + toc_size);
+    let mut out: Vec<u8> = vec![0u8; hdr + toc_size];
+    let reuse = hdr.min(outer.len());
+    out[..reuse].copy_from_slice(&outer[..reuse]);
+    out[0x10..0x14].copy_from_slice(&(hdr as u32).to_le_bytes());
+    out[0x14..0x18].copy_from_slice(&(hdr as u32 + toc_size as u32).to_le_bytes());
+    let block_bytes: Vec<Vec<u8>> = blocks.iter().map(build_crossing_block).collect();
+    let mut bo = blocks_off;
+    for (i, blk) in blocks.iter().enumerate() {
+        let p = hdr + 16 + 12 * i;
+        out[p..p + 4].copy_from_slice(&(bo as u32).to_le_bytes());
+        out[p + 4..p + 8].copy_from_slice(&blk.elem_start.to_le_bytes());
+        out[p + 8..p + 12].copy_from_slice(&blk.elem_end.to_le_bytes());
+        bo += block_bytes[i].len();
+    }
+    let total: u32 = blocks.iter().map(|b| b.values.len() as u32).sum();
+    out[hdr..hdr + 4].copy_from_slice(&element_count.to_le_bytes());
+    out[hdr + 4..hdr + 8].copy_from_slice(&total.to_le_bytes());
+    out[hdr + 8..hdr + 12].copy_from_slice(&((bo - blocks_off) as u32).to_le_bytes());
+    out[hdr + 12..hdr + 16].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
+    out.resize(blocks_off, 0);
+    for bb in &block_bytes {
+        out.extend_from_slice(bb);
+    }
+    out
+}
+
+#[cfg(test)]
+mod crossing_tests {
+    use super::*;
+    use crate::{header, read_crossings};
+
+    #[test]
+    fn crossing_roundtrip() {
+        let blocks = vec![
+            CrossingBlockData {
+                elem_start: 0,
+                elem_end: 2,
+                exists: vec![true, false, true],
+                starts: vec![0, 2],
+                values: vec![42, 7, 42],
+            },
+            CrossingBlockData {
+                elem_start: 3,
+                elem_end: 5,
+                exists: vec![false, false, false],
+                starts: vec![],
+                values: vec![],
+            },
+        ];
+        let outer = header::nl_header(header::KIND_CROSSING, 99, 3, 0);
+        let bytes = write_crossing_file(6, &outer, &blocks);
+        assert!(crate::is_crossing(&bytes));
+        assert!(!crate::is_name_list(&bytes));
+        let ci = read_crossings(&bytes).unwrap();
+        assert_eq!(ci.element_count, 6);
+        assert_eq!(ci.blocks.len(), 2);
+        let b0 = ci.decode_crossings(&bytes, 0).unwrap();
+        assert_eq!(b0.len(), 2);
+        assert_eq!(b0[0].element, 0);
+        assert_eq!(b0[0].streets, vec![42, 7]);
+        assert_eq!(b0[1].element, 2);
+        assert_eq!(b0[1].streets, vec![42]);
+        assert!(ci.decode_crossings(&bytes, 1).unwrap().is_empty());
+    }
+}

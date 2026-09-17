@@ -1083,6 +1083,14 @@ any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card te
      (BACCHUSWEG × LINGENER STRASSE, multi-way residential clusters…); full-file replay via the new
      `lid_format::read_crossings`/`CrossingIndex::decode_crossings` decodes all 252 DEU blocks
      (1 221 570 crossings) and `lid2dump --sqlite` exports them as `crossing` + `v_crossing`.
+     Row semantics (DEU-probed): a row = the OTHER street elements meeting this street, one entry
+     per distinct meeting node, row's own id NEVER in its row (0/1.22 M). WRITER shipped
+     (`lid_format::write::write_crossing_file`, osm2lid `LID30006.DAT`): header kind 2, sub-header
+     `{elem, Σvalues, block_bytes, n}`; blocks emit the verified 0x801 triple + the stock's empty
+     value-slot columns (0x802/0x803/0x804/0x807/0x808) with stock codes/params; junctions = shared
+     graph nodes of the routable onecells. NOT yet emitted: 0x806, status 0x8001 (`00e077cc`
+     undecoded) and the crossing `NLCellIdAttrVector` 0x001..0x005 — positions therefore pending.
+     Krzeszowice sample: 216 crossing rows (market-square crossings name-resolve via `v_crossing`).
      POL card `LID30006.DAT` is a
      **legacy variant** (author block shifted to 0x0c, `02 77 ?? ??` @0x08 — the sub-header @0x77 is
      author garbage, broken under the modern parser; block signature `17 00 01 48 01 00` ×61 from

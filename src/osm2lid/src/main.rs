@@ -91,6 +91,7 @@ fn main() {
     let mut no_poi = false;
     let mut no_genattr = false;
     let mut no_pa = false;
+    let mut no_crossings = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -113,6 +114,7 @@ fn main() {
             "--no-poi" => no_poi = true,
             "--no-genattr" => no_genattr = true,
             "--no-pa" => no_pa = true,
+            "--no-crossings" => no_crossings = true,
             "-h" | "--help" => {
                 usage();
                 exit(0);
@@ -176,7 +178,11 @@ fn main() {
     let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
     let (ncit, city_idx) = write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2);
     let segs = build_onecells(&data, bbox);
-    eprintln!("onecells: {} clusters: {}", segs.len(), segs.iter().map(|x| x.cluster).max().unwrap_or(0));
+    eprintln!(
+        "onecells: {} clusters: {}",
+        segs.len(),
+        segs.iter().map(|x| x.cluster).max().unwrap_or(0)
+    );
     let (mut st_entries, mut city_of) = collect_street_entries(&data, bbox);
     let real_labels: Vec<String> = st_entries.iter().map(|e| e.label.clone()).collect();
     let (addr_hits, pseudo_settlements) = resolve_addresses(&data, bbox, &segs, &real_labels);
@@ -187,7 +193,8 @@ fn main() {
         // the ASF model stores duplicate names as PARALLEL 0x00 leaf edges (encoder-side FIX
         // `encode_duplicate_names_roundtrip`; CHECKED stock: 843k (name,city) duplicate groups,
         // up to 105 per group). Entry order is deterministic (cluster sort).
-        let places: Vec<(&String, (i64, i64))> = data.places.iter().map(|(n, c, _)| (n, *c)).collect();
+        let places: Vec<(&String, (i64, i64))> =
+            data.places.iter().map(|(n, c, _)| (n, *c)).collect();
         for (label, (cx, cy)) in &pseudo_settlements {
             let (city_coord, city_name) = match nearest_place(&places, *cx, *cy) {
                 Some((nm, c)) => (Some(c), Some(nm.clone())),
@@ -202,7 +209,8 @@ fn main() {
             });
         }
     }
-    let (nst, streets) = write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
+    let (nst, streets) =
+        write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
     // city coordinate registry (first node per unique name — same order `write_cities` numbers elements)
     let city_coords: std::collections::BTreeMap<&String, (i64, i64)> = {
         let mut m = std::collections::BTreeMap::new();
@@ -222,7 +230,14 @@ fn main() {
     let (naddr, street_cell) = if no_genattr {
         (0, Default::default())
     } else {
-        write_gen_attr(&outdir.join("LID40006.DAT"), &addr_hits, &segs, &streets, nst, region_id)
+        write_gen_attr(
+            &outdir.join("LID40006.DAT"),
+            &addr_hits,
+            &segs,
+            &streets,
+            nst,
+            region_id,
+        )
     };
     let npa = if no_pa {
         0
@@ -237,13 +252,26 @@ fn main() {
             region_id,
         )
     };
+    let ncross = if no_crossings {
+        0
+    } else {
+        write_crossings(
+            &outdir.join("LID30006.DAT"),
+            &segs,
+            &streets,
+            nst,
+            region_id,
+        )
+    };
 
     eprintln!(
-        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), PA_20006.DAT ({} access points), REGION_ID=0x{:03x} ({})",
-        out, npoi, ncity, ncit, nst, nrel, naddr, npa, region_id, region.to_uppercase()
+        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), PA_20006.DAT ({} access points), LID30006.DAT ({} crossing rows), REGION_ID=0x{:03x} ({})",
+        out, npoi, ncity, ncit, nst, nrel, naddr, npa, ncross, region_id, region.to_uppercase()
     );
     eprintln!("NOTE: ship the stock META0000.DAT unchanged — its relation table entry #1 is (2↔3), which is what REL00001.DAT carries.");
-    eprintln!("NOTE: crossing (+10000) tables are not generated yet — see LID_format.md §12. PA file card-test pending (no stock PA sample exists on any card).");
+    eprintln!(
+        "NOTE: crossing cells (positions) are NOT yet written (column RE pending) — the device can list partners per street but may not locate them. PA file card-test pending (no stock PA sample exists on any card)."
+    );
 }
 
 fn usage() {
@@ -254,7 +282,8 @@ fn usage() {
         \t--bbox W,S,E,N keep only entries within this lon/lat box\n\
         \t--no-poi       skip amenity/shop/tourism POIs (cities only)\n\
         \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file\n\
-        \t--no-pa        skip the PA_20006.DAT point-access-point file"
+        \t--no-pa        skip the PA_20006.DAT point-access-point file\n\
+        \t--no-crossings skip the LID30006.DAT crossing (fileID+10000) file"
     );
 }
 
@@ -505,7 +534,9 @@ fn tag_way(d: &mut Data, ids: Vec<i64>, t: &HashMap<String, String>) {
     let addr_place = t.get("addr:place").cloned();
     if let (Some(num), Some((label, from_place))) = (
         t.get("addr:housenumber"),
-        addr_street.map(|v| (v, false)).or_else(|| addr_place.map(|v| (v, true))),
+        addr_street
+            .map(|v| (v, false))
+            .or_else(|| addr_place.map(|v| (v, true))),
     ) {
         let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
         for &r in &ids {
@@ -711,12 +742,17 @@ struct SidMap {
 
 impl SidMap {
     fn pick(&self, label: &str, c: (i64, i64)) -> Option<u32> {
-        self.by_label
-            .get(label)
-            .and_then(|v| v.iter().min_by_key(|(_, p)| pt_seg_d2(c, *p, *p)).map(|(i, _)| *i))
+        self.by_label.get(label).and_then(|v| {
+            v.iter()
+                .min_by_key(|(_, p)| pt_seg_d2(c, *p, *p))
+                .map(|(i, _)| *i)
+        })
     }
     fn first(&self, label: &str) -> Option<u32> {
-        self.by_label.get(label).and_then(|v| v.first()).map(|(i, _)| *i)
+        self.by_label
+            .get(label)
+            .and_then(|v| v.first())
+            .map(|(i, _)| *i)
     }
 }
 
@@ -741,7 +777,10 @@ fn write_name_list_idx(
     let nl = lid_format::read(&bytes).ok();
     if let Some(nl) = &nl {
         for (i, e) in nl.elements.iter().enumerate() {
-            decode_ids.entry(e.name.as_str()).or_default().push(i as u32);
+            decode_ids
+                .entry(e.name.as_str())
+                .or_default()
+                .push(i as u32);
         }
     }
     // city first-seen ranks (mirrors encode_id's grouping)
@@ -767,10 +806,10 @@ fn write_name_list_idx(
         if o.len() == ids.len() {
             for (&id, &(_, _, ei)) in ids.iter().zip(&o) {
                 sid_of_entry[ei] = id;
-                by_label
-                    .entry(label.to_string())
-                    .or_default()
-                    .push((id, (i64::from(entries[ei].x_pau), i64::from(entries[ei].y_pau))));
+                by_label.entry(label.to_string()).or_default().push((
+                    id,
+                    (i64::from(entries[ei].x_pau), i64::from(entries[ei].y_pau)),
+                ));
             }
         } else {
             degraded = true; // decode disagrees with grouping model: fall back to first-wins
@@ -783,13 +822,22 @@ fn write_name_list_idx(
         eprintln!("WARNING: name-list decode alignment mismatch, duplicate labels may mis-bind");
         for (i, e) in entries.iter().enumerate() {
             if sid_of_entry[i] == u32::MAX {
-                if let Some(f) = decode_ids.get(e.label.as_str()).and_then(|v| v.first().copied()) {
+                if let Some(f) = decode_ids
+                    .get(e.label.as_str())
+                    .and_then(|v| v.first().copied())
+                {
                     sid_of_entry[i] = f;
                 }
             }
         }
     }
-    (entries.len(), SidMap { by_label, sid_of_entry })
+    (
+        entries.len(),
+        SidMap {
+            by_label,
+            sid_of_entry,
+        },
+    )
 }
 
 /// Housenumber "12" → 12; "12A"/"3/5"/"31a"/"" → None (stock GenAttr is a *numeric* record column;
@@ -812,7 +860,7 @@ struct HN {
 fn parse_hn(s: &str) -> Option<HN> {
     let mut parts: Vec<&str> = Vec::new();
     for piece in s.split(['-', '\u{2013}', '\u{2014}', '/']) {
-            let digits: &str = {
+        let digits: &str = {
             let t = piece.trim();
             let end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
             &t[..end]
@@ -826,14 +874,34 @@ fn parse_hn(s: &str) -> Option<HN> {
         0 => None,
         1 => {
             let n = num(&parts[0])?;
-            Some(HN { from: n, to: n, even: n % 2 == 0, odd: n % 2 == 1 })
+            Some(HN {
+                from: n,
+                to: n,
+                even: n % 2 == 0,
+                odd: n % 2 == 1,
+            })
         }
         _ => {
             let (from, to) = (
-                parts.iter().map(|p| num(p)).collect::<Option<Vec<u32>>>()?.into_iter().min()?,
-                parts.iter().map(|p| num(p)).collect::<Option<Vec<u32>>>()?.into_iter().max()?,
+                parts
+                    .iter()
+                    .map(|p| num(p))
+                    .collect::<Option<Vec<u32>>>()?
+                    .into_iter()
+                    .min()?,
+                parts
+                    .iter()
+                    .map(|p| num(p))
+                    .collect::<Option<Vec<u32>>>()?
+                    .into_iter()
+                    .max()?,
             );
-            Some(HN { from, to, even: true, odd: true })
+            Some(HN {
+                from,
+                to,
+                even: true,
+                odd: true,
+            })
         }
     }
 }
@@ -846,19 +914,123 @@ mod hn_tests {
     fn hn_parsing() {
         use super::HN;
         let cases: &[(&str, Option<HN>)] = &[
-            ("7", Some(HN { from: 7, to: 7, even: false, odd: true })),
-            ("8 ", Some(HN { from: 8, to: 8, even: true, odd: false })),
-            ("1a", Some(HN { from: 1, to: 1, even: false, odd: true })),
-            ("1A", Some(HN { from: 1, to: 1, even: false, odd: true })),
-            ("11b", Some(HN { from: 11, to: 11, even: false, odd: true })),
-            ("31 A", Some(HN { from: 31, to: 31, even: false, odd: true })),
-            ("12-16", Some(HN { from: 12, to: 16, even: true, odd: true })),
-            ("12 \u{2013} 16", Some(HN { from: 12, to: 16, even: true, odd: true })),
-            ("1/2", Some(HN { from: 1, to: 2, even: true, odd: true })),
-            ("3/7", Some(HN { from: 3, to: 7, even: true, odd: true })),
-            ("2/1", Some(HN { from: 1, to: 2, even: true, odd: true })),
-            ("1A/2", Some(HN { from: 1, to: 2, even: true, odd: true })),
-            ("5-", Some(HN { from: 5, to: 5, even: false, odd: true })),
+            (
+                "7",
+                Some(HN {
+                    from: 7,
+                    to: 7,
+                    even: false,
+                    odd: true,
+                }),
+            ),
+            (
+                "8 ",
+                Some(HN {
+                    from: 8,
+                    to: 8,
+                    even: true,
+                    odd: false,
+                }),
+            ),
+            (
+                "1a",
+                Some(HN {
+                    from: 1,
+                    to: 1,
+                    even: false,
+                    odd: true,
+                }),
+            ),
+            (
+                "1A",
+                Some(HN {
+                    from: 1,
+                    to: 1,
+                    even: false,
+                    odd: true,
+                }),
+            ),
+            (
+                "11b",
+                Some(HN {
+                    from: 11,
+                    to: 11,
+                    even: false,
+                    odd: true,
+                }),
+            ),
+            (
+                "31 A",
+                Some(HN {
+                    from: 31,
+                    to: 31,
+                    even: false,
+                    odd: true,
+                }),
+            ),
+            (
+                "12-16",
+                Some(HN {
+                    from: 12,
+                    to: 16,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "12 \u{2013} 16",
+                Some(HN {
+                    from: 12,
+                    to: 16,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "1/2",
+                Some(HN {
+                    from: 1,
+                    to: 2,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "3/7",
+                Some(HN {
+                    from: 3,
+                    to: 7,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "2/1",
+                Some(HN {
+                    from: 1,
+                    to: 2,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "1A/2",
+                Some(HN {
+                    from: 1,
+                    to: 2,
+                    even: true,
+                    odd: true,
+                }),
+            ),
+            (
+                "5-",
+                Some(HN {
+                    from: 5,
+                    to: 5,
+                    even: false,
+                    odd: true,
+                }),
+            ),
             ("", None),
             ("b5", None),
             ("b", None),
@@ -878,18 +1050,16 @@ mod hn_tests {
 /// differing ONLY by diacritics in one town) is covered by the nearest-candidate tie-break.
 fn fold_diacritics(t: &str) -> String {
     t.chars()
-        .map(|c| {
-            match c {
-                '\u{0105}' => 'a',
-                '\u{0107}' => 'c',
-                '\u{0119}' => 'e',
-                '\u{0142}' => 'l',
-                '\u{0144}' => 'n',
-                '\u{00f3}' => 'o',
-                '\u{015b}' => 's',
-                '\u{017a}' | '\u{017c}' => 'z',
-                _ => c,
-            }
+        .map(|c| match c {
+            '\u{0105}' => 'a',
+            '\u{0107}' => 'c',
+            '\u{0119}' => 'e',
+            '\u{0142}' => 'l',
+            '\u{0144}' => 'n',
+            '\u{00f3}' => 'o',
+            '\u{015b}' => 's',
+            '\u{017a}' | '\u{017c}' => 'z',
+            _ => c,
         })
         .collect()
 }
@@ -902,7 +1072,9 @@ fn street_tokens(label: &str) -> Vec<String> {
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .map(fold_diacritics)
-        .filter(|t| !t.is_empty() && !matches!(t.as_str(), "ul" | "al" | "aleja" | "alei" | "os" | "ulica"))
+        .filter(|t| {
+            !t.is_empty() && !matches!(t.as_str(), "ul" | "al" | "aleja" | "alei" | "os" | "ulica")
+        })
         .collect()
 }
 
@@ -1008,7 +1180,12 @@ fn compose_records(src: &[HN]) -> Vec<HN> {
                 last = list[j];
                 j += 1;
             }
-            out.push(HN { from, to: last, even, odd });
+            out.push(HN {
+                from,
+                to: last,
+                even,
+                odd,
+            });
             i = j;
         }
     }
@@ -1050,8 +1227,10 @@ fn resolve_addresses(
             }
         }
     }
-    let tok_of: BTreeMap<&str, Vec<String>> =
-        real_labels.iter().map(|l| (l.as_str(), street_tokens(l))).collect();
+    let tok_of: BTreeMap<&str, Vec<String>> = real_labels
+        .iter()
+        .map(|l| (l.as_str(), street_tokens(l)))
+        .collect();
 
     fn nearest_seg(c: (i64, i64), list: &[usize], segs: &[OneCell]) -> (usize, i128) {
         let mut best = list[0];
@@ -1075,7 +1254,9 @@ fn resolve_addresses(
         if !in_bbox(*c, bbox) {
             continue;
         }
-        let Some(parsed) = parse_hn(num) else { continue };
+        let Some(parsed) = parse_hn(num) else {
+            continue;
+        };
         let label = label.trim().to_string();
         if label.is_empty() || label.contains('\0') {
             continue;
@@ -1086,14 +1267,24 @@ fn resolve_addresses(
         // name binds to that street (same entry, no duplicate).
         if *from_place && !real.contains(label.as_str()) {
             pseudo_groups.entry(label.clone()).or_default().push(*c);
-            hits.push(AddrHit { label, coord: *c, hn: parsed, seg: None });
+            hits.push(AddrHit {
+                label,
+                coord: *c,
+                hn: parsed,
+                seg: None,
+            });
             continue;
         }
         if real.contains(label.as_str()) {
             let seg = by_name
                 .get(label.as_str())
                 .map(|list| nearest_seg(*c, list, segs).0);
-            hits.push(AddrHit { label, coord: *c, hn: parsed, seg });
+            hits.push(AddrHit {
+                label,
+                coord: *c,
+                hn: parsed,
+                seg,
+            });
             continue;
         }
         let target = fallback_cache.entry(label.clone()).or_insert_with(|| {
@@ -1132,12 +1323,20 @@ fn resolve_addresses(
             })
         });
         match target {
-            Some((nm, seg)) => {
-                hits.push(AddrHit { label: nm.clone(), coord: *c, hn: parsed, seg: *seg })
-            }
+            Some((nm, seg)) => hits.push(AddrHit {
+                label: nm.clone(),
+                coord: *c,
+                hn: parsed,
+                seg: *seg,
+            }),
             None => {
                 pseudo_groups.entry(label.clone()).or_default().push(*c);
-                hits.push(AddrHit { label, coord: *c, hn: parsed, seg: None });
+                hits.push(AddrHit {
+                    label,
+                    coord: *c,
+                    hn: parsed,
+                    seg: None,
+                });
             }
         }
     }
@@ -1174,13 +1373,18 @@ fn resolve_addresses(
             e.2 += 1;
         }
         for (_, (sx, sy, n)) in clusters {
-            pseudo.push((label.clone(), (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64)));
+            pseudo.push((
+                label.clone(),
+                (
+                    sx.div_euclid(n as i128) as i64,
+                    sy.div_euclid(n as i128) as i64,
+                ),
+            ));
         }
     }
     pseudo.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     (hits, pseudo)
 }
-
 
 /// GenAttr house-number attribute block chunk size (street elements per TOC block; stock ≈4–19 k).
 const HN_ATTR_CHUNK: usize = 8192;
@@ -1309,11 +1513,14 @@ fn write_gen_attr(
     if nst < 2 || nrec_all == 0 {
         return (0, Default::default());
     } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
-    // Synthetic-row (unroutable street / pseudo-street) cell clusters: prefer the REAL one-cell
-    // cluster of the nearest routable segment within 300 m (stock binds village addresses to
-    // real road cells, e.g. DEBINY rows -> global cell id 123); purely synthetic id otherwise.
+      // Synthetic-row (unroutable street / pseudo-street) cell clusters: prefer the REAL one-cell
+      // cluster of the nearest routable segment within 300 m (stock binds village addresses to
+      // real road cells, e.g. DEBINY rows -> global cell id 123); purely synthetic id otherwise.
     for (&sid, &(sx, sy, n)) in &virt_cnt {
-        let c = (sx.div_euclid(n as i128) as i64, sy.div_euclid(n as i128) as i64);
+        let c = (
+            sx.div_euclid(n as i128) as i64,
+            sy.div_euclid(n as i128) as i64,
+        );
         let mut near: Option<(i128, u32)> = None;
         for sg in segs {
             let dd = pt_seg_d2(c, sg.ca, sg.cb);
@@ -1365,7 +1572,9 @@ fn write_gen_attr(
             for &(seg, cl) in &street_rows {
                 let base = row_cluster.len() as u32;
                 row_cluster.push(cl);
-                let Some(list) = seg_recs.get(&seg) else { continue };
+                let Some(list) = seg_recs.get(&seg) else {
+                    continue;
+                };
                 // distinct parsed HNs (1a/1b dedup to one "1" — same building) merged into
                 // stock-style records: step-2 consecutive single numbers coalesce into one
                 // single-parity range record (stock `5..9` odd), parsed ranges stay as-is
@@ -1557,7 +1766,99 @@ fn write_gen_attr(
         eprintln!("write {path:?} failed");
         return (0, Default::default());
     }
-    (nrec_all, street_cell.into_iter().map(|(sid, (_, row))| (sid, row)).collect())
+    (
+        nrec_all,
+        street_cell
+            .into_iter()
+            .map(|(sid, (_, row))| (sid, row))
+            .collect(),
+    )
+}
+
+/// `LID30006.DAT` crossings. A crossing = a graph node where at least two distinct street elements
+/// meet; the element rows live in the `LID20006` street-element domain (`elem_count` = the name
+/// list's element count) and each existing element lists the OTHER street elements that meet it,
+/// one entry per distinct meeting node (the stock-DEU shape: self never listed, multi-node
+/// partners repeat). [OPEN] positions need the crossing `NLCellIdAttrVector` columns whose
+/// semantics are still under RE (LID_format.md §11 note) — this file lists partners only; the
+/// `LID4` cell ids are NOT duplicated here.
+fn write_crossings(
+    path: &Path,
+    segs: &[OneCell],
+    streets: &SidMap,
+    nst: usize,
+    region: u16,
+) -> usize {
+    use lid_format::write::{write_crossing_file, CrossingBlockData};
+    use std::collections::{BTreeSet, HashMap};
+
+    if nst < 2 {
+        return 0;
+    }
+    // Node identity = the exact PAU coords of onecell endpoints (shared OSM nodes give bit-equal
+    // coords). One pass: node -> sids touching it.
+    let mut node_sids: HashMap<(i64, i64), BTreeSet<u32>> = HashMap::new();
+    for sg in segs {
+        let Some(nm) = &sg.name else { continue };
+        let Some(sid) = streets.first(nm.trim()) else {
+            continue;
+        };
+        for end in [sg.ca, sg.cb] {
+            node_sids.entry(end).or_default().insert(sid);
+        }
+    }
+    // Junction occurrences in deterministic PAU node order.
+    let mut nodes: Vec<(i64, i64)> = node_sids.keys().copied().collect();
+    nodes.sort();
+    let mut by_sid: BTreeMap<u32, Vec<(i64, i64, u32)>> = BTreeMap::new();
+    for node in nodes {
+        let sids = &node_sids[&node];
+        if sids.len() < 2 {
+            continue;
+        }
+        for &x in sids {
+            for &y in sids {
+                if x != y {
+                    by_sid.entry(x).or_default().push((node.0, node.1, y));
+                }
+            }
+        }
+    }
+    if by_sid.is_empty() {
+        return 0;
+    }
+    let nblk = nst.div_ceil(HN_ATTR_CHUNK).max(2);
+    let w = nst.div_ceil(nblk);
+    let mut blocks = Vec::new();
+    let mut total_rows = 0usize;
+    for lo in (0..nst).step_by(w) {
+        let hi = (lo + w).min(nst);
+        let mut exists = vec![false; hi - lo];
+        let mut starts: Vec<u32> = Vec::new();
+        let mut values: Vec<u32> = Vec::new();
+        for sid in lo as u32..hi as u32 {
+            if let Some(vals) = by_sid.get(&sid) {
+                exists[(sid - lo as u32) as usize] = true;
+                starts.push(values.len() as u32);
+                values.extend(vals.iter().map(|&(_, _, y)| y));
+                total_rows += 1;
+            }
+        }
+        blocks.push(CrossingBlockData {
+            elem_start: lo as u32,
+            elem_end: (hi - 1) as u32,
+            exists,
+            starts,
+            values,
+        });
+    }
+    let outer = lid_format::header::nl_header(lid_format::header::KIND_CROSSING, region, 3, 0);
+    let bytes = write_crossing_file(nst as u32, &outer, &blocks);
+    if fs::write(path, &bytes).is_err() {
+        eprintln!("write {path:?} failed");
+        return 0;
+    }
+    total_rows
 }
 
 fn write_pa(
@@ -1607,8 +1908,10 @@ fn write_pa(
             // relative PAU offset from the street anchor (the device adds the anchor back).
             let dx = ax - i64::from(e.x_pau);
             let dy = ay - i64::from(e.y_pau);
-            if i64::from(i32::MIN) <= dx && dx <= i64::from(i32::MAX)
-                && i64::from(i32::MIN) <= dy && dy <= i64::from(i32::MAX)
+            if i64::from(i32::MIN) <= dx
+                && dx <= i64::from(i32::MAX)
+                && i64::from(i32::MIN) <= dy
+                && dy <= i64::from(i32::MAX)
             {
                 filled[sid as usize].pos = Some((dx as i32, dy as i32));
                 // bGetPACellIDs 00b898dc hands this id straight to the street block's enGetCells:
@@ -1650,7 +1953,12 @@ fn write_street_city_rel(
     city_idx: &HashMap<String, u32>,
     city_coords: &std::collections::BTreeMap<&String, (i64, i64)>,
 ) -> usize {
-    let src_elems = sid_of_entry.iter().copied().filter(|&s| s != u32::MAX).max().map_or(0, |m| m + 1) as u64;
+    let src_elems = sid_of_entry
+        .iter()
+        .copied()
+        .filter(|&s| s != u32::MAX)
+        .max()
+        .map_or(0, |m| m + 1) as u64;
     let tgt_elems = city_idx.len() as u64;
     let mut rels: Vec<(u32, u32)> = Vec::new();
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();

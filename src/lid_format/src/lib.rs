@@ -643,8 +643,11 @@ impl CrossingIndex {
                 values = decode_u32(b, d.code, s, en, count);
             }
         }
-        if starts.is_empty() || values.is_empty() {
-            return Err(format!("block {bi}: no column-0x801 value list"));
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if starts.is_empty() {
+            return Err(format!("block {bi}: 0x801 values without starts"));
         }
         let n_elem = e.elem_end - e.elem_start + 1;
         let mut out = Vec::new();
