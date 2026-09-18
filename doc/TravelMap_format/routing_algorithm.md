@@ -167,14 +167,26 @@ server-side handler bodies live in PROCNAV, see §7.]
    `GetPackageFormat` @0x006b87b4 (V1/V2/V3), `GetFileEntryV1/2/3` @0x006b8584/@0x006b8344/@0x006b8078,
    `s32ExtractFileToBuffer` @0x006b89d8, `s32ReadFileIntoBuffer` @0x006b7f90 (only the `UNC `
    uncompressed marker `0x20434e55` is handled there; V1 entries are tagged with the `ULI ` marker
-   `0x20494c55`, literal pool @0x006b8b78) — i.e. the SDS path *indexes* ULI entries but the actual
-   ULI→ELF expansion is done by the DNL loader elsewhere (not `gal_updater_out.out` — no ULI/XOZL
-   strings there). ULI header on PROCNAV: `{ "ULI ", u32 0, u32 1, u32 2, u32 0, u32 0x24 hdrsize,
-   u32 unpacked=0x120b974, u32 packed=0x91f348 }`, payload @0x24; the packed stream shows a
-   byte-split/delta profile (dense 0xfe/0xff/0xca pairs) — next candidate hosts to search: the
-   card's BOOT partition installer (not yet unpacked into `Map_unpacked`) and `PROCDLSAVER.OUT`
-   itself (XOZL-packed). After unpack: import PROCNAV (≈18.9 MB) and document the search core
-   (open/closed lists, cost tables, multi-region stitching at root clusters, reroute) here.
+   `0x20494c55`, literal pool @0x006b8b78 — `s32ExtractFileToBuffer` V1 branch passes the `ULI ` tag
+   straight into that UNC-only reader, so the SDS path INDEXES ULI entries but CANNOT expand them).
+   ULI header on PROCNAV: `{ "ULI ", u32 0, u32 1, u32 2, u32 0, u32 0x24 hdrsize,
+   u32 unpacked=0x120b974, u32 packed=0x91f348 }`, payload @0x24.
+   **Codec located 2026-09-18 (firmware ISO pass):** `container.iso.bin` (DNL installer ISO, full
+   filesystem unpacked to `/tmp/rnwwork/dnl/`) → `nor0/processes/` stages `PROCNAV.OUT` in the SAME
+   ULI form; the only code on the whole firmware+card that knows `XOZL`/`ULI` is the **triton
+   dual-OS monitor** (`triton_dualos.bin.uimage`, raw ARM blob, extracted at
+   `/tmp/rnwwork/triton.bin`): format checker @`0x108814` (`cmp` vs `"XOZL"`/`"ULI "` literals
+   @0x108838/0x10883c), installer/reader loop @`0x108844`, header-parse wrappers @`0x10857c`/
+   `0x108620`/`0x1086c4` (format codes 0/2/4) selecting three unpack primitives @`0xde5cc`,
+   `0xdd4ec`, `0x109070`; `0x109070` delegates to `0x10d66c/0x10d85c/0x10daf4/0x10d88c` with an
+   LSB bit-reader/bitter set of helpers @`0x109230-0x1092f0` → the codec is a BITSTREAM coder,
+   not byte-escape LZSS (a classic-LZSS brute force over 4k parameter sets against the small
+   `PROCDLSAVER.OUT` XOZL oracle — unpacked=0xf5e4 raw ELF — found no hit). `PROCDLSAVER.OUT`
+   (XOZL, same 0x24-byte header, payload with near-literal ELF prefix) is the small oracle for
+   further codec work. Options: (a) continue RE of the triton bitstream codec (medium-heavy);
+   (b) once car access returns, look for an already-expanded PROCNAV on the live head unit
+   (`find / -name 'PROCNAV*'`, /tmp, /dev/shm, /opt/bosch/processes) and/or trace the DNL install
+   flow with the existing rootshell tooling.
 2. On-device `routeprobe` capture (car access pending): confirms PROCNAV launch + file-open order
    (root clusters → ci chain) during a real Kraków calculation.
 3. `trRegionInfo` registry record width/field map inside `NAV_ROOT` `@a` table (partially read:

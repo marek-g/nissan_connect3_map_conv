@@ -126,10 +126,12 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   Kraków's stock shard `N6E2102.TCI` is an empty stub (ref pool zero-filled) and no shard references POL's
   clusters, yet stock routing works in Kraków — the per-region `NAV_ROOT.DAT` is now DECODED (device writer
   `rnw_tclNavRootKnitter` recovered): it carries a **root-cluster list** of 24-byte `nav_tclClusterInfo`
-  gateway records (POL: 1 cluster in `NAV00001` @0x4000 len 0xe660) from which ci-adjacency reaches every
+  gateway records (POL: 1 cluster in `NAV00001` @0x4000, cluster id 0xe660) from which ci-adjacency reaches every
   cluster — no TCI needed (all 17 stock roots' packed idents re-confirm the final region table).
-  **Remaining:** `osm2rnw` must emit a minimal `NAV_ROOT.DAT` (root-cluster ListDesc + empty annots + the
-  appended global-area/instruction records); on-device `routeprobe` capture still confirms the load order;
+  **DONE 2026-09-18:** `diag/merge_nav_root.py` appends generated clusters as root records into the
+  stock region root (exact record + root-shape-area layout verified byte-exact on stock POL/DEU/SCA/
+  EEU; area/instruction records are stock-identical → copied; rnwcheck re-parses + hard-fails
+  `--generated`). On-device `routeprobe` capture still confirms the load order;
   Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and
   drop stale `data/connect/rnw/**/*.PTH`.
 - **2c — routing engine hunt (2026-09-18, `doc/TravelMap_format/routing_algorithm.md`).** Search core is a

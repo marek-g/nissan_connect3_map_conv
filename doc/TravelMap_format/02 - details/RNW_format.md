@@ -514,6 +514,16 @@ byte-exact write layout is inferred from the reader + data. A region is three th
     ci-adjacency lists (`nav_tclClusterInfo::bRead` @0x008910cc; stream stride 24, in-memory
     stride 0x34) — the region's **root (gateway) clusters**, addressed exactly like a TCI ref
     (`fileOffset` packs the regionIdent, `fileId` = `NAV%05u`);
+  - **exact root-record layout** (verified byte-exact on stock POL/DEU/SCA/EEU, all fields mirror
+    the target cluster's own header):
+    `u32@0 (clusterOff&~0x3FFF)|regionIdent · u16@2 target cluster id (NAV cluster hdr u16@0) ·
+    u16@4 fileId · i32@8 refLon · i32@12 refLat · u8@16 shift · u8@17 hdrByte17 ·
+    u16@18 shapeOff · u16@20 ocnt · u16@22 0x0200`;
+  - **root-shape area**: runs directly between the last root record and the annotation-list
+    offset; per root `ocnt × {i16 dx,i16 dy}` — a **verbatim copy of the target cluster's outline
+    bytes** (same encoding as the cluster outline, verified byte-identical). Produced by
+    `bKnitRootClusterShapes` @0x008838b0; the shape offsets in the records must chain exactly
+    record-after-record up to the annotation start;
   - at annot-list `payloadOff`: TLV annotations `{u16 totalLen, u16 type}` iterated by
     `u16InterpreteAnnotations` @0x00891c4c: `0x2b` global-instruction `+{u32,u32}`
     (`bInterpreteGlobalInstructionAnnot` @0x00891b98), `0x2c` global-areas =
@@ -528,8 +538,14 @@ byte-exact write layout is inferred from the reader + data. A region is three th
     roots → merge root-cluster + annotation lists → write header/area/instruction → patch sizes.
   **Card evidence (all 17 stock `RNW/CCP/*/NAV_ROOT.DAT`, 2026-09):** root-cluster records'
   packed idents reproduce the FINAL region table **exactly** (a third independent confirmation),
-  and every region has 1–7 gateway clusters (`rootCnt`: DEU 4 @NAV00001 clusters 1/42/90/136,
-  POL 1 @NAV00001 cluster 1 (0x4402→off 0x4000, len 0xe660), SCA 7, EEU/ISV/FRM 5–6 …).
+   and every region has 1–7 gateway clusters (`rootCnt`: DEU 4 @NAV00001 clusters 1/42/90/136,
+   POL 1 @NAV00001 cluster 1 (0x4402→off 0x4000, cluster id 0xe660), SCA 7, EEU/ISV/FRM 5–6 …;
+   one EEU record's target header does not match — suspected compressed cluster, non-blocking).
+   **Generated-region workflow: `diag/merge_nav_root.py`** — appends our clusters as root records
+   (refs/outline read from the generated NAV header), shifts the annotation chain and the records'
+   shapeOffsets, patches both sizes; the global-area/instruction records after the header record are
+   byte-identical across stock regions and are copied through untouched. `diag/rnwcheck.py`
+   re-parses `NAV_ROOT.DAT` (desc → record/shape chain → annots) and hard-fails under `--generated`.
 - **TCI** is a set of *tiles*; each tile carries `#primcl` (primary-cluster count), `#cl`
   (cluster count) and a list of **8-byte cluster entries**:
   ```
