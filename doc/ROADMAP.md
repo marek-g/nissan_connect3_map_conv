@@ -104,20 +104,26 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   file-offset/fileId/origin into its ci2 records once all cluster offsets are fixed). This makes output
   byte-faithful to stock on the cross-cluster link path; validate with `rnw2osm … overlaps=N>0`.
 - **2b — the cluster locator (`.tci`).** Mechanism **resolved** by Ghidra and **implemented** in `osm2rnw
-  --tci`. The runtime finds a position's cluster through a per-tile `.tci` under `data/data/map/` (a `.tci` =
-  4-level tile index → `{u32 fileOffset, u16 fileId, u16 length}` → `NAV%05u.DAT`), **not** `NAV_ROOT.DAT`
-  (region metadata). Key facts: `fileId` is the literal `%05u` filename (`vFileId2Name`); the ref `fileOffset`
-  packs the region ident in bits 0–13 (`u16GetRegionIdent`) and the 16 KB-aligned cluster offset in bits 14+;
-  the reader reads `nPrim` refs (write `nPrim==nAll`); routing queries the finest level only, so each cluster
-  is registered in every finest-level tile its bbox overlaps. `osm2map` no longer emits `.tci`; `osm2rnw`
-  reads the tile grid from step-1 `<REGION>AA.IDX` (`--map-idx`). The `regionIdent` is now **derived from
-  `--region`** via a baked 17-row table (`REGION_IDENT` / `doc/region_ident.tsv` / `--list-region-ids`),
-  extracted from the data (regionIdent frequency in each region's own `NAV_ROOT.DAT`, cross-checked against
-  its stock `.TCI`); Poland's road region is `POL` (`0x402`, shard `N6E2102.TCI`; `EEU`/`0x42a` is the
-  separate HU/UA/BY aggregate on the same grid — not Poland). Offline-validated (krzeszowice:
-  52 clusters, `nPrim==nAll`, refs in-bounds, derived ident `0x402`). **Remaining:** on-device boot validation;
-  verify the table's low-confidence rows (BNL/MLC) against an untested region. Patches: cluster flags byte bit
-  0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and drop stale `data/connect/rnw/**/*.PTH`.
+  --tci`. TCI reaches the reader through two carriers: per-tile `.tci` shards under `data/data/map/`
+  (4-level tile index → `{u32 fileOffset, u16 length, u16 fileId}` → `NAV%05u.DAT`; ref word order
+  re-confirmed 2026-09 from `u16LoadClusterIdListAndStoreInQ` disasm @0x8deb20 — `osm2rnw` had it swapped
+  and is fixed) and the per-region `NAV_ROOT.DAT` (which also embeds a TCI). The runtime registers shards
+  by directory scan of `data/data/map/*.tci`, taking tile ids from the FILENAMES (`u16InitTciFileList`
+  @0x8de860 → `u16InitTciIdList` @0x8de624). Key facts: `fileId` is the literal `%05u` filename
+  (`vFileId2Name`); the ref `fileOffset` packs the region ident in bits 0–13 (`u16GetRegionIdent`) and the
+  16 KB-aligned cluster offset in bits 14+; the reader reads `nPrim` refs (write `nPrim==nAll`); routing
+  queries the finest level only, so each cluster is registered in every finest-level tile its bbox
+  overlaps. `osm2map` no longer emits `.tci`; `osm2rnw` reads the tile grid from step-1 `<REGION>AA.IDX`
+  (`--map-idx`). The `regionIdent` table was **rebuilt 2026-09** (`REGION_IDENT` / `doc/region_ident.tsv`
+  / `--list-region-ids`) by joining every shard ref to the region NAV inventories: DEU `0x401`, IBE
+  `0x409`, FRM `0x40a`, ISV `0x40b`, SCA `0x40d`, EEU `0x42a` confirmed (100 % single-owner); the old
+  NAV_ROOT-histogram rows were wrong (FRM, MLC) and only the confirmed set remains baked. **POL blocker:**
+  Kraków's stock shard `N6E2102.TCI` is an empty stub (ref pool zero-filled) and no shard references POL's
+  clusters, yet stock routing works in Kraków — Poland evidently loads clusters via the `NAV_ROOT.DAT` /
+  `NAV00001.DAT` per-region container. **Remaining:** on-device open-capture (strace DAPIAPP/PROCNAV during
+  a Kraków route) to pin the real per-region load path before any `.tci`-based card trial; verify `POL`
+  `0x402` then; Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and
+  drop stale `data/connect/rnw/**/*.PTH`.
 
 ### Phase 3: MAP / IDX writer
 

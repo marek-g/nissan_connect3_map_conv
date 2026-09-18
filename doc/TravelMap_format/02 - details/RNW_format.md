@@ -480,8 +480,9 @@ Caveats:
 
 ## 10. Dead ends (for the record)
 
-- `N6E210I.TCI` cluster-list sections are zero-filled on disk — TCI is not a
-  usable RNW↔MAP join path.
+- `N6E2102.TCI` (Kraków's MAP shard) cluster-ref pool is zero-filled on disk (98108 of
+  98352 slots are `{0,0,0}`; the few nonzero lvl3 entries are junk with `length` 1–4) —
+  this shard is an empty stub, so TCI is not a usable RNW↔MAP join path for Poland.
 - The "UN" magic seen in NAV file headers is just fileId 20053 as u16 LE.
 - MAP annotation layout ({u8 size,u8 type}) differs from RNW annotations
   ({u16 size,u16 type}) — mixing them up silently yields zero names.
@@ -504,8 +505,19 @@ byte-exact write layout is inferred from the reader + data. A region is three th
   +0x04  u16  length         cluster size in bytes
   +0x06  u16  fileId         which NAVnnnnn.DAT (== filename number)
   ```
-  (`dap_map_tclTCIClusterId::bRead` @0x008e01ec.) Loaded by
-  `u16LoadClusterIdListAndStoreInQ` @0x008de974 / `u16LoadClusterIndexTile` @0x008df4a0.
+  (`dap_map_tclTCIClusterId::bRead` @0x008e01ec; field order re-confirmed from
+  `u16LoadClusterIdListAndStoreInQ` disasm @0x8deb20: struct+4 → `vSetClusterLength`,
+  struct+6 → `vSetClusterFileId` — the cluster-ref word order is `off,len,fid`, **not**
+  `off,fid,len`; `osm2rnw` had this swapped and was fixed 2026-09.)
+  The `fileOffset` word is packed: `(aligned offset & ~0x3FFF) | regionIdent` where
+  `regionIdent = (profile<<10)|codeId` (14 bit); `u32GetClusterFileOffset` @0x886450 masks
+  `& 0xFFFFC000`, `u16GetRegionIdent` @0x886460 takes `& 0x3FFF`, and
+  `bSetClusterFileOffset` @0xb583d0 requires the packed value `< 2^28`.
+  Region idents are NOT guessable — see [`doc/region_ident.tsv`](../../region_ident.tsv)
+  (rebuilt 2026-09 by joining every shard ref to the NAV inventories: DEU 0x401, IBE 0x409,
+  FRM 0x40a, ISV 0x40b, SCA 0x40d, EEU 0x42a, each 100 % single-owner; the old
+  NAV_ROOT-histogram table had FRM/MLC wrong and was retired).
+  Loaded by `u16LoadClusterIdListAndStoreInQ` @0x008de974 / `u16LoadClusterIndexTile` @0x008df4a0.
 - **Cluster load path:** `u16ReadCluster` @0x0088670c → `u16LoadCluster` @0x0090add4
   (fileId→filename via `vFileId2Name`, then read `{offset,length}` bytes) →
    `rnw_tclClusterInternal::bRead(..., flags=0x3060313, ...)` → `u16PatchCluster` (post-load:
@@ -518,6 +530,24 @@ byte-exact write layout is inferred from the reader + data. A region is three th
   `NAV00001.DAT`: first cluster at 0x4000; block 0 holds the source filename
   `databases//00001.wrk`, copyright, build date, project name and a shell-env dump
   `REGION_CODE=POL PROFILE_CODE=CCP`). Analogous to the MAP info-string region — display only.
+
+### Who feeds the TCI at runtime (card reality, 2026-09)
+
+- TCI reaches the reader through **two carriers**: the per-region `NAV_ROOT.DAT` (section
+  inside `RNW/CCP/<REGION>/`) and **per-MAP-shard `<TILEID>.TCI` files stored next to the
+  `.MAP` shards in `DATA/DATA/MAP/`** (on-card both are CPRNAV_2-compressed; the TCI
+  container header starts `{u16 0, u16 92, u32 size, u16 partTableOff, u16 partCount}`).
+- Runtime registers the shards by **directory scan of `data/data/map/*.tci`**; the tile ids
+  come from the FILENAMES (`dap_map_tclTCICache::u16InitTciFileList` @0x8de860 →
+  `u16InitTciIdList` @0x8de624 → `dap_map_tclTileFileId::vSet(filename)`), and
+  `bIsTciFileAvail` @0x8de1fc answers availability per tileFileId from that list. A
+  swapped-in shard must therefore keep the stock tile-id filename.
+- **Open question (blocks the RNW card trial):** for POL the shard carrier is dead —
+  `N6E2102.TCI` is an empty stub and none of the 76 shards reference POL's cluster files
+  (full ref-join vote), yet routing works on the stock card in Kraków. So the runtime
+  locates Polish clusters through `NAV_ROOT.DAT`/`NAV00001.DAT` (or something else), and
+  the exact per-region load path must be pinned by an **on-device open-capture** (strace on
+  DAPIAPP/PROCNAV while computing a Kraków route) before a `.TCI`-based swap can be trusted.
 
 ### Cluster format — fully known (writable)
 

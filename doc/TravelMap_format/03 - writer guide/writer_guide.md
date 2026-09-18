@@ -337,7 +337,8 @@ for each map level L=0..3:
 section = tileId/125;  TCITile entry @ partition.offsetList[L] + tileId*8   # 125 tiles / 1000-B section
   TCITile = { u16 nPrimClusters, u16 nAllClusters, u32 clusterListFileOffset }
 clusterRefs @ clusterListFileOffset = nAllClusters × TCIClusterId
-  TCIClusterId = { u32 fileOffset, u16 fileId, u16 length }     # into data/rnw/<PROF>/<REGION>/NAV%05u.DAT
+  TCIClusterId = { u32 fileOffset, u16 length, u16 fileId }     # into data/rnw/<PROF>/<REGION>/NAV%05u.DAT
+                                                                  # (len@+4, fid@+6 — disasm @0x8deb20)
 load `length` bytes at `fileOffset` in NAV%05u(fileId).DAT  →  that cluster
 ```
 IMPORTANT packing detail (found in `rnw_tclIDBase`): `TCIClusterId.fileOffset` is *packed*. The cluster's
