@@ -132,6 +132,11 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   appended global-area/instruction records); on-device `routeprobe` capture still confirms the load order;
   Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and
   drop stale `data/connect/rnw/**/*.PTH`.
+- **2c — routing engine hunt (2026-09-18, `doc/TravelMap_format/routing_algorithm.md`).** Search core is a
+  lazy-launched process **`PROCNAV.OUT`**, shipped by the data card (`DNL/BIN/NAV/COMMON`, ULI-packed,
+  unpacker = `procsds.out`); `procmapengine`/`DAPIAPP` provably contain no search code. DAPIAPP-side data
+  pipeline (region registry from NAV_ROOT, root-cluster gateways, TCI dir-scan, cluster load, ci/overlap
+  connectivity) fully decoded and documented with addresses. Next: unpack PROCNAV, document the search.
 
 ### Phase 3: MAP / IDX writer
 
