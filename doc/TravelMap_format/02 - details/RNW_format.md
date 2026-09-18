@@ -11,7 +11,7 @@ zero-dependency Rust; build with `cargo build --release`.
 ## 1. File organization
 
 ```
-CRYPTNAV/DATA/DATA/RNW/CCP/<REGION>/NAV_ROOT.DAT     (root TCI index + metadata — the entry point)
+CRYPTNAV/DATA/DATA/RNW/CCP/<REGION>/NAV_ROOT.DAT     (root-cluster list + metadata — the entry point)
 CRYPTNAV/DATA/DATA/RNW/CCP/<REGION>/NAVnnnnn.DAT     (341 files for POL; cluster data)
 CRYPTNAV/DATA/DATA/RNW/CCP/<REGION>/AEX/AEXnnnnn.DAT (per-cluster auxiliary data, optional —
     loaded only when config flag bRNWLoadAexData is set; same fileId numbering as NAV)
@@ -77,9 +77,10 @@ at a cluster-relative offset (not inline), which is why `bRead` does a skip→re
 seek-back double pass:
 
 ```
-+0x00  u32  clusterFileOffset   offset of the neighbour cluster within its NAV file
++0x00  u32  clusterFileOffset   packed: (neighbour offset & ~0x3FFF) | regionIdent (§11)
 +0x04  u16  size                neighbour cluster size (bytes)
 +0x06  u16  fileId              neighbour's NAV file id == the number in NAV<fileId>.DAT
+                               (same {off,len,fid} word layout as the TCI clusterRef)
 +0x08  s32  refLon              outline reference position (PAU)
 +0x0c  s32  refLat
 +0x10  s8   shift               outline delta scale
@@ -495,9 +496,40 @@ byte-exact write layout is inferred from the reader + data. A region is three th
 
 ### Container / how clusters are located (decoded this pass)
 
-- **`NAV_ROOT.DAT`** = root of the cluster tree. Layout: a ~0x20-byte numeric header, then a
-  string table (the 8 compass-sector names in EN/DE/FR — `EAST`, `NORTH-EAST`, …, version
-  `2021.1`, and a country list), then the **TCI** (Tile Cluster Index).
+- **`NAV_ROOT.DAT`** = per-region ROOT index + metadata (**FULLY DECODED 2026-09-18** from the
+  device's own *writer*, `rnw_tclNavRootKnitter` — `bCreateHeader` @0x008812ec, `u16Knit`
+  @0x008848f8 — and its readers). Layout:
+  - header record, `u32@0x00` = header-record size (0x2000-ish on card, 0x34 in the factory
+    template): `{u32 hdrSize, u32 totalFileSize, u16 authorStrOff, u16 tableOff}` (the two u16s
+    at @8/@a are patched by `u16UpdateHeaderRecord` @0x00881b98; `u32@4` = whole-file size —
+    CHECKED DEU/POL: `u32@4 == filesize`);
+  - at `0x0c` a `rnw_tclListDesc<nav_tclClusterInfo>` **root-cluster list descriptor**
+    `{u16 payloadOff, u16 count}` (`bRead` @0x0089030c; read via `u16InterpreteHeader`
+    @0x00891e4c after skipping 12 bytes), then a second descriptor for the
+    **annotation list** `{u16 payloadOff, u16 count}`;
+  - at `authorStrOff` the build-string region (`/mill/...databases//00001.wrk/bin/nav_root.dat`,
+    `Copyright …`, version, compass-sector/country strings — the "NAV00001 = 00001.wrk" origin),
+    at `tableOff` a u16/u32 registry table ending 0x11 bytes before the root-cluster payload;
+  - at root-list `payloadOff`: `count` × the **same 24-byte `nav_tclClusterInfo` records** as the
+    ci-adjacency lists (`nav_tclClusterInfo::bRead` @0x008910cc; stream stride 24, in-memory
+    stride 0x34) — the region's **root (gateway) clusters**, addressed exactly like a TCI ref
+    (`fileOffset` packs the regionIdent, `fileId` = `NAV%05u`);
+  - at annot-list `payloadOff`: TLV annotations `{u16 totalLen, u16 type}` iterated by
+    `u16InterpreteAnnotations` @0x00891c4c: `0x2b` global-instruction `+{u32,u32}`
+    (`bInterpreteGlobalInstructionAnnot` @0x00891b98), `0x2c` global-areas =
+    `rnw_tclAreaCtrl::bReadPSF`, `0x3e` prefix table (`u16InterpretePrefixTable`), unknown types
+    are skipped — card POL also carries types 0x3/0x11/0x16/0x39/0x41/0x4d/0x4e/0x55/0x56/0x60/
+    0x7c/0x89/0x8a [UNVERIFIED semantics];
+  - after the header record the knitter appends the **global-area** and **global-instruction**
+    records (`u16WriteGlobalAreaRecord` @0x00881420, `u16WriteGlobalInstructionRecord`
+    @0x008813c8); runtime loads the area record via
+    `dap_tclDataAccess::u16LoadDataBlockConnectGlobal(…,0x22,1,"NAV_ROOT.DAT",off,size)`
+    (`rnw_tclBaseWorker::u16ReadGlobalAreaRecord` @0x00909d94). Knit flow: read both regions'
+    roots → merge root-cluster + annotation lists → write header/area/instruction → patch sizes.
+  **Card evidence (all 17 stock `RNW/CCP/*/NAV_ROOT.DAT`, 2026-09):** root-cluster records'
+  packed idents reproduce the FINAL region table **exactly** (a third independent confirmation),
+  and every region has 1–7 gateway clusters (`rootCnt`: DEU 4 @NAV00001 clusters 1/42/90/136,
+  POL 1 @NAV00001 cluster 1 (0x4402→off 0x4000, len 0xe660), SCA 7, EEU/ISV/FRM 5–6 …).
 - **TCI** is a set of *tiles*; each tile carries `#primcl` (primary-cluster count), `#cl`
   (cluster count) and a list of **8-byte cluster entries**:
   ```
@@ -514,9 +546,12 @@ byte-exact write layout is inferred from the reader + data. A region is three th
   `& 0xFFFFC000`, `u16GetRegionIdent` @0x886460 takes `& 0x3FFF`, and
   `bSetClusterFileOffset` @0xb583d0 requires the packed value `< 2^28`.
   Region idents are NOT guessable — see [`doc/region_ident.tsv`](../../region_ident.tsv)
-  (rebuilt 2026-09 by joining every shard ref to the NAV inventories: DEU 0x401, IBE 0x409,
-  FRM 0x40a, ISV 0x40b, SCA 0x40d, EEU 0x42a, each 100 % single-owner; the old
-  NAV_ROOT-histogram table had FRM/MLC wrong and was retired).
+  (FINALIZED 2026-09 with two independent methods that agree on their overlap: the shard
+  ref→NAV-inventory join gives DEU 0x401, IBE 0x409, FRM 0x40a, ISV 0x40b, SCA 0x40d,
+  EEU 0x42a; the ci-adjacency scan below reproduces all six and yields the other 11:
+  POL 0x402 GRC 0x403 TUR 0x404 BNL 0x407 ACL 0x408 GBI 0x40c CHS 0x40e ELL 0x411 INT
+  0x412 EAD 0x416 MLC 0x483. The retired NAV_ROOT-histogram table was wrong for FRM/GRC/
+  TUR/BNL/MLC).
   Loaded by `u16LoadClusterIdListAndStoreInQ` @0x008de974 / `u16LoadClusterIndexTile` @0x008df4a0.
 - **Cluster load path:** `u16ReadCluster` @0x0088670c → `u16LoadCluster` @0x0090add4
   (fileId→filename via `vFileId2Name`, then read `{offset,length}` bytes) →
@@ -542,12 +577,17 @@ byte-exact write layout is inferred from the reader + data. A region is three th
   `u16InitTciIdList` @0x8de624 → `dap_map_tclTileFileId::vSet(filename)`), and
   `bIsTciFileAvail` @0x8de1fc answers availability per tileFileId from that list. A
   swapped-in shard must therefore keep the stock tile-id filename.
-- **Open question (blocks the RNW card trial):** for POL the shard carrier is dead —
+- **POL load path (root-cluster hypothesis, 2026-09-18):** for POL the shard carrier is dead —
   `N6E2102.TCI` is an empty stub and none of the 76 shards reference POL's cluster files
-  (full ref-join vote), yet routing works on the stock card in Kraków. So the runtime
-  locates Polish clusters through `NAV_ROOT.DAT`/`NAV00001.DAT` (or something else), and
-  the exact per-region load path must be pinned by an **on-device open-capture** (strace on
-  DAPIAPP/PROCNAV while computing a Kraków route) before a `.TCI`-based swap can be trusted.
+  (full ref-join vote), yet routing works on the stock card in Kraków. With NAV_ROOT decoded, the
+  answer is almost certainly the **root-cluster list**: POL's `NAV_ROOT.DAT` registers one gateway
+  cluster in `NAV00001` (`0x4402` = off 0x4000, len 0xe660, regionIdent 0x402) and routing reaches
+  every POL cluster from it through the ci1/ci2 adjacency walk — no TCI tile lookups needed once a
+  root cluster is loaded (`u32GetNumberOfAllRootCluster` @0x008f8058 /
+  `vSetNumberOfRootCluster` @0x008ff380 manage them at region-load). Writer consequence: a region
+  we ship **must carry its own `NAV_ROOT.DAT`** (root-cluster list + annotations), not just
+  `NAV*.DAT`. The on-device capture (`diag/routeprobe_logger.sh`) stays on the plan to confirm the
+  sequence, but the RNW trial can now be built against a generated `NAV_ROOT.DAT`.
 
 ### Cluster format — fully known (writable)
 
@@ -628,8 +668,11 @@ when set.
 ### Minimal viable RNW dataset (loadable for geometry/routing)
 
 One `NAVnnnnn.DAT` containing a **single cluster** with all nodes (zerocells), roads (onecells),
-and the position list for the area, plus a minimal `NAV_ROOT.DAT` whose TCI has one tile with one
-8-byte entry `{offset, length, fileId}` pointing at that cluster. Leave the cluster's ci1/ci2
+and the position list for the area, plus a minimal `NAV_ROOT.DAT` (layout above) whose
+root-cluster list holds ONE 24-byte `nav_tclClusterInfo` record pointing at that cluster
+(`{offset|regionIdent, length, fileId}` — same packed addressing as a TCI ref) and an empty
+annotation list; a `.TCI` shard is only needed for map-tile→cluster lookups (address/routing entry
+points), the root-cluster path alone gets the cluster loaded. Leave the cluster's ci1/ci2
 lists empty (no neighbours) **and** ship no `CONNECT` patch for the region, so neither the
 cross-cluster fixup nor the `.PTH` patch step in `u16PatchCluster` is triggered; also omit AEX. This is
 enough for the reader to load and route within the region; it will not reproduce the original

@@ -92,6 +92,7 @@ fn main() {
     let mut no_genattr = false;
     let mut no_pa = false;
     let mut no_crossings = false;
+    let mut no_addr_list = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -115,6 +116,7 @@ fn main() {
             "--no-genattr" => no_genattr = true,
             "--no-pa" => no_pa = true,
             "--no-crossings" => no_crossings = true,
+            "--no-addr-list" => no_addr_list = true,
             "-h" | "--help" => {
                 usage();
                 exit(0);
@@ -263,10 +265,22 @@ fn main() {
             region_id,
         )
     };
+    let n129 = if no_addr_list {
+        0
+    } else {
+        write_addr_list(
+            &outdir.join("LID20000.DAT"),
+            &st_entries,
+            &city_of,
+            &streets,
+            &addr_hits,
+            region_id,
+        )
+    };
 
     eprintln!(
-        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), PA_20006.DAT ({} access points), LID30006.DAT ({} crossing rows), REGION_ID=0x{:03x} ({})",
-        out, npoi, ncity, ncit, nst, nrel, naddr, npa, ncross, region_id, region.to_uppercase()
+        "wrote {}/GLOB_POI.DAT ({}), DB_CITY.DAT ({}), LID20001.DAT ({} cities), LID20000.DAT ({} addr rows), LID20006.DAT ({} streets), REL00001.DAT ({} street→city pairs), LID40006.DAT ({} house numbers), PA_20006.DAT ({} access points), LID30006.DAT ({} crossing rows), REGION_ID=0x{:03x} ({})",
+        out, npoi, ncity, ncit, n129, nst, nrel, naddr, npa, ncross, region_id, region.to_uppercase()
     );
     eprintln!("NOTE: ship the stock META0000.DAT unchanged — its relation table entry #1 is (2↔3), which is what REL00001.DAT carries.");
     eprintln!(
@@ -283,7 +297,8 @@ fn usage() {
         \t--no-poi       skip amenity/shop/tourism POIs (cities only)\n\
         \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file\n\
         \t--no-pa        skip the PA_20006.DAT point-access-point file\n\
-        \t--no-crossings skip the LID30006.DAT crossing (fileID+10000) file"
+        \t--no-crossings skip the LID30006.DAT crossing (fileID+10000) file\
+        \t--no-addr-list skip the LID20000.DAT listID-129 address gazetteer"
     );
 }
 
@@ -1137,6 +1152,9 @@ struct AddrHit {
     label: String,
     coord: (i64, i64),
     hn: HN,
+    /// Raw `addr:housenumber` text as authored (kept for the listID-129 gazetteer row
+    /// `"CITY, STREET NUMBER"`; `hn` is its GenAttr numeric projection).
+    raw: String,
     /// Segment chosen among the target street's onecells; None => target has no own onecells
     /// (registered-but-unroutable street, or village pseudo-street) -> synthetic table row.
     seg: Option<usize>,
@@ -1192,6 +1210,68 @@ fn compose_records(src: &[HN]) -> Vec<HN> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Emit the stock `LID20000.DAT` — the listID-129 address gazetteer (LID_format §11.2, stock POL
+/// oracle: 194 118 rows, globally sorted, all names unique, no positions, blocks ~11.5k). Row
+/// grammar: a plain `CITY` row per city that has any row, a `CITY, STREET` row per (city, street)
+/// element pair (stock keeps these for streets whose addresses are numberless AND for the DEBINY
+/// pseudo-settlements), and a `CITY, STREET NUMBER` row per resolved house number. The street
+/// component is byte-identical to the LID20006 element name: the device re-derives a city's
+/// street-index set from these very names (`LISA_tclHnrProcessing::bSetUpStreetIndcesByHnr` +
+/// the `NLGenAttrHnrStreetIdxDetermination` descriptor), so any renormalisation here would break
+/// that join. Encoder stores city-less entries in the stock "no coordinates" flavor (§12.5).
+fn write_addr_list(
+    path: &Path,
+    entries: &[lid_format::NameEntry],
+    city_of: &[Option<String>],
+    streets: &SidMap,
+    hits: &[AddrHit],
+    region: u16,
+) -> usize {
+    use std::collections::BTreeSet;
+    let mut sid_to_ei: HashMap<u32, usize> = HashMap::new();
+    for (ei, &sid) in streets.sid_of_entry.iter().enumerate() {
+        sid_to_ei.entry(sid).or_insert(ei);
+    }
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut cities: BTreeSet<&String> = BTreeSet::new();
+    for (e, city) in entries.iter().zip(city_of) {
+        let Some(city) = city else { continue };
+        cities.insert(city);
+        names.insert(format!("{city}, {}", e.label));
+    }
+    for hit in hits {
+        let Some(sid) = streets.pick(&hit.label, hit.coord) else {
+            continue;
+        };
+        let Some(&ei) = sid_to_ei.get(&sid) else {
+            continue;
+        };
+        let Some(Some(city)) = city_of.get(ei) else {
+            continue;
+        };
+        names.insert(format!("{city}, {} {}", hit.label, hit.raw));
+    }
+    names.extend(cities.into_iter().cloned());
+    if names.is_empty() {
+        return 0; // stock has no empty list file; skip it entirely
+    }
+    let list: Vec<lid_format::NameEntry> = names
+        .iter()
+        .map(|n| lid_format::NameEntry {
+            label: n.clone(),
+            x_pau: -1,
+            y_pau: -1,
+            city: None,
+        })
+        .collect();
+    let bytes = lid_format::encode_id(region, 129, &list);
+    if fs::write(path, &bytes).is_err() {
+        eprintln!("write {path:?} failed");
+        return 0;
+    }
+    list.len()
 }
 
 /// Resolve every valid address to a street LABEL + (optionally) a segment, replicating what the
@@ -1271,6 +1351,7 @@ fn resolve_addresses(
                 label,
                 coord: *c,
                 hn: parsed,
+                raw: num.trim().to_string(),
                 seg: None,
             });
             continue;
@@ -1283,6 +1364,7 @@ fn resolve_addresses(
                 label,
                 coord: *c,
                 hn: parsed,
+                raw: num.trim().to_string(),
                 seg,
             });
             continue;
@@ -1327,6 +1409,7 @@ fn resolve_addresses(
                 label: nm.clone(),
                 coord: *c,
                 hn: parsed,
+                raw: num.trim().to_string(),
                 seg: *seg,
             }),
             None => {
@@ -1335,6 +1418,7 @@ fn resolve_addresses(
                     label,
                     coord: *c,
                     hn: parsed,
+                    raw: num.trim().to_string(),
                     seg: None,
                 });
             }

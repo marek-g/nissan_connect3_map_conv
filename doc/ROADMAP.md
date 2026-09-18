@@ -114,15 +114,23 @@ copy. Round-trip through `rnw2osm` is faithful — geometry, connectivity, stree
   16 KB-aligned cluster offset in bits 14+; the reader reads `nPrim` refs (write `nPrim==nAll`); routing
   queries the finest level only, so each cluster is registered in every finest-level tile its bbox
   overlaps. `osm2map` no longer emits `.tci`; `osm2rnw` reads the tile grid from step-1 `<REGION>AA.IDX`
-  (`--map-idx`). The `regionIdent` table was **rebuilt 2026-09** (`REGION_IDENT` / `doc/region_ident.tsv`
-  / `--list-region-ids`) by joining every shard ref to the region NAV inventories: DEU `0x401`, IBE
-  `0x409`, FRM `0x40a`, ISV `0x40b`, SCA `0x40d`, EEU `0x42a` confirmed (100 % single-owner); the old
-  NAV_ROOT-histogram rows were wrong (FRM, MLC) and only the confirmed set remains baked. **POL blocker:**
+  (`--map-idx`). The `regionIdent` table is **FINAL 2026-09**, all 17 regions (`REGION_IDENT` /
+  `doc/region_ident.tsv`) from two mutually-confirming methods: shard ref→NAV join (DEU 0x401 IBE 0x409
+  FRM 0x40a ISV 0x40b SCA 0x40d EEU 0x42a) and the ci-adjacency scan reproducing all six + the other 11
+  (POL 0x402 GRC 0x403 TUR 0x404 BNL 0x407 ACL 0x408 GBI 0x40c CHS 0x40e ELL 0x411 INT 0x412 EAD 0x416
+  MLC 0x483); the old NAV_ROOT-histogram values (FRM 0x403, GRC 0x406, TUR 0x407, BNL 0x404, MLC 0x40a)
+  were wrong. **Two osm2rnw packing bugs fixed:** .tci ref word order (`off,len,fid`) and the ci2
+  neighbour `fileOffset` now packs regionIdent like stock (caught by `rnwcheck --generated` ci scan).
+  Default shard name fixed: `--tci-prof 0x02` → `N6E2102.TCI` matching the osm2map land shard, because
+  the runtime parses tile ids from the FILENAME at dir-scan. **POL blocker RESOLVED (hypothesis) 2026-09-18:**
   Kraków's stock shard `N6E2102.TCI` is an empty stub (ref pool zero-filled) and no shard references POL's
-  clusters, yet stock routing works in Kraków — Poland evidently loads clusters via the `NAV_ROOT.DAT` /
-  `NAV00001.DAT` per-region container. **Remaining:** on-device open-capture (strace DAPIAPP/PROCNAV during
-  a Kraków route) to pin the real per-region load path before any `.tci`-based card trial; verify `POL`
-  `0x402` then; Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and
+  clusters, yet stock routing works in Kraków — the per-region `NAV_ROOT.DAT` is now DECODED (device writer
+  `rnw_tclNavRootKnitter` recovered): it carries a **root-cluster list** of 24-byte `nav_tclClusterInfo`
+  gateway records (POL: 1 cluster in `NAV00001` @0x4000 len 0xe660) from which ci-adjacency reaches every
+  cluster — no TCI needed (all 17 stock roots' packed idents re-confirm the final region table).
+  **Remaining:** `osm2rnw` must emit a minimal `NAV_ROOT.DAT` (root-cluster ListDesc + empty annots + the
+  appended global-area/instruction records); on-device `routeprobe` capture still confirms the load order;
+  Patches: cluster flags byte bit 0x80 triggers a `NAV____n.PTH` memcpy — keep it clear and
   drop stale `data/connect/rnw/**/*.PTH`.
 
 ### Phase 3: MAP / IDX writer

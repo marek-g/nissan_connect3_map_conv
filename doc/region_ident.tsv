@@ -2,31 +2,48 @@
 # regionIdent = (profile<<10)|codeId ; all shipped RNW regions use profile 1 (folder CCP).
 # Baked into osm2rnw (src/osm2rnw/src/main.rs REGION_IDENT).
 #
-# REBUILT 2026-09 with a trustworthy method. Every .tci clusterRef is
-#   {u32 fileOffset = (aligned cluster offset & ~0x3FFF) | regionIdent,
-#    u16 length, u16 fileId}                       <- field order CONFIRMED from DAPIAPP.OUT
-# (u16LoadClusterIdListAndStoreInQ disasm @0x8deb20: struct+4 -> vSetClusterLength,
-#  struct+6 -> vSetClusterFileId; older docs had these swapped, osm2rnw fixed accordingly).
-# Decoding all 76 EUR-card shards and requiring fileId+inbounds to resolve to exactly ONE
-# region's NAV%05u.DAT inventory gives an unambiguous ident -> owner-region vote:
-#   0x401->DEU 94546/94546 · 0x409->IBE 72062 · 0x40a->FRM 3098 · 0x40b->ISV 9215 ·
-#   0x40d->SCA 128129 · 0x42a->EEU 115744   (100 % agreement, single-owner refs only)
+# FINALIZED 2026-09 via two independent, mutually-confirming empirical methods over the
+# EUR card (Map_unpacked):
 #
-# WARNING about the previous table: it was derived from NAV_ROOT.DAT low-14-bit histograms
-# and is demonstrably WRONG in at least two rows (FRM listed 0x403, MLC listed 0x40a; 0x40a
-# empirically owns FRM files). Rows without ref-join evidence (BNL GRC TUR ACL MLC GBI CHS
-# ELL INT EAD) were REMOVED — a guessed ident silently emits another region's clusters.
-# Target those regions with an explicit --region-ident once proven (on-device open-capture).
+# (1) shard .tci join. Every clusterRef is
+#       {u32 fileOffset = (cluster offset & ~0x3FFF) | regionIdent, u16 length, u16 fileId}
+#   (order CONFIRMED from DAPIAPP.OUT u16LoadClusterIdListAndStoreInQ disasm @0x8deb20;
+#    older docs had len/fid swapped). fileId -> per-region NAV%05u.DAT inventory; require
+#    in-bounds; count single-owner refs. The .tci master on this card only references six
+#    regions, each with 100% agreement:
+#      0x401->DEU 94546 | 0x409->IBE 72062 | 0x40a->FRM 3098 | 0x40b->ISV 9215 |
+#      0x40d->SCA 128129 | 0x42a->EEU 115744
 #
-# POL caveat: NO .tci shard on this card references POL's clusters (all 76 shards checked),
-# and Krakow's own shard N6E2102.TCI references cluster files that are absent from the card.
-# The runtime evidently locates Poland's road clusters another way (NAV_ROOT.DAT /
-# NAV00001.DAT per-region container). 0x402 for POL is a legacy value, never confirmed.
-region	regionIdent	codeId	profile	confidence
-DEU	0x0401	1	1	confirmed(ref-join 94546)
-POL	0x0402	2	1	unverified(no .tci refs on card; card loads POL via NAV_ROOT/NAV00001)
-IBE	0x0409	9	1	confirmed(ref-join 72062)
-FRM	0x040a	10	1	confirmed(ref-join 3098; old 0x403 was wrong)
-ISV	0x040b	11	1	confirmed(ref-join 9215)
-SCA	0x040d	13	1	confirmed(ref-join 128129)
-EEU	0x042a	42	1	confirmed(ref-join 115744)
+# (2) cluster-adjacency (ci) scan. nav_tclClusterInfo (RNW_format.md §3a, 24-byte ci1/ci2
+#   records, bRead @0x008910cc) packs the SAME ident-bearing fileOffset word. Parse every
+#   region folder's NAV clusters, take the dominant low-14-bit value of the ci records:
+#   reproduces ALL SIX values of (1) exactly and yields the remaining 11 regions.
+#   Secondary (minority) idents inside a folder are genuine border-neighbour refs
+#   (e.g. EEU clusters reference a few DEU clusters).
+#
+# This CORRECTS the retired NAV_ROOT-histogram table: it had FRM 0x403 (really GRC),
+# GRC 0x406 (used nowhere), TUR 0x407 (really BNL), BNL 0x404 (really TUR), MLC 0x40a
+# (really FRM). POL 0x402 is now CONFIRMED (ci-scan 12975 refs) - the legacy value was right.
+#
+# Semantics: the packed codeId matters for cross-region lookups (.tci pools, ci adjacency);
+# per-region NAV_ROOT.DAT refs usually leave codeId zero (region implicit). POL caveat
+# stands: no .tci shard references POL (N6E2102.TCI is an empty stub) - on-device capture
+# (diag/routeprobe_logger.sh) decides whether a .tci swap can ever drive Polish routing.
+region	regionIdent	codeId	profile	method
+DEU	0x0401	1	1	tci-join 94546 + ci-scan 10788
+POL	0x0402	2	1	ci-scan 12975
+GRC	0x0403	3	1	ci-scan 20826
+TUR	0x0404	4	1	ci-scan 18560
+BNL	0x0407	7	1	ci-scan 8517
+ACL	0x0408	8	1	ci-scan 7694
+IBE	0x0409	9	1	tci-join 72062 + ci-scan 15343
+FRM	0x040a	10	1	tci-join 3098 + ci-scan 19653
+ISV	0x040b	11	1	tci-join 9215 + ci-scan 11120
+GBI	0x040c	12	1	ci-scan 13830
+SCA	0x040d	13	1	tci-join 128129 + ci-scan 10595
+CHS	0x040e	14	1	ci-scan 21514
+ELL	0x0411	17	1	ci-scan 20923
+INT	0x0412	18	1	ci-scan 595
+EAD	0x0416	22	1	ci-scan 17138
+EEU	0x042a	42	1	tci-join 115744 + ci-scan 11235
+MLC	0x0483	131	1	ci-scan 7560 (28 small files, clean majority)

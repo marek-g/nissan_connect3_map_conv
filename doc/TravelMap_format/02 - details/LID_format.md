@@ -789,6 +789,20 @@ is the real implementation cost** — build `lid2dump` first and decode stock be
 > on-device matcher semantics (no card to run it), crossing files (+10000), `PA`, `REL`.
 > No `DB_CITY.DAT` on this card, so SQLite cannot substitute for the regional city name-list — it must be
 > written as the **listID-2** file `LID20001.DAT` (stock `LID20000` is the listID-129 HNR domain, §11.2).
+>
+> **LID20000 (listID-129 gazetteer) writer DONE (2026-09-18):** `osm2lid` `write_addr_list` emits
+> `LID20000.DAT` with the stock row grammar (stock POL oracle: 194 118 unique names, globally sorted,
+> 17 blocks, no positions; verified `lid2dump --sqlite` over stock POL): plain `CITY` row per city
+> present, one `CITY, STREET` row per (city, street) element pair (covers the DEBINY-style village rows,
+> 60 778 numberless stock rows), one `CITY, STREET <raw addr:housenumber>` row per resolved address
+> (raw text kept, stock has e.g. `5A`; road-number streets like `KRZESZOWICE, 79` emerge naturally from
+> numeric street labels). The street component is stored **byte-identical** to the `LID20006` element
+> name and the city to the `LID20001` element name, because `bSetUpStreetIndcesByHnr` re-derives the
+> street index by string equality. City-less entries make `lid_format::encode_id` pick the stock
+> "no coordinates" flavor (flags `0x0008_0000`, origin −1/−1, §12.5). Stock's ~11.5k-name blocks
+> become the encoder's ~10k-node trie blocks. Regression: `osm2lid/tests/addr_list.rs` (grammar + join
+> back to `LID20001`/`LID20006` + `11A` raw + no positions). Opt out `--no-addr-list`. **Still pending:**
+> `NLHnrToTree` on-device matcher semantics (no card to run it), crossing files (+10000), `PA`, `REL`.
 
 ### 11.9 Empirical reality on the EUR card — **[CORRECTED, 2026-09; earlier "no sample" claim was WRONG]**
 

@@ -461,7 +461,7 @@ fn main() {
     let outp = outp.unwrap_or_else(|| format!("{}_RNW_out", region));
     fs::create_dir_all(Path::new(&outp).join(&region)).expect("mkdir");
     let nav_path = Path::new(&outp).join(&region).join(format!("NAV{:05}.DAT", file_id));
-    let cluster_loc = write_nav(&blobs, &segs, &gnodes, file_id, &nav_path);
+    let cluster_loc = write_nav(&blobs, &segs, &gnodes, file_id, region_ident, &nav_path);
 
     let (w, s, e, n) = bbox_pau;
     eprintln!("wrote {} ({} clusters, {} segments)", nav_path.display(), blobs.len(), segs.len());
@@ -703,47 +703,54 @@ fn parse_hex_or_dec(s: &str) -> u16 {
 
 // ---------------------------------------------------------------------------
 // RNW routing-region ident table: region code (RNW folder under DATA/DATA/RNW/CCP/)
-// -> the 14-bit regionIdent packed into every .tci clusterRef fileOffset low word.
+// -> the 14-bit regionIdent packed into every .tci clusterRef AND every cluster-adjacency
+// (nav_tclClusterInfo / ci1/ci2) fileOffset word.
 // regionIdent = (profile<<10)|codeId; every shipped region uses profile 1 (CCP), so
 // all values are 0x400|codeId.
-// Table rebuilt 2026-09 by a NEW empirical method: decode every .tci clusterRef as
-// {u32 offPacked, u16 length, u16 fileId}, map fileId onto the NAV%05u.DAT inventory of
-// each region folder, and require (offPacked & ~0x3FFF) + length <= file size. The region
-// folder that actually owns the referenced file is the region the packed ident names.
-// Confirmed by a FULL vote over every .tci clusterRef on the EUR card (unambiguous single-owner
-// fileIds only): DEU 0x401 (94546/94546) · IBE 0x409 (72062) · FRM 0x40a (3098) · ISV 0x40b
-// (9215) · SCA 0x40d (128129) · EEU 0x42a (115744) — all 100% agreement.
-// The PREVIOUS method (per-region NAV_ROOT low-14-bit histograms) was WRONG for several
-// rows: it had FRM=0x403 and MLC=0x40a, but the ref join proves 0x40a resolves to FRM
-// files and 0x403's join signal is not FRM. Rows it produced that carry no ref-join
-// evidence were dropped from the table (see below) - use --region-ident for them.
-// POL caveat (2026-09): on this card NO .tci shard references POL's clusters (verified
-// across all 76 shards), and Krakow's own shard N6E2102.TCI is an EMPTY STUB: its level
-// tables are allocated but the cluster-ref pool is zero-filled (98108 of 98352 ref slots
-// are {0,0,0}; the few nonzero lvl3 entries are junk with len 1-4). The stock card thus
-// never locates Poland's road clusters through .tci - the runtime path evidently runs via
-// the per-region NAV_ROOT.DAT / NAV00001.DAT ("databases//00001.wrk") container instead.
-// 0x402 for POL is a legacy value (never confirmed). An on-device open-capture (strace on
-// DAPIAPP/PROCNAV while computing a Krakow route) is required before any .tci-based swap
-// is trusted for Poland. The runtime registers shards by DIRECTORY SCAN of
-// data/data/map/*.tci and reads the tile ids from the FILENAMES
+// Table FINALIZED 2026-09 by two independent, mutually-confirming empirical methods:
+//   (1) shard .tci join: decode every clusterRef {u32 off|ident, u16 len, u16 fileId}, map
+//       fileId onto the per-region NAV%05u.DAT inventory, require off&~0x3FFF + len <= size,
+//       count only refs with a single in-bounds owner-region. Covers 6 regions (the ones the
+//       EUR card's .tci master actually references): DEU 0x401 IBE 0x409 FRM 0x40a ISV 0x40b
+//       SCA 0x40d EEU 0x42a - each 100% agreement (3098..128129 refs).
+//   (2) cluster-adjacency (ci) scan: parse NAV clusters, read the 24-byte ci1/ci2 records
+//       (nav_tclClusterInfo::bRead @0x008910cc, same {off|ident,len,fid} word), take the
+//       dominant low-14-bit value per region folder. Reproduces ALL SIX values of (1)
+//       exactly and yields the other 11: POL 0x402 GRC 0x403 TUR 0x404 BNL 0x407 ACL 0x408
+//       GBI 0x40c CHS 0x40e ELL 0x411 INT 0x412 EAD 0x416 MLC 0x483 (codeId 131 - unusual
+//       but cleanly separated: 7560 of ~11k ci refs in MLC's 28 files, next value 798).
+// This CORRECTS the retired NAV_ROOT-histogram table: FRM was 0x403 (really GRC), TUR was
+// 0x407 (really BNL), BNL was 0x404 (really TUR), GRC was 0x406 (used nowhere), MLC was
+// 0x40a (really FRM). Cross-refs to OTHER regions (the small secondary idents per folder)
+// are genuine border neighbours, e.g. EEU clusters carry a few DEU(0x401) refs.
+// Note: in per-region NAV_ROOT.DAT cluster-refs the codeId bits are usually ZERO (only
+// profile bit set, i.e. ident 0x400 or 0x0) - the region is implicit there; the packed
+// codeId matters for the cross-region .tci pool and the ci adjacency words.
+// POL note: no .tci shard on this card references POL (Krakow's shard N6E2102.TCI is an
+// empty stub) although POL's own clusters pack 0x402 in their ci lists - the runtime's POL
+// discovery evidently goes through NAV_ROOT/NAV00001; shards are registered by DIRECTORY
+// SCAN of data/data/map/*.tci with tile ids parsed from the FILENAMES
 // (dap_map_tclTCICache::u16InitTciFileList @0x8de860 -> u16InitTciIdList @0x8de624,
-// dap_map_tclTileFileId::vSet(filename)); bIsTciFileAvail @0x8de1fc answers availability
-// per tileFileId from that list - so a swapped-in shard must be named like the stock tile
-// it replaces.
+// dap_map_tclTileFileId::vSet(filename); bIsTciFileAvail @0x8de1fc). A swapped-in shard
+// must be named like the stock tile shard it replaces.
 const REGION_IDENT: &[(&str, u16)] = &[
-    ("DEU", 0x401), // 1   Germany              (confirmed: 94546 refs resolve only to DEU files)
-    ("POL", 0x402), // 2   Poland               (UNVERIFIED - POL has no .tci refs on this card)
-    ("IBE", 0x409), // 9   Iberia               (confirmed: 72062 refs resolve only to IBE files)
-    ("FRM", 0x40a), // 10  France               (confirmed: 3098 refs resolve only to FRM files; old 0x403 wrong)
-    ("ISV", 0x40b), // 11  Switzerland          (confirmed: 9215 refs resolve only to ISV files)
-    ("SCA", 0x40d), // 13  Scandinavia          (confirmed: 128129 refs resolve only to SCA files)
-    ("EEU", 0x42a), // 42  Eastern Europe agg.  (confirmed: 115744 refs resolve only to EEU files; NOT Poland's roads)
-    // Rows of the old NAV_ROOT-histogram table without ref-join evidence were REMOVED 2026-09
-    // (BNL GRC TUR ACL MLC GBI CHS ELL INT EAD) - the method demonstrably produced at least two
-    // wrong values (FRM, MLC). Emitting a guessed ident writes another region's clusters, so these
-    // regions must be targeted with an explicit --region-ident until proven (on-device capture or
-    // a card whose .tci shards reference them).
+    ("DEU", 0x401), // 1   Germany            (tci-join 94546 + ci-scan 10788)
+    ("POL", 0x402), // 2   Poland             (ci-scan 12975; no .tci refs on this card)
+    ("GRC", 0x403), // 3   Greece             (ci-scan 20826; old table wrongly gave it 0x406)
+    ("TUR", 0x404), // 4   Turkey             (ci-scan 18560; old table wrongly gave it 0x407)
+    ("BNL", 0x407), // 7   Benelux            (ci-scan 8517; old table wrongly gave it 0x404)
+    ("ACL", 0x408), // 8   Austria            (ci-scan 7694)
+    ("IBE", 0x409), // 9   Iberia             (tci-join 72062 + ci-scan 15343)
+    ("FRM", 0x40a), // 10  France             (tci-join 3098 + ci-scan 19653; old 0x403 was GRC)
+    ("ISV", 0x40b), // 11  Switzerland        (tci-join 9215 + ci-scan 11120)
+    ("GBI", 0x40c), // 12  Great Britain/Ireland (ci-scan 13830)
+    ("SCA", 0x40d), // 13  Scandinavia        (tci-join 128129 + ci-scan 10595)
+    ("CHS", 0x40e), // 14  Czech/Slovak?      (ci-scan 21514)
+    ("ELL", 0x411), // 17  Hellas/Greece-agg? (ci-scan 20923)
+    ("INT", 0x412), // 18  international net  (ci-scan 595; INT files are small)
+    ("EAD", 0x416), // 22  (Adriatic/Dinaric?) (ci-scan 17138)
+    ("EEU", 0x42a), // 42  Eastern Europe agg.(tci-join 115744 + ci-scan 11235; NOT Poland's roads)
+    ("MLC", 0x483), // 131 (28 small files)    (ci-scan 7560; codeId 131, clean majority)
 ];
 
 // region code -> regionIdent (case-insensitive, matches the RNW folder name).
@@ -1173,6 +1180,7 @@ fn write_nav(
     segs: &[Seg],
     gnodes: &[(i64, i64)],
     file_id: u16,
+    region_ident: u16,
     path: &Path,
 ) -> Vec<(u32, usize)> {
     // Pass A: serialize each cluster (sizes independent of cross-cluster offsets), assign each
@@ -1190,11 +1198,13 @@ fn write_nav(
         made.push((b, sites));
     }
     // Pass B: patch each ci2 record's fileOffset(u32@0)+fileId(u16@6) with the neighbour's
-    // real file position. num + origin were written in serialize.
+    // real file position. num + origin were written in serialize. The fileOffset word packs
+    // the regionIdent in its low 14 bits exactly like the .tci clusterRef (observed as the
+    // dominant per-region ci value on every stock region folder).
     for (i, (b, sites)) in made.iter_mut().enumerate() {
         for (k, &site) in sites.iter().enumerate() {
             let tgt = blobs[i].ci2[k];
-            put_u32(b, site, offs[tgt]);
+            put_u32(b, site, (offs[tgt] & 0xffff_c000) | region_ident as u32);
             put_u16(b, site + 6, file_id);
         }
     }
@@ -1302,9 +1312,13 @@ mod tci_tests {
         assert_eq!(region_ident_for("DEU"), Some(0x401));
         assert_eq!(region_ident_for("FRM"), Some(0x40a));
         assert_eq!(region_ident_for("EEU"), Some(0x42a));
-        // retired guesses must NOT silently return a value again:
-        assert_eq!(region_ident_for("MLC"), None);
-        assert_eq!(region_ident_for("GRC"), None);
-        assert_eq!(region_ident_for("INT"), None);
+        assert_eq!(region_ident_for("POL"), Some(0x402));
+        // values recovered via the ci-adjacency scan (method reproduces the tci-join six):
+        assert_eq!(region_ident_for("GRC"), Some(0x403));
+        assert_eq!(region_ident_for("TUR"), Some(0x404));
+        assert_eq!(region_ident_for("BNL"), Some(0x407));
+        assert_eq!(region_ident_for("MLC"), Some(0x483));
+        // retired wrong values must never reappear:
+        assert_eq!(region_ident_for("XYZ"), None);
     }
 }
