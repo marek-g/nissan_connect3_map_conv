@@ -1853,13 +1853,18 @@ fn poi_rank(tags: &HashMap<String, String>) -> u8 {
     3
 }
 
-// Level-of-detail is toggled by OSM2MAP_LOD (default OFF). Off = the car-validated geometry (#09p:
-// pre-LOD per-level caps [2,4,7,7]/[1,2,3,3], no RDP simplification). The LOD path (sub-pixel
-// Douglas-Peucker + coarser caps) is implemented and stock-motivated but has NOT been car-validated
-// on its own (the earlier #08 reboot was the water-line code, not LOD) — set OSM2MAP_LOD=1 to test it.
+// Level-of-detail is toggled by OSM2MAP_LOD (default ON). On = the stock-motivated path (sub-pixel
+// Douglas-Peucker + per-level caps MEASURED from the stock N6E2 dense tiles). It is the DEFAULT
+// because a dense extract (whole Małopolska: Kraków L1 tile wanted 108 multi-slot sub-entries)
+// floods the 15-entry IDX multi-slot cap with LOD off — tmcheck FAIL, and the head unit reads the
+// slot count as a 4-bit field (#23-class reboot). OSM2MAP_LOD=0 restores the old car-validated
+// sparse-geometry path (#09p caps [2,4,6,7]/[1,2,3,3], no RDP) for small extracts. The LOD path has
+// NOT yet been car-validated on its own (the earlier #08 reboot was the water-line code, not LOD;
+// the #23 LOD crash was the bare feat-0x0001 name bug, fixed in poi_can_name) — re-check it on a
+// card before trusting it for on-car road-showing at coarse zoom.
 fn lod_on() -> bool {
     matches!(
-        env::var("OSM2MAP_LOD").unwrap_or_else(|_| "0".into()).as_str(),
+        env::var("OSM2MAP_LOD").unwrap_or_else(|_| "1".into()).as_str(),
         "1" | "y" | "yes" | "on" | "true"
     )
 }
