@@ -97,10 +97,33 @@ struct Seg {
 struct Network {
     nodes: HashMap<i64, (i64, i64)>,
     ways: Vec<(Vec<i64>, Attr, Option<String>)>,
+    // Settlement-area candidates (RNW annot 0x19 BuiltUpLen; routing_algorithm.md §5):
+    // node-geoms of ways tagged boundary/place-ish; flag = the way's OWN tags mark a place area.
+    poly_geoms: HashMap<i64, (Vec<i64>, bool)>,
+    // boundary=place / place=* relations: ordered ids of their outer way members.
+    place_rel_outer: Vec<Vec<i64>>,
 }
 impl Network {
     fn new() -> Self {
-        Network { nodes: HashMap::new(), ways: Vec::new() }
+        Network { nodes: HashMap::new(), ways: Vec::new(), poly_geoms: HashMap::new(),
+                  place_rel_outer: Vec::new() }
+    }
+}
+
+// Way/relation tags that mark a settlement (built-up) area polygon.
+fn is_place_area(tags: &HashMap<String, String>) -> bool {
+    if tags.contains_key("place") {
+        return true;
+    }
+    tags.get("boundary").map(|b| b == "place").unwrap_or(false)
+}
+fn is_boundaryish(tags: &HashMap<String, String>) -> bool {
+    tags.contains_key("boundary") || tags.contains_key("place")
+}
+
+fn collect_poly(net: &mut Network, id: i64, ids: Vec<i64>, tags: &HashMap<String, String>) {
+    if is_boundaryish(tags) {
+        net.poly_geoms.insert(id, (ids, is_place_area(tags)));
     }
 }
 
@@ -127,7 +150,7 @@ fn add_way(net: &mut Network, nodes: Vec<i64>, tags: &HashMap<String, String>) {
 }
 
 fn parse_pbf(path: &str, net: &mut Network) {
-    use pbf_craft::models::{Element, Tag as PbfTag};
+    use pbf_craft::models::{BasicElement, Element, Tag as PbfTag};
     use pbf_craft::readers::PbfReader;
     fn nd_to_deg(nd: i64) -> f64 {
         if nd < 0 {
@@ -158,9 +181,28 @@ fn parse_pbf(path: &str, net: &mut Network) {
                     let ids: Vec<i64> = w.way_nodes.iter().map(|wn| wn.id).collect();
                     let tags: HashMap<String, String> =
                         w.tags.iter().map(|t: &PbfTag| (t.key.clone(), t.value.clone())).collect();
+                    collect_poly(net, w.id, ids.clone(), &tags);
                     add_way(net, ids, &tags);
                 }
-                Element::Relation(_) => {}
+                Element::Relation(r) => {
+                    let tags: HashMap<String, String> =
+                        r.get_tags().iter().map(|t| (t.key.clone(), t.value.clone())).collect();
+                    if is_place_area(&tags) {
+                        let mut outer: Vec<i64> = r.members.iter()
+                            .filter(|m| m.member_type == pbf_craft::models::ElementType::Way
+                                && m.role == "outer")
+                            .map(|m| m.member_id).collect();
+                        if outer.is_empty() {
+                            outer = r.members.iter()
+                                .filter(|m| m.member_type == pbf_craft::models::ElementType::Way
+                                    && m.role != "inner")
+                                .map(|m| m.member_id).collect();
+                        }
+                        if !outer.is_empty() {
+                            net.place_rel_outer.push(outer);
+                        }
+                    }
+                }
             }
         })
         .unwrap_or_else(|e| panic!("read pbf {}: {}", path, e));
@@ -176,6 +218,11 @@ fn parse_osm_xml(path: &str, net: &mut Network) {
     let mut node_tags: HashMap<String, String> = HashMap::new();
     let mut way_ids: Option<Vec<i64>> = None;
     let mut way_tags: HashMap<String, String> = HashMap::new();
+    let mut way_id: i64 = 0;
+    let mut in_rel = false;
+    let mut rel_tags: HashMap<String, String> = HashMap::new();
+    let mut rel_outer: Vec<i64> = Vec::new();
+    let mut rel_anon: Vec<i64> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -195,6 +242,18 @@ fn parse_osm_xml(path: &str, net: &mut Network) {
                 "way" => {
                     way_ids = Some(Vec::new());
                     way_tags.clear();
+                    way_id = 0;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "id" {
+                            way_id = str_of(&a).parse().unwrap_or(0);
+                        }
+                    }
+                }
+                "relation" => {
+                    in_rel = true;
+                    rel_tags.clear();
+                    rel_outer.clear();
+                    rel_anon.clear();
                 }
                 _ => {}
             },
@@ -236,6 +295,29 @@ fn parse_osm_xml(path: &str, net: &mut Network) {
                         node_tags.insert(k, v);
                     } else if way_ids.is_some() {
                         way_tags.insert(k, v);
+                    } else if in_rel {
+                        rel_tags.insert(k, v);
+                    }
+                }
+                "member" => {
+                    if in_rel {
+                        let (mut typ, mut rid, mut role) = (String::new(), 0i64, String::new());
+                        for a in e.attributes().flatten() {
+                            let s = str_of(&a);
+                            match a.key.as_ref() {
+                                "type" => typ = s,
+                                "ref" => rid = s.parse().unwrap_or(0),
+                                "role" => role = s,
+                                _ => {}
+                            }
+                        }
+                        if typ == "way" {
+                            if role == "outer" {
+                                rel_outer.push(rid);
+                            } else if role != "inner" {
+                                rel_anon.push(rid);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -249,7 +331,22 @@ fn parse_osm_xml(path: &str, net: &mut Network) {
                 "way" => {
                     if let Some(ids) = way_ids.take() {
                         let tags = std::mem::take(&mut way_tags);
+                        collect_poly(net, way_id, ids.clone(), &tags);
                         add_way(net, ids, &tags);
+                    }
+                }
+                "relation" => {
+                    in_rel = false;
+                    if is_place_area(&rel_tags) {
+                        let mut outer = std::mem::take(&mut rel_outer);
+                        if outer.is_empty() {
+                            outer = std::mem::take(&mut rel_anon);
+                        }
+                        rel_outer.clear();
+                        rel_anon.clear();
+                        if !outer.is_empty() {
+                            net.place_rel_outer.push(outer);
+                        }
                     }
                 }
                 _ => {}
@@ -266,6 +363,126 @@ fn str_of(a: &quick_xml::events::attributes::Attribute) -> String {
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| a.value.as_ref().to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Built-up (settlement) area polygons -> RNW onecell annotation 0x19
+// {u32 fwd, u32 bwd} metres (RNW_format.md §8a; engine consumer
+// tclClExConverter::vCalcDrivingResistance, routing_algorithm.md §5). Rings come from the
+// SAME input file: closed ways tagged place=* / boundary=place, and place-like
+// multipolygon relations assembled from their outer member ways. An onecell is annotated
+// when BOTH endpoints fall inside any ring (builtup length = full onecell length).
+// ---------------------------------------------------------------------------
+
+// Exact integer even-odd ray cast (PAU coords; x-crossing compared without division).
+fn pt_in_ring(p: (i64, i64), r: &[(i64, i64)]) -> bool {
+    let (px, py) = (p.0 as i128, p.1 as i128);
+    let mut inside = false;
+    let mut j = r.len() - 1;
+    for i in 0..r.len() {
+        let (xi, yi) = (r[i].0 as i128, r[i].1 as i128);
+        let (xj, yj) = (r[j].0 as i128, r[j].1 as i128);
+        let dy = yj - yi;
+        if (yi > py) != (yj > py) {
+            let lhs = (px - xi) * dy;
+            let rhs = (xj - xi) * (py - yi);
+            if if dy > 0 { lhs < rhs } else { lhs > rhs } {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+fn ring_bbox(r: &[(i64, i64)]) -> (i64, i64, i64, i64) {
+    let mut b = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for &(x, y) in r {
+        if x < b.0 { b.0 = x; } if x > b.2 { b.2 = x; }
+        if y < b.1 { b.1 = y; } if y > b.3 { b.3 = y; }
+    }
+    b
+}
+
+fn pt_in_any(p: (i64, i64), rings: &[((i64, i64, i64, i64), Vec<(i64, i64)>)]) -> bool {
+    rings.iter().any(|(bb, r)| {
+        p.0 >= bb.0 && p.0 <= bb.2 && p.1 >= bb.1 && p.1 <= bb.3 && pt_in_ring(p, r)
+    })
+}
+
+// Concatenate member-way id-chains of one multipolygon into closed rings (greedy, both ends).
+fn assemble_rings(chains: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    fn dedup(mut v: Vec<i64>) -> Vec<i64> {
+        v.dedup();
+        v
+    }
+    let mut pool: Vec<Vec<i64>> = chains.into_iter().map(dedup).filter(|c| c.len() >= 2).collect();
+    let mut rings = Vec::new();
+    while let Some(mut cur) = pool.pop() {
+        let mut closed = false;
+        loop {
+            if cur.len() >= 4 && cur.first() == cur.last() {
+                closed = true;
+                break;
+            }
+            let (head, tail) = (cur[0], *cur.last().unwrap());
+            let hit = pool.iter().position(|c| {
+                let (h, t) = (c[0], *c.last().unwrap());
+                h == tail || t == tail || h == head || t == head
+            });
+            let Some(k) = hit else { break };
+            let c = pool.swap_remove(k);
+            let (h, t) = (c[0], *c.last().unwrap());
+            if h == tail {
+                cur.extend(c[1..].iter());
+            } else if t == tail {
+                cur.extend(c[..c.len() - 1].iter().rev());
+            } else if t == head {
+                let mut nc = c;
+                nc.extend(cur[1..].iter());
+                cur = nc;
+            } else {
+                // h == head: prepend reversed c
+                let mut nc: Vec<i64> = c[..c.len() - 1].iter().rev().copied().collect();
+                nc.extend(cur);
+                cur = nc;
+            }
+            cur.dedup();
+        }
+        if closed {
+            rings.push(cur);
+        }
+    }
+    rings
+}
+
+fn build_place_rings(net: &Network) -> Vec<((i64, i64, i64, i64), Vec<(i64, i64)>)> {
+    let coords = |ids: &[i64]| -> Option<Vec<(i64, i64)>> {
+        ids.iter().map(|i| net.nodes.get(i).copied()).collect()
+    };
+    let mut id_rings: Vec<Vec<i64>> = Vec::new();
+    for (ids, placeish) in net.poly_geoms.values() {
+        if *placeish && ids.len() >= 4 && ids.first() == ids.last() {
+            id_rings.push(ids.clone());
+        }
+    }
+    for outer in &net.place_rel_outer {
+        let chains: Vec<Vec<i64>> =
+            outer.iter().filter_map(|w| net.poly_geoms.get(w)).map(|(g, _)| g.clone()).collect();
+        id_rings.extend(assemble_rings(chains));
+    }
+    id_rings
+        .into_iter()
+        .filter_map(|ids| {
+            let mut r = coords(&ids)?;
+            if r.len() >= 4 && r.first() == r.last() {
+                r.pop();
+            }
+            (r.len() >= 3).then(|| (ring_bbox(&r), r))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 fn main() {
@@ -394,6 +611,10 @@ fn main() {
         eprintln!("no highway ways found");
         exit(1);
     }
+    let rings = build_place_rings(&net);
+    if !rings.is_empty() {
+        eprintln!("built-up place polygons: {}", rings.len());
+    }
 
     let bb = bbox.map(|(w, s, e, n)| (deg2pau(w), deg2pau(s), deg2pau(e), deg2pau(n)));
 
@@ -445,11 +666,30 @@ fn main() {
         exit(1);
     }
 
+    // Built-up length per segment (annot 0x19): full length when both endpoints are inside
+    // a settlement ring (onecells here are straight a->b, so no partial clipping applies).
+    let seg_built: Vec<u32> = segs
+        .iter()
+        .map(|s| {
+            if !rings.is_empty()
+                && pt_in_any(gnodes[s.a as usize], &rings)
+                && pt_in_any(gnodes[s.b as usize], &rings)
+            {
+                seg_len(&gnodes, s) as u32
+            } else {
+                0
+            }
+        })
+        .collect();
+    if !rings.is_empty() {
+        eprintln!("built-up onecells: {}", seg_built.iter().filter(|&&v| v > 0).count());
+    }
+
     let bbox_pau = extent(&gnodes);
     let clusters = build_clusters(&segs, bbox_pau, target_oc);
     eprintln!("clusters: {}", clusters.len());
 
-    let mut blobs = build_blobs(&segs, &gnodes, &clusters);
+    let mut blobs = build_blobs(&segs, &gnodes, &clusters, &seg_built);
     mark_borders(&mut blobs, &clusters);
     if !no_overlaps {
         build_overlaps(&mut blobs, &segs);
@@ -838,9 +1078,15 @@ struct ClusterBlob {
     // ci2 overlap links (filled by build_overlaps; serialized as cluster bit3 + onecell bit4).
     ci2: Vec<usize>,                            // neighbour cluster indices, in ci2-slot order
     oc_ovl: Vec<Vec<(u16, u16, usize)>>,        // per onecell: (ci2_index, nbr onecell local, nbr cluster)
+    oc_built: Vec<u32>,                         // per onecell: built-up length m (annot 0x19; 0 = none)
 }
 
-fn build_blobs(segs: &[Seg], gnodes: &[(i64, i64)], clusters: &[Vec<usize>]) -> Vec<ClusterBlob> {
+fn build_blobs(
+    segs: &[Seg],
+    gnodes: &[(i64, i64)],
+    clusters: &[Vec<usize>],
+    seg_built: &[u32],
+) -> Vec<ClusterBlob> {
     clusters
         .iter()
         .map(|seg_idx| {
@@ -877,6 +1123,7 @@ fn build_blobs(segs: &[Seg], gnodes: &[(i64, i64)], clusters: &[Vec<usize>]) -> 
                 node_border: Vec::new(),
                 ci2: Vec::new(),
                 oc_ovl: vec![Vec::new(); seg_idx.len()],
+                oc_built: seg_idx.iter().map(|&si| seg_built[si]).collect(),
             }
         })
         .collect()
@@ -1012,17 +1259,21 @@ fn serialize(
     let ci2_off = var;
     var += 24 * cb.ci2.len();
 
-    // per-onecell: overlap entries + name flag + descriptor stream (bit0 name, bit4 overlaps).
+    // per-onecell: annot list (name 0x3C + built-up 0x19) + overlap entries + descriptor
+    // stream (bit0 AnnotList, bit4 overlaps).
     let mut has_name = vec![false; oc];
+    let mut has_built = vec![false; oc];
     let mut ovl_cnt = vec![0u16; oc];
     for oi in 0..oc {
         has_name[oi] = segs[cb.oc_seg[oi]].name.is_some();
+        has_built[oi] = cb.oc_built.get(oi).copied().unwrap_or(0) > 0;
         ovl_cnt[oi] = cb.oc_ovl[oi].len() as u16;
     }
     // descriptor stream location (at onecell offf): one 4-byte slot per set bit, in bit order.
     let mut oc_desc = vec![0u16; oc];
     for oi in 0..oc {
-        let nslots = (has_name[oi] as usize) + if ovl_cnt[oi] > 0 { 1 } else { 0 };
+        let nslots = ((has_name[oi] || has_built[oi]) as usize)
+            + if ovl_cnt[oi] > 0 { 1 } else { 0 };
         if nslots > 0 {
             oc_desc[oi] = var as u16;
             var += 4 * nslots;
@@ -1030,9 +1281,10 @@ fn serialize(
     }
     let mut oc_ann = vec![0u16; oc];
     for oi in 0..oc {
-        if has_name[oi] {
+        let frames = (has_name[oi] as usize) * 6 + (has_built[oi] as usize) * 12;
+        if frames != 0 {
             oc_ann[oi] = var as u16;
-            var += 6;
+            var += frames;
         }
     }
     let mut oc_ovl_arr = vec![0u16; oc];
@@ -1127,7 +1379,7 @@ fn serialize(
         put_u32(&mut b, p, hdr);
         put_u32(&mut b, p + 4, (seg_len(gnodes, s) as u32) & 0x00FF_FFFF);
         let mut lfo: u16 = 0;
-        if has_name[oi] {
+        if has_name[oi] || has_built[oi] {
             lfo |= 1;
         }
         if ovl_cnt[oi] > 0 {
@@ -1137,14 +1389,25 @@ fn serialize(
         put_u16(&mut b, p + 10, if lfo != 0 { oc_desc[oi] } else { 4 });
         if lfo != 0 {
             let mut q = oc_desc[oi] as usize;
-            if has_name[oi] {
+            if has_name[oi] || has_built[oi] {
                 put_u16(&mut b, q, oc_ann[oi]);
-                put_u16(&mut b, q + 2, 1);
+                put_u16(&mut b, q + 2, has_name[oi] as u16 + has_built[oi] as u16);
                 q += 4;
-                put_u16(&mut b, oc_ann[oi] as usize, 6);
-                put_u16(&mut b, oc_ann[oi] as usize + 2, 0x3C);
-                let nm = segs[si].name.clone().unwrap();
-                put_u16(&mut b, oc_ann[oi] as usize + 4, name_text[nm.as_str()]);
+                let mut aq = oc_ann[oi] as usize;
+                if has_name[oi] {
+                    put_u16(&mut b, aq, 6);
+                    put_u16(&mut b, aq + 2, 0x3C);
+                    let nm = segs[si].name.clone().unwrap();
+                    put_u16(&mut b, aq + 4, name_text[nm.as_str()]);
+                    aq += 6;
+                }
+                if has_built[oi] {
+                    let bl = cb.oc_built[oi];
+                    put_u16(&mut b, aq, 0x0C);
+                    put_u16(&mut b, aq + 2, 0x19);
+                    put_u32(&mut b, aq + 4, bl);
+                    put_u32(&mut b, aq + 8, bl);
+                }
             }
             if ovl_cnt[oi] > 0 {
                 put_u16(&mut b, q, oc_ovl_arr[oi]);
@@ -1245,7 +1508,9 @@ fn usage() {
           \t--file-id      NAV file id (default 20001)\n\
           \t--target-oc    segments/cluster <=1024 (default 700)\n\
           \t--bbox         only roads inside W,S,E,N degrees (default: input extent)\n\
-          \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
+           \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
+           \tBuilt-up annot 0x19: emitted automatically for onecells whose endpoints lie inside\n\
+           \t\t   settlement polygons (place=* / boundary=place ways or relations) present in the input\n\
           \t--tci          also emit the tile->cluster locator <out>/MAP/<shard>.TCI\n\
           \t--map-idx      DIR with the step-1 osm2map <REGION>AA.IDX (source of the region tile grid)\n\
           \t--region-ident override the ref regionIdent (default: derived from --region via baked table)\n\
@@ -1276,6 +1541,7 @@ mod tci_tests {
             node_border: vec![],
             ci2: vec![],
             oc_ovl: vec![],
+            oc_built: vec![],
         }
     }
 
@@ -1320,5 +1586,103 @@ mod tci_tests {
         assert_eq!(region_ident_for("MLC"), Some(0x483));
         // retired wrong values must never reappear:
         assert_eq!(region_ident_for("XYZ"), None);
+    }
+}
+
+#[cfg(test)]
+mod builtup_tests {
+    use super::*;
+
+    #[test]
+    fn pt_in_ring_even_odd() {
+        let sq = vec![(0i64, 0i64), (100, 0), (100, 100), (0, 100)];
+        assert!(pt_in_ring((50, 50), &sq));
+        assert!(!pt_in_ring((150, 50), &sq));
+        assert!(!pt_in_ring((-1, 50), &sq));
+        let concave = vec![(0, 0), (200, 0), (200, 200), (100, 200), (100, 100), (0, 100)];
+        assert!(pt_in_ring((50, 50), &concave));
+        assert!(pt_in_ring((150, 150), &concave)); // the notch cuts the TOP-LEFT quadrant
+        assert!(!pt_in_ring((50, 150), &concave)); // inside bbox, outside the ring
+    }
+
+    #[test]
+    fn assemble_rings_joins_open_member_ways() {
+        // square split into two open ways (shared endpoints 3 and 1)
+        let rings = assemble_rings(vec![vec![1, 2, 3], vec![3, 4, 1]]);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].first(), rings[0].last());
+        assert_eq!(rings[0].len(), 5);
+        assert!(assemble_rings(vec![vec![1, 2, 3], vec![7, 8]]).is_empty());
+    }
+
+    fn u16le(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+
+    fn one_cell_blob(built: u32, name: Option<&str>) -> (Vec<ClusterBlob>, Vec<Seg>, Vec<(i64, i64)>) {
+        let gnodes = vec![(0i64, 0i64), (30_000, 0)];
+        let segs = vec![Seg {
+            a: 0,
+            b: 1,
+            mid: (15_000, 0),
+            attr: Attr::default(),
+            name: name.map(|s| s.to_string()),
+        }];
+        (build_blobs(&segs, &gnodes, &[vec![0usize]], &[built]), segs, gnodes)
+    }
+
+    // -> (onecell listFlags, offset of its descriptor slot 0 = {annOff, annCnt})
+    fn find_onecell_ann(b: &[u8]) -> (u16, usize) {
+        let ooff = u16le(b, 0x12) as usize;
+        let ocnt = u16le(b, 0x14) as usize;
+        let lf = u16le(b, 0x16);
+        let mut d = ooff + 4 * ocnt;
+        for bit in 0..9 {
+            if lf >> bit & 1 == 1 {
+                if bit == 5 {
+                    let off = u16le(b, d) as usize;
+                    assert_eq!(u16le(b, d + 2), 1); // one onecell
+                    let lfo = u16le(b, off + 8);
+                    let offf = u16le(b, off + 10) as usize;
+                    return (lfo, offf as usize);
+                }
+                d += 4;
+            }
+        }
+        panic!("onecell list not emitted");
+    }
+
+    #[test]
+    fn serialize_emits_builtup_annot_frame() {
+        let (blobs, segs, gnodes) = one_cell_blob(123, Some("U Topolska"));
+        let (b, _sites) = serialize(&blobs[0], &blobs, &gnodes, &segs, 1);
+        let (lfo, slot) = find_onecell_ann(&b);
+        assert_eq!(lfo & 1, 1, "AnnotList bit must be set");
+        let ann = u16le(&b, slot) as usize;
+        assert_eq!(u16le(&b, slot + 2), 2, "two frames: name + builtup");
+        // frame 1: name 0x3C (size 6)
+        assert_eq!((u16le(&b, ann), u16le(&b, ann + 2)), (6, 0x3C));
+        // frame 2: builtup 0x19 (size 12, {u32 fwd, u32 bwd})
+        let f2 = ann + 6;
+        assert_eq!((u16le(&b, f2), u16le(&b, f2 + 2)), (0x0C, 0x19));
+        let fwd = u32::from_le_bytes([b[f2 + 4], b[f2 + 5], b[f2 + 6], b[f2 + 7]]);
+        let bwd = u32::from_le_bytes([b[f2 + 8], b[f2 + 9], b[f2 + 10], b[f2 + 11]]);
+        assert_eq!((fwd, bwd), (123, 123));
+    }
+
+    #[test]
+    fn no_builtup_no_frames_and_builtup_only_keeps_list() {
+        let (blobs, segs, gnodes) = one_cell_blob(0, None);
+        let (b, _) = serialize(&blobs[0], &blobs, &gnodes, &segs, 1);
+        let (lfo, _) = find_onecell_ann(&b);
+        assert_eq!(lfo & 1, 0, "no annot list without name/builtup");
+
+        let (blobs, segs, gnodes) = one_cell_blob(77, None);
+        let (b, _) = serialize(&blobs[0], &blobs, &gnodes, &segs, 1);
+        let (lfo, slot) = find_onecell_ann(&b);
+        assert_eq!(lfo & 1, 1);
+        assert_eq!(u16le(&b, slot + 2), 1);
+        let ann = u16le(&b, slot) as usize;
+        assert_eq!((u16le(&b, ann), u16le(&b, ann + 2)), (0x0C, 0x19));
     }
 }

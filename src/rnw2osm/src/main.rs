@@ -580,6 +580,29 @@ fn read_names(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<Vec<String>> {
     names
 }
 
+// BuiltUpLen (0x19) {u32 fwd, u32 bwd} metres — the engine's urban-speed split input
+// (RNW_format.md §8a; PROCNAV tclClExConverter::vCalcDrivingResistance).
+fn read_builtup(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<(u32, u32)> {
+    let mut q = ann_off;
+    for _ in 0..ann_cnt as usize {
+        if q + 12 > cd.len() {
+            break;
+        }
+        let size = u16le(cd, q) as usize;
+        let typ = u16le(cd, q + 2);
+        if size < 4 || size > 64 {
+            break;
+        }
+        if typ == 0x19 {
+            let fwd = u32::from_le_bytes([cd[q + 4], cd[q + 5], cd[q + 6], cd[q + 7]]);
+            let bwd = u32::from_le_bytes([cd[q + 8], cd[q + 9], cd[q + 10], cd[q + 11]]);
+            return Some((fwd, bwd));
+        }
+        q += size;
+    }
+    None
+}
+
 // A zerocell's annotation list is a self-contained nav_tclAnnotList object living at
 // `offz`: [u16 data_off][u16 count], then `count` records at data_off, each
 // [u16 size][u16 type]... where the real type is (type & 0x7fff) (top bit = flag).
@@ -638,6 +661,7 @@ struct Road {
     name: Option<Vec<String>>,
     hdr: u32, // raw onecell header word: class fields + all attribute bits (decoded at emission)
     length: u32, // stored road length (onecell x field, low 24 bits; source's own units)
+    built: (u32, u32), // annot 0x19 BuiltUpLen metres {fwd,bwd}; (0,0) = no annotation
     overlaps: Vec<Overlap>,
 }
 
@@ -1009,8 +1033,10 @@ fn parse_cluster(
         }
 
         let mut names = None;
+        let mut built = (0u32, 0u32);
         if ann_cnt != 0 {
             names = read_names(cd, ann_off, ann_cnt);
+            built = read_builtup(cd, ann_off, ann_cnt).unwrap_or((0, 0));
         }
         roads[k] = Some(Road {
             pts: Some(res),
@@ -1018,6 +1044,7 @@ fn parse_cluster(
             name: names,
             hdr,
             length: oclen,
+            built,
             overlaps,
         });
     }
@@ -1575,6 +1602,9 @@ fn main() {
             tags.push(tag("rn_freeway", freeway.to_string()));
             if r.length != 0 {
                 tags.push(tag("rn_length", r.length.to_string()));
+            }
+            if r.built.0 != 0 {
+                tags.push(tag("rn_builtup", format!("{},{}", r.built.0, r.built.1)));
             }
             if gateway == 1 {
                 tags.push(tag("rn_gateway", "yes"));
