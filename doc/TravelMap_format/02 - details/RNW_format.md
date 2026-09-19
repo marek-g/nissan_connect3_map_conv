@@ -441,13 +441,13 @@ zerocells, 4.26 M carrying an AnnotList, 7.53 M node annotations):
 
 | type | count | size | routing (CLEX) | meaning |
 |------|------:|------|:--:|---------|
-| 0x0f | 3 429 285 | 10/16/22 | ✔ | junction matrix (zce offset field) |
-| 0x01 | 2 206 462 | 14/24/38 | ✔ | junction matrix |
+| 0x0f | 3 429 285 | N²+6/7  | ✔ | **TIME turn matrix** → `zce+0` (`u32GetTimeValue`); ubiquitous (the core cost) |
+| 0x01 | 2 206 462 | 2N²+4   | ✔ | **INSTRUCTION matrix** → `zce+2` (`iu16GetInstructionIndex`); **u16 cells** (only 2×-wide) |
 | 0x77 | 1 021 571 | 8 | ✔ | **turn-prohibition quad-matrix** (`prGetProhibQuadMatrixAnnotation`→`GetAnnotation(0x77)`@0x3626d8; `vSetZCInternalStatus` sets `zce+0x18` bit0) |
 | 0x21 |   328 199 | 8 | ✗ | display/border — NOT in routing table |
 | 0x31 |   201 309 | 6 | ✗ | **border/crossing marker** (`bBordersObjectAtTo/From` §5) — display, not a matrix |
-| 0x82 |   228 330 | 16/22 | ✔ | junction matrix |
-| 0x02 |    58 257 | 16/22 | ✔ | junction matrix (shared code w/ OC distance §8a) |
+| 0x82 |   228 330 | N²+6/7  | ✔ | **GENERALIZED-INSTRUCTION matrix** → `zce+0xe` (`rGetGeneralizedInstruction`); rare |
+| 0x02 |    58 257 | N²+6/7  | ✔ | **DISTANCE turn matrix** → `zce+6` (`u32GetDistanceValue`); = OC DistanceMatrix code §8a, rare (fine-tier) |
 | 0x32 |    50 768 | 10 | ✗ | display/border — NOT in routing table |
 | 0x42 |     6 801 | 12/18 | ✗ | display — NOT in routing table |
 | 0x8d |        50 | 12 | ✔ | **toll-booth cost** (`prGetTollBoothCostRelAnnotation`→`GetAnnotation(0x8d)`@0x44b5d4; `zce+0x18` bit2) |
@@ -464,25 +464,43 @@ stock DEU+POL nodes.
 
 Node annotations are read by `tagZEROCELLELEMENT` accessors that index a **degree² matrix** where the
 junction degree `N = u16@(zce+0x12)` (= incident-road count): cell = `(fromIdx−1)·N + (toIdx−1)`
-(`iu16GetMatrixIndex` @0x348298). Values carry a shared 1-byte **shift** and a `0xff`/`0xffff`
-**sentinel** = "no turn". Accessors: `u32GetTimeValue` @0x348320 (from `zce+0`),
+(`iu16GetMatrixIndex` @0x348298). Each matrix = `{shift header, N² cells}` — u8 cells + a shift for
+time/distance/gen-instr, u16 cells + a 2-byte shift for instruction — value = `cell << shift`, with a
+`0xff`/`0xffff` **sentinel** = "no turn". Accessors: `u32GetTimeValue` @0x348320 (from `zce+0`),
 `u32GetDistanceValue` @0x34836c (from `zce+6`), `iu16GetInstructionIndex` @0x3483c4 (from `zce+2`),
 `rGetGeneralizedInstruction` @0x3483fe (from `zce+0xe`), `prGetComplexIntersection` @0x44b5ae,
 `bTurnIsProhibited` @0x44b4c0. The turn cost is consumed by `vCreateZerocellResistance` @0x640d7c /
 `vCreateObjectMatrixColumnEntry` @0x640624 → `vGetManoeuvrePenalty` @0x4d4c28, which subtracts the
 OC's `anGenTimeDist` (OC annot **0x17** §8a) base/max before applying the node's per-turn delta.
 
-> **OPEN (exact 1:1 among the 4 matrices):** the codes `{0x01,0x02,0x0f,0x82}` correspond to the four
-> matrix offset fields `{time, instruction, distance, generalized-instruction}` (read by the accessors
-> above), but the precise **type↔field** bijection is not a literal switch — `vCopyAnnotation`
-> @0x391922 appends every matched annotation generically and the per-type field assignment lives in
-> the `ClusterAnnotationReader` runtime-built index (no decompilable literal), so it was not isolated
-> here. Only 0x77 (prohibition) and 0x8d (toll) are type-confirmed.
+> **RESOLVED — type↔field bijection of the 4 matrices** (empirically, DEU `bijection.py` over 80 k
+> junctions carrying ≥2 matrix types, sizes cross-checked against degree `N`):
+>
+> | `zce` field | getter | on-disk code | cell | frame size vs `N` |
+> |---|---|---|---|---|
+> | `+0`  time | `u32GetTimeValue` | **0x0f** | u8 + shift | `N²+6` (even `N`) / `N²+7` (odd) |
+> | `+2`  instruction | `iu16GetInstructionIndex` | **0x01** | **u16** + shift | **`2N²+4`** (exact, all N) |
+> | `+6`  distance | `u32GetDistanceValue` | **0x02** | u8 + shift | `N²+6/7` |
+> | `+0xe` gen-instruction | `rGetGeneralizedInstruction` | **0x82** | u8 + shift | `N²+6/7` |
+>
+> **Confidence.** `0x01`=instruction is **proven by cell width**: its frame size is exactly `2N²+4`
+> (u16 cells + a 2-byte shift header) for every `N`, the only 2×-wide annotation family; `0x02`=distance
+> is **proven by code identity** (the OC annotation vocabulary §8a names code `0x02` *DistanceMatrix*,
+> same `{shift, cells}` layout) plus its gated rarity (`u32GetDistanceValue` is suppressed unless
+> `(clex+0x2c)&7 != 0` = fine tier). `0x0f`=time is the **inferred** assignment (strongest signal: it is
+> the ubiquitous u8 matrix that co-occurs with the instruction as the core `0x01`+`0x0f` pair on
+> ~every managed junction, and time is the mandatory RESISTANCETAB cost); `0x82`=gen-instruction falls
+> out as the remaining rare u8 matrix (co-occurs with distance in the richer `0x02+0x0f+0x82` triples).
+> The literal per-type field write is still not a decompilable switch (`vCopyAnnotation` appends
+> generically; the setter is a runtime index), so `0x0f`/`0x82` rest on frequency+pairing, not a
+> literal `switch(type){…case 0x0f: zce[0]=…}`.
 >
 > **Writer note (`osm2rnw`):** the generator emits **no node annotations** today, so PROCNAV prices
 > every junction turn as free (turn/turn-cost + manoeuvre features unavailable) — acceptable for a
-> minimal single-region route. To emit them: per junction build the degree² matrix under a routing
-> code in the table above (exact code + shift/sentinel encoding still to pin).
+> minimal single-region route. To emit them: per junction of degree `N`, write the time matrix as code
+> `0x0f` (`{u16 shift, u8[N²]}`, `0xff` = no-turn), instruction `0x01` (`{u16 shift, u16[N²]}`,
+> `0xffff` = none), optional distance `0x02`, under the `{u16 size, u16 type}` frame; exact shift
+> (scale) encoding per cell still to pin against `u32GetTimeValue`'s `<<shift`.
 
 ### 8b. Global header annotations (NAV_ROOT.DAT) — the routing country tables
 
