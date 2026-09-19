@@ -396,6 +396,8 @@ is a flag**, code = `type & 0x7fff`:
 |------|-----------------|------------|----------|--------------------------------|
 | 0x02 | DistanceMatrix  | 0x0088f5a8 | 8        | routing cost matrix            |
 | 0x17 | GenTimeDist     | 0x0088f41c | 20       | generalized time-distance (4)  |
+| 0x19 | BuiltUpLen      | —          | 8        | built-up (urban) OC length ×2 (PROCNAV-only, see below) |
+| 0x2f | FreewayLen      | —          | 8        | freeway OC length ×2 (PROCNAV-only, see below)          |
 | 0x1b | RealLength      | 0x0088f4e8 | 4        | signed real length (m)         |
 | 0x1d | State           | 0x0088f518 | 4        | road state / status            |
 | 0x3c | Name            | 0x0088f740 | 8        | name ref (only if loader bit1) |
@@ -409,6 +411,15 @@ is a flag**, code = `type & 0x7fff`:
 - **DistanceMatrix (0x02):** `{u8 rows, u8 cols, u8[rows*cols]}` — raw distance matrix, memcpy'd verbatim.
 - **GenTimeDist (0x17):** `{u16 shift, u16 v0..v3}`; each stored metric = `vi << shift` (4 values, one scale).
 - **RealLength (0x1b):** `{s16}` — signed metres.
+- **BuiltUpLen (0x19) / FreewayLen (0x2f):** `{u32 fwd, u32 bwd}` metres — consumed by the ROUTING
+  process only (`tagONECELLELEMENT::prGetBuiltUpLengthAnnotation` @0x004e9e42,
+  `...FreewayLength...` @0x004e9e5c on PROCNAV's in-memory CLEX; the DAPIAPP display loader above
+  has no case for them and skips them as `Unknown`). Used by `vCalcDrivingResistance` to split an
+  OC into urban/freeway/other partial segments with different speed tables (routing_algorithm.md §5).
+  0x19 confirmed ON-DISK in cluster onecell annotlists (DEU: 197 frames in 4.7 MB NAV32642.DAT,
+  e.g. `0c 00 19 00 39 000000 39 000000` = 57 m both dirs); 0x2f frames NOT found in stock RNW
+  DEU files — freeway length is presumably carried via AEX export or derived at runtime from the
+  OC class flags (`onecell +0x1c` bit 0x200 / `+0x14` bit 0x40000000 fallback paths).
 
 > Note: this is the **NAV cluster** annotation system. The separate **AEX "extern annotation"** files (§13)
 > are a different on-disk format with their own type-code space and are parsed client-side, *not* by this reader.

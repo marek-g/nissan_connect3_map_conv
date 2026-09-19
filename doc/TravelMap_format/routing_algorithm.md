@@ -43,9 +43,53 @@ FW itself has no NAV binaries. `PROCNAV` was **not running** at capture time
 (`20_PROCNAV_status.txt: NOT FOUND`) → started on demand (lazy launch by the DNL deploy/start
 service, likely `procsds`).
 
-`PROCNAV.OUT` is not ELF: container `ULI ` (magic `"ULI "` + `u32 0` + `u32 1` + `u32 2`, then
-`u32 0`, `u32 0x24` header size, `u32 0x120b974` ≈ 18.9 MB unpacked size, `u32 0x91f348` packed
-size; payload from `0x24`). Unpacking is pending (§7).
+`PROCNAV.OUT` is not ELF on disk: container `"ULI "` — **SOLVED 2026-09-19, see 1.4.**
+
+### 1.4 ULI/XOZL container unpacker + engine location (2026-09-19)
+
+The monitor (triton) installer `@0x108844` (blob vaddr; blob = `triton_mid.bin` minus its 64-byte
+`triton_dualos` package header) reads the container header, allocates ONE output buffer of
+`usize + 0x40` (the 52-byte file header is copied in at offset 0, sections start at +0x40), then
+per section descriptor (stride 24: {…, packedOff, packedLen?, unpackedOff, unpackedLen?}) calls
+the decompressor **`0x10bd90`** at `0x1089b4`; for magic `"ULI "` each section's OUTPUT bytes are
+then post-processed in place at `0x1089d0`: `b = ~(b ^ 1)`. (`XOZL` skips the transform.)
+
+Codec (window consts 0x801/0xffff0000 @blob 0x10c04c/50) — byte tokens, T = stream byte, B = next
+byte(s); `T & 3` inline literal bytes trail EVERY token:
+
+| token T | meaning |
+|---|---|
+| first: `T>0x11` | literal run of `T-0xE` bytes |
+| first: `1≤T≤0xF` / `T==0` | literal run `T+6` / escape `0xFF·zeros + B + 0x15` |
+| `T≥0x40` | near match: off = `((T>>2)&7)·1 + 8B + 1`, len = `(T>>5)+4` |
+| `0x20..0x3F` | off = `(B>>2)+1` (off<3 ⇒ 1/2/3-byte RLE pattern fill), len = `(T&0x1F)+5`, `T&0x1F==0` ⇒ escape `0xFF·zeros+B+0x24` |
+| `0x10..0x1F` | FAR match: off = `(((T&8)<<13) \| u16)>>2`, `0` ⇒ end marker; src = `out − 0x4000 − off` (reaches previous sections), len = `(T&7)+5`, escape `+0xC` |
+| `T<0x10` | 2-byte match: off = `(T>>2) + 4B + 1` |
+
+Verified: PROCDLSAVER.OUT + all 5 ISO `nor0/processes/*.out` + PROCNAV.OUT decode to EXACT header
+`usize`, all valid ARM ELFs. Tool: `src/elf_decompressor/uli_unpack.py <in> <out> --triton <triton_mid.bin>`
+(emulates the monitor codec verbatim under Unicorn; `pip install unicorn`). PROCNAV decodes to a
+19 MB ARM ELF EXEC (entry 0x5ea418, .text 8.6 MB, full .dynsym 1.9 MB) — imported to Ghidra as
+`/tmp_re2/PROCNAV_dec.out` (94 450 functions, dynamic symbols resolved).
+
+**Engine anatomy (from PROCNAV .dynsym):** the search lives in the `rc_*` namespaces —
+`rc_rif_tclRouteInterface` (RPC: `s32SetEntryPointsAndUpdateRoute_*`), `rc_calc_tclCALCULATIONWORK`
+(the workhorse: `vCreateCalcTables` builds FIVE per-glue-area tables — `tagRS_REFERENCETAB`,
+`tagRS_RESISTANCETAB`, `tagRS_ROUTETAB`, `tagRS_MULTIWAVETAB`, `tagRS_UPLINKTAB`;
+`vInitOptimizeWaveFront` seeds the frontier; **`vOptimize` @0x608acc is the main wavefront loop**;
+`u32CalculateResistanceToEntryPoint`, `u32GetResistanceOfEntryPointToDestination`), cost/policy
+helpers `rc_calc_*` (`rc_calc_bResistanceDescriptionIsBetter` = the relaxation compare,
+`rc_calc_u32CalculateROSAValue`/`CombineROSAValues` = toll/time penalty combine,
+`tagZEROCELLELEMENT::bTurnIsProhibited`, `tagONECELLELEMENT::bIsRestrictedOrBlocked`), graph
+assembly `rc_gcl_*`/`rs_*` (glue clusters, neighbours, root clusters), result assembly
+`rc_rlist_*`, cell lookup `cid_FindOneCellToCoordinate`/`cid_SearchThroughClusters`.
+`vOptimize` iterates the MULTIWAVE frontier queue; for each wave entry it walks the OC's route
+edges, computes candidate cost = prev + resistance matrix value (`tagRS_RESISTANCETAB::
+pu16GetResistanceMatrix`, `u32DecodeZCResistanceEth`) + ROSA penalty + prohibition/avoidance
+penalties (encoded in the high bits of the 32-bit cost: 0x4000000/0x8000000 restriction flags,
+`+4/+0x10/+0x3f` class penalties), relaxes into ROUTETAB elements, marks processed with bit
+0x8000000 — i.e. **Dijkstra label-correcting over the ONE-CELL (OC) graph with an explicit
+wavefront table**, seeded bidirectionally (from/to), over the glue-area cluster neighbourhood.
 
 ## 2. Data-side pipeline the search relies on (fully decoded)
 
@@ -162,31 +206,14 @@ server-side handler bodies live in PROCNAV, see §7.]
 
 ## 4. Open questions / next steps (ordered)
 
-1. **Unpack `PROCNAV.OUT`**: analyze the ULI container. Findings 2026-09-18: `procsds.out`
-   (imported+analyzed, 39 777 functions) hosts the DNL package reader `SDS_tclDataPackage` —
-   `GetPackageFormat` @0x006b87b4 (V1/V2/V3), `GetFileEntryV1/2/3` @0x006b8584/@0x006b8344/@0x006b8078,
-   `s32ExtractFileToBuffer` @0x006b89d8, `s32ReadFileIntoBuffer` @0x006b7f90 (only the `UNC `
-   uncompressed marker `0x20434e55` is handled there; V1 entries are tagged with the `ULI ` marker
-   `0x20494c55`, literal pool @0x006b8b78 — `s32ExtractFileToBuffer` V1 branch passes the `ULI ` tag
-   straight into that UNC-only reader, so the SDS path INDEXES ULI entries but CANNOT expand them).
-   ULI header on PROCNAV: `{ "ULI ", u32 0, u32 1, u32 2, u32 0, u32 0x24 hdrsize,
-   u32 unpacked=0x120b974, u32 packed=0x91f348 }`, payload @0x24.
-   **Codec located 2026-09-18 (firmware ISO pass):** `container.iso.bin` (DNL installer ISO, full
-   filesystem unpacked to `/tmp/rnwwork/dnl/`) → `nor0/processes/` stages `PROCNAV.OUT` in the SAME
-   ULI form; the only code on the whole firmware+card that knows `XOZL`/`ULI` is the **triton
-   dual-OS monitor** (`triton_dualos.bin.uimage`, raw ARM blob, extracted at
-   `/tmp/rnwwork/triton.bin`): format checker @`0x108814` (`cmp` vs `"XOZL"`/`"ULI "` literals
-   @0x108838/0x10883c), installer/reader loop @`0x108844`, header-parse wrappers @`0x10857c`/
-   `0x108620`/`0x1086c4` (format codes 0/2/4) selecting three unpack primitives @`0xde5cc`,
-   `0xdd4ec`, `0x109070`; `0x109070` delegates to `0x10d66c/0x10d85c/0x10daf4/0x10d88c` with an
-   LSB bit-reader/bitter set of helpers @`0x109230-0x1092f0` → the codec is a BITSTREAM coder,
-   not byte-escape LZSS (a classic-LZSS brute force over 4k parameter sets against the small
-   `PROCDLSAVER.OUT` XOZL oracle — unpacked=0xf5e4 raw ELF — found no hit). `PROCDLSAVER.OUT`
-   (XOZL, same 0x24-byte header, payload with near-literal ELF prefix) is the small oracle for
-   further codec work. Options: (a) continue RE of the triton bitstream codec (medium-heavy);
-   (b) once car access returns, look for an already-expanded PROCNAV on the live head unit
-   (`find / -name 'PROCNAV*'`, /tmp, /dev/shm, /opt/bosch/processes) and/or trace the DNL install
-   flow with the existing rootshell tooling.
+1. ~~**Unpack `PROCNAV.OUT`**~~ **DONE 2026-09-19** — codec found (triton monitor `0x10bd90`,
+   byte-token LZ, see §1.4), full container spec + `src/elf_decompressor/uli_unpack.py` verified on 7 files
+   (all decode to exact header size, all valid ARM ELFs). PROCNAV now in Ghidra
+   (`/tmp_re2/PROCNAV_dec.out`, 94 450 functions, .dynsym names live). Historical notes kept
+   below — the earlier "bitstream coder @0x109070" theory was WRONG (those are region pool
+   allocators; the SVC #4-#12 handler table at blob 0x555c0 is PC-card window I/O used by the
+   installer's verification path, not the codec).
+   `procsds.out` (`UNC `-only SDS reader) remains the on-target package INDEXER only.
 2. On-device `routeprobe` capture (car access pending): confirms PROCNAV launch + file-open order
    (root clusters → ci chain) during a real Kraków calculation.
 3. `trRegionInfo` registry record width/field map inside `NAV_ROOT` `@a` table (partially read:
@@ -194,4 +221,82 @@ server-side handler bodies live in PROCNAV, see §7.]
 4. Annotation types beyond 0x2b/0x2c/0x3e (0x3, 0x11, 0x16, 0x39, 0x41, 0x4d, 0x4e, 0x55, 0x56,
    0x60, 0x7c, 0x89, 0x8a seen on POL) — semantics unknown, skipped by the runtime reader, so
    likely optional for our output.
-5. `AEX` auxiliary cluster data — optional (`bRNWLoadAexData` unset path), unexplored.
+ 5. `AEX` auxiliary cluster data — optional (`bRNWLoadAexData` unset path), unexplored.
+
+## 5. Engine internals (PROCNAV_dec.out, 2026-09-19)
+
+Container-unpacked PROCNAV now RE'd at symbol level (Ghidra `/tmp_re2/PROCNAV_dec.out`).
+
+**Data model.** The RNW network is loaded through `dap_rnw_if_tclLoader` as before (§2), but the
+calculator flattens the working glue-area (set of participating clusters, `tagRSGLUEAREADESC`)
+into five scratch tables built per calculation by `rc_calc_tclCALCULATIONWORK::vCreateCalcTables`
+@0x0060737c (all indexed by **cluster index within the glue area**):
+
+* `tagRS_REFERENCETAB` — cluster→local index + per-cluster OC reference list (`prGetRefTabOCElement`).
+* `tagRS_RESISTANCETAB` — per (cluster, one-cell-direction) **resistance matrix**:
+  `pu16GetResistanceMatrix(clusterElem, resistanceDesc)` → u16 row; row index = cobounding-OC
+  slot; `u32DecodeZCResistanceEth(ocPair, idx)` decodes a traversal cost; `0xFFFF` = prohibited.
+* `tagRS_ROUTETAB` — the LABEL table: element = {word0 packed `(OC & 0x3ff) | cluster<<10 | ...`,
+  +4 from-direction record, +0x10 to-direction record} — each direction record carries
+  {cost (24-bit), wave number, prev-wave link, flags bit 0x40000 = has-wave, 0x8000000 = settled}.
+* `tagRS_MULTIWAVETAB` — the FRONTIER RING: 20-byte elements `prGetMultiWaveTabElement(u16)`
+  (1-based, ≤ count@+8), `iu16Add` pushes a {props, cost} copy and returns its index; ring wraps
+  at 0x3FFF entries.
+* `tagRS_UPLINKTAB` + `rc_calc_trVGSTACK` — the current-wave generation stack (per side;
+  `rc_calc_trVGSTACKSET::vSwitch` swaps FROM/TO generations).
+
+**Cost encoding.** A cost is a u32: `cost&0xFFFFFF` = accumulated resistance (saturating add in
+`rc_calc_u32CombineROSAValues` @0x004441d8), byte3 = penalty/priority bitfield
+(`rc_calc_u32SetROSAPriority` @0x00444136: `|= 0x1000000<<prio & 0xff000000`); combination ORs
+the bytes and saturates the 24-bit sum. Penalty sources folded in: `rc_calc_u32CalculateROSAValue`
+(toll/"ROSA"), `rc_calc_u32CalculateAvoidResistance` (avoid list), complex-intersection U-turn
+(`u32GetCmplxUTurnResistance`, ×0x390), turn/vehicle/load/road-condition prohibitions
+(`bTurnIsProhibited`, `bIsRestrictedOrBlocked` → bits 0x4000000/0x8000000), street-class
+penalties (+4/+0x10/+0x3f buckets from `rc_calc_trRouteCriteria`).
+
+**Search flow.**
+1. `rc_rif_tclRouteInterface::s32SetEntryPointsAndUpdateRoute_E` (RPC) → build glue area
+   (`rc_gcl_*`: touch/overlap/bridge cluster neighbourhoods, §2.4 ci-walk + area outlines).
+2. `vCreateCalcTables` per glue area; `vInitOptimizeWaveFront` @0x0060874c seeds BOTH sides:
+   iterates the interface one-cell set, resolves the cluster's local index, stamps the OC's
+   ROUTETAB direction record (cost from the entry property, wave number, bit 0x20000), pushes
+   the OC onto the side's VGSTACK (`prGetNewEntry`; destination side additionally floods complex
+   intersections `vAddComplexPathesToMWTabAndInOCsToVGStack`); then `vSwitch`.
+3. `vOptimize` @0x00608acc = the loop: pop wave entry from the frontier (ROUTETAB records marked
+   0x8000000 chain through MULTIWAVE elements), for the entry OC enumerate cobounding OCs (via
+   zero-cell lists / complex-intersection member lists), compute candidate cost
+   (`pu16GetResistanceMatrix` row + `bUpdateResistanceValues` + penalties), and
+   **relax (`rc_calc_bResistanceDescriptionIsBetter` @0x0044441c) into the neighbour's ROUTETAB
+   direction record, push its MULTIWAVE index (iu16Add) and set 0x8000000 = settled** — i.e.
+   two-ended Dijkstra on the OC adjacency graph with wave number = iteration stamp; terminates
+   when FROM and TO waves settle the same OC/edge (or status 0x22800xxx timeout/overflow).
+4. Route assembly: prev-wave chain → `rc_rlist_*` route list (`prInitRawRouteList`,
+   `rs_GetDownClOfRoute`, `rc_rlist_vPackRoutelist`), travel-time/distances via
+   `rc_master_s32GetTravelTimeDelta`, annotations re-evaluated by `rc_rdb_*`
+   (bEvaluateLimitation etc. against `rc_calc_trRouteCriteria`).
+
+Implication for `osm2rnw` (§3): the engine reads exactly the §2 surface, but the cost model
+above demands one addition for realistic travel times: the **BuiltUpLen annotation (0x19,
+`{u32 fwd, u32 bwd}` m)** on OCs inside settlements (OSM: split way at `place` polygon boundary;
+stock DEU has ~40 per 1 MB of RNW) — without it every OC is priced with the open-road speed
+table. 0x2f FreewayLen appears to be absent from stock RNW (class-flag fallback). Also stressed:
+ci-chain completeness (glue-area neighbour discovery) and OC cobounding zero-cell lists (wave
+expansion). The trial-card probe should watch PROCNAV (now unpackable and analyzable) instead of
+guessing.
+
+**Per-OC resistance model (`tclClExConverter::vCalcDrivingResistance` @0x00632808).** An ONE-CELL
+record is 40 bytes: `+0x14` flags {road class bits 0..2, class<<8 road-type in 0xf00, bit
+0x400000/0x40000000 = urban/freeway applicability}, `+0x24` = length (m). The OC is split into
+at most three PARTIAL segments — built-up length (`prGetBuiltUpLengthAnnotation`), freeway length
+(`prGetFreewayLengthAnnotation`), remainder — each priced by `vCalcPartlyDrivingResistance` with
+the active 8×3 speed-table profile (`tclSpeedTabIdentifier.type=2`; ECO/user profile switches the
+table via criteria +0x9c; live TMC/CSD block `tagCSDBlock` participates) plus a `rc_tclUserSpeed
+FuelValues` fuel accumulator; results are then scaled by road-type multipliers (×1.3/×1.5 at
+0x100/0x300/0x400, ×10 at 0x700/0xa00 classes). Three accumulators come out {time, alt-time,
+fuel}; `rc_calc_u32CalculateResistanceCombination(criteria, t1, t2, fuel)` folds them into the
+single 24-bit cost, then `tagRS_RESISTANCETAB::vCreateOnecellResistance/vCreateZerocellResistance
+` bake per-OC and per-transition (turn) costs into the RESISTANCETAB matrices (u16 × 2^scale,
+0xFFFF = prohibited), with MOC (`moc_tclClientInterface` = live traffic) delay manipulation
+(`vManipulateOnecellResistanceOnBorder/InsideGluearea`). Transition side:
+`u32GetTransitionResistance` adds turn/direction costs from ZEROCELLELEMENT (turn-prohibition,
+complex-intersection lane matrices).
