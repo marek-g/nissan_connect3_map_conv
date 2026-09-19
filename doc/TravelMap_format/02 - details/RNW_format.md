@@ -410,19 +410,129 @@ is a flag**, code = `type & 0x7fff`:
 **Routing-cost payload layouts (decoded):**
 - **DistanceMatrix (0x02):** `{u8 rows, u8 cols, u8[rows*cols]}` — raw distance matrix, memcpy'd verbatim.
 - **GenTimeDist (0x17):** `{u16 shift, u16 v0..v3}`; each stored metric = `vi << shift` (4 values, one scale).
-- **RealLength (0x1b):** `{s16}` — signed metres.
-- **BuiltUpLen (0x19) / FreewayLen (0x2f):** `{u32 fwd, u32 bwd}` metres — consumed by the ROUTING
-  process only (`tagONECELLELEMENT::prGetBuiltUpLengthAnnotation` @0x004e9e42,
+- **RealLength (0x1b):** `{s16}` — signed metres (rare; real-metre override of the `x` length).
+- **BuiltUpLen (0x19) / FreewayLen (0x2f):** `{u32 fwd, u32 bwd}` in **half length-units** — the same
+  2⁸-PAU unit as the `x` stored length but at ×2 fixed-point (half-unit granularity), so
+  `metres = value/2 × 2.3886`; hard bound: `built ≤ 0.875 × len` on every stock OC (rules out
+  half-metres) — consumed by the ROUTING process only (`tagONECELLELEMENT::prGetBuiltUpLengthAnnotation` @0x004e9e42,
   `...FreewayLength...` @0x004e9e5c on PROCNAV's in-memory CLEX; the DAPIAPP display loader above
   has no case for them and skips them as `Unknown`). Used by `vCalcDrivingResistance` to split an
-  OC into urban/freeway/other partial segments with different speed tables (routing_algorithm.md §5).
+  OC into urban/freeway/other partial segments with different speed tables (routing_algorithm.md §4).
   0x19 confirmed ON-DISK in cluster onecell annotlists (DEU: 197 frames in 4.7 MB NAV32642.DAT,
-  e.g. `0c 00 19 00 39 000000 39 000000` = 57 m both dirs); 0x2f frames NOT found in stock RNW
+  e.g. `0c 00 19 00 39 000000 39 000000` = `0x39` 57 half-units both dirs ≈ 68 m under the ×2 model);
+  0x2f frames NOT found in stock RNW
   DEU files — freeway length is presumably carried via AEX export or derived at runtime from the
   OC class flags (`onecell +0x1c` bit 0x200 / `+0x14` bit 0x40000000 fallback paths).
 
 > Note: this is the **NAV cluster** annotation system. The separate **AEX "extern annotation"** files (§13)
-> are a different on-disk format with their own type-code space and are parsed client-side, *not* by this reader.
+> are a different on-disk format with their own type-code space and are parsed client-side, *not* by this
+> reader. The table above is the **onecell (road)** annotation vocabulary as the DAPIAPP display loader sees
+> it; **zerocell (node)** annotations use a partially different code set that the display loader skips and
+> PROCNAV routing consumes — see §8c.
+
+### 8c. Zerocell (node) annotations — junction turn-cost matrices (decoded 2026-09-19)
+
+The same `{u16 size, u16 type & 0x7fff}` frame list also backs **zerocells** (at the zerocell
+descriptor-stream bit 0 `{off,cnt}`, exactly like the onecell bit 0). But the node annotation type
+space is **different** from the OC set of §8a, and the DAPIAPP display loader has **no case** for
+them — they are `bSkipBuffer`'d there and consumed **only by PROCNAV routing** (turn/manoeuvre costs
+baked into the `RESISTANCETAB`). Ground-truth census over stock DEU+POL (42 178 clusters, 13.5 M
+zerocells, 4.26 M carrying an AnnotList, 7.53 M node annotations):
+
+| type | count | size | routing (CLEX) | meaning |
+|------|------:|------|:--:|---------|
+| 0x0f | 3 429 285 | 10/16/22 | ✔ | junction matrix (zce offset field) |
+| 0x01 | 2 206 462 | 14/24/38 | ✔ | junction matrix |
+| 0x77 | 1 021 571 | 8 | ✔ | **turn-prohibition quad-matrix** (`prGetProhibQuadMatrixAnnotation`→`GetAnnotation(0x77)`@0x3626d8; `vSetZCInternalStatus` sets `zce+0x18` bit0) |
+| 0x21 |   328 199 | 8 | ✗ | display/border — NOT in routing table |
+| 0x31 |   201 309 | 6 | ✗ | **border/crossing marker** (`bBordersObjectAtTo/From` §5) — display, not a matrix |
+| 0x82 |   228 330 | 16/22 | ✔ | junction matrix |
+| 0x02 |    58 257 | 16/22 | ✔ | junction matrix (shared code w/ OC distance §8a) |
+| 0x32 |    50 768 | 10 | ✗ | display/border — NOT in routing table |
+| 0x42 |     6 801 | 12/18 | ✗ | display — NOT in routing table |
+| 0x8d |        50 | 12 | ✔ | **toll-booth cost** (`prGetTollBoothCostRelAnnotation`→`GetAnnotation(0x8d)`@0x44b5d4; `zce+0x18` bit2) |
+
+**The routing-relevant node annotation set is pinned exactly** by the global CLEX type table
+`tagANNOTATION_TYPES @0x1216a20` (read by `rc_tcl_ClusterAnnotationReader::vReadAnnotations`
+@0x391a54), which holds **8 codes**: `{0x01, 0x02, 0x0f, 0x82, 0x77, 0x79, 0x7a, 0x8d}`. Types not in
+this set (the 0x21/0x31/0x32/0x42 above, plus 0x19/0x1b/0x3c/…) are **never copied into the routing
+CLEX** — they are the display/border annotations (read by DAPIAPP or the `bBordersObjectAtTo/From`
+test). Of the 8: `0x77`+`0x8d` set `zce+0x18` status bits via `vSetZCInternalStatus` @0x391074; the
+4 matrix codes `{0x01,0x02,0x0f,0x82}` are appended to the CLEX pool by `u32AddAnnotationToClEx` and
+reached via the `zce[0]/[2]/[6]/[0xe]` offset fields; `0x79`/`0x7a` are copied but rare/absent on
+stock DEU+POL nodes.
+
+Node annotations are read by `tagZEROCELLELEMENT` accessors that index a **degree² matrix** where the
+junction degree `N = u16@(zce+0x12)` (= incident-road count): cell = `(fromIdx−1)·N + (toIdx−1)`
+(`iu16GetMatrixIndex` @0x348298). Values carry a shared 1-byte **shift** and a `0xff`/`0xffff`
+**sentinel** = "no turn". Accessors: `u32GetTimeValue` @0x348320 (from `zce+0`),
+`u32GetDistanceValue` @0x34836c (from `zce+6`), `iu16GetInstructionIndex` @0x3483c4 (from `zce+2`),
+`rGetGeneralizedInstruction` @0x3483fe (from `zce+0xe`), `prGetComplexIntersection` @0x44b5ae,
+`bTurnIsProhibited` @0x44b4c0. The turn cost is consumed by `vCreateZerocellResistance` @0x640d7c /
+`vCreateObjectMatrixColumnEntry` @0x640624 → `vGetManoeuvrePenalty` @0x4d4c28, which subtracts the
+OC's `anGenTimeDist` (OC annot **0x17** §8a) base/max before applying the node's per-turn delta.
+
+> **OPEN (exact 1:1 among the 4 matrices):** the codes `{0x01,0x02,0x0f,0x82}` correspond to the four
+> matrix offset fields `{time, instruction, distance, generalized-instruction}` (read by the accessors
+> above), but the precise **type↔field** bijection is not a literal switch — `vCopyAnnotation`
+> @0x391922 appends every matched annotation generically and the per-type field assignment lives in
+> the `ClusterAnnotationReader` runtime-built index (no decompilable literal), so it was not isolated
+> here. Only 0x77 (prohibition) and 0x8d (toll) are type-confirmed.
+>
+> **Writer note (`osm2rnw`):** the generator emits **no node annotations** today, so PROCNAV prices
+> every junction turn as free (turn/turn-cost + manoeuvre features unavailable) — acceptable for a
+> minimal single-region route. To emit them: per junction build the degree² matrix under a routing
+> code in the table above (exact code + shift/sentinel encoding still to pin).
+
+### 8b. Global header annotations (NAV_ROOT.DAT) — the routing country tables
+
+
+
+`rnw_tclFileHeader`-level annotations live in the **NAV_ROOT.DAT header**: at +0x10 a
+ListDesc `{u16 annOff, u16 cnt}` points at a frame stream (same {u16 size, u16 type} frames
+as §8a) — `nav_tclFileHeader::bRead` skips them, so §8a does not list them. The ROUTING
+loader (`dap_rnw_if_tclLoader::s32LoadRootHeader` + `rnw_GetAnnotation(type, root, root+0x10)`)
+consumes them; they are per-country and **required** (`vLoadSpeedTables` fails with
+0x21800111/12 when missing — routing cannot start):
+
+| code | name (loader)            | payload                                                     |
+|------|--------------------------|-------------------------------------------------------------|
+| 0x16 | SpeedFactors             | `{u16 cnt, [entry]{u16 countryId, u16 avgSpeed[8rc][3seg]}}` |
+| 0x39 | SpeedLimits              | `{u16 cnt, [entry]{u16 countryId, u16 limit[8rc][3seg]}}`    |
+| 0x55 | StatusTable              | road-state table (`vDetermineOnecellResistanceWithAllTMData`) |
+| 0x2b | InstMat                  | instruction matrices (+0x56 secondary)                       |
+| 0x41 | CatTranslate             | category→string table with self-referential string offsets   |
+
+`seg` column = {0 urban, 1 open road, 2 freeway} — the SAME 3-way split the onecell 0x19
+BuiltUpLen annotation drives (§8a, routing_algorithm.md §4). Values are km/h u16; the driving
+time = `len*0x895 / speed` (`vCalcPartlyDrivingResistance` @0x006323e4; `tagCSDBlock::rfrGetSpeedTab`
+hands out the per-country 8×3 tab; user ECO profile or `rfrGetSpeedTabShortRes` replaces it).
+countryId is Bosch-internal: **POL 0x41EC, DEU 0x10B5** (the 0x41EC seen in MAP road-info state).
+
+Verified stock payloads (POL/DEU NAV_ROOT.DAT):
+
+```
+SpeedFactors (avg achievable speeds):
+  rc0  PL {100,110,110}   DE {100,130,130}
+  rc1  PL { 50, 80,100}   DE { 50, 80,105}
+  rc2  PL { 40, 70, 90}   DE { 40, 70, 95}
+  rc3  PL { 30, 50, 90}   DE { 30, 50, 95}
+  rc4  PL { 20, 40, 90}   DE { 20, 40, 95}
+  rc5  PL { 13, 25, 25}   DE { 13, 25, 25}
+  rc6/7 PL {  5, 10, 10}  DE {  5, 10, 10}
+SpeedLimits (legal; 386 = "no limit" sentinel):
+  rc0  PL {140,140,140}   DE {386,386,386}
+  rc1-7  PL {50,90,90}    DE {50,100,386}
+```
+
+The `anSpeedFactors` in-memory entry expands each u16 pair to the 0x6c `tagCSDBlock`
+{Time/FastRes/Fuel/GreenRes/Trailer 8×3 u8 tabs} (`tclRouteCountryInfo::vLoadSpeedTables`
+@0x006309bc; trailer cap 0x50/80 km/h, green cap 0x6e/110 km/h).
+
+> For a SELF-BUILT region's NAV_ROOT.DAT these globals must be emitted (copying the stock
+> POL frame is valid for Poland); the merge-based `diag/merge_nav_root.py` carries them over
+> from the stock root automatically. A NAV_ROOT without 0x16/0x39 makes the calculator
+> return 0x21800111 ("speed factor annot missing") and every route request fails.
 
 ## 9. Extraction + join pipeline
 
@@ -510,17 +620,20 @@ byte-exact write layout is inferred from the reader + data. A region is three th
 - **`NAV_ROOT.DAT`** = per-region ROOT index + metadata (**FULLY DECODED 2026-09-18** from the
   device's own *writer*, `rnw_tclNavRootKnitter` — `bCreateHeader` @0x008812ec, `u16Knit`
   @0x008848f8 — and its readers). Layout:
-  - header record, `u32@0x00` = header-record size (0x2000-ish on card, 0x34 in the factory
-    template): `{u32 hdrSize, u32 totalFileSize, u16 authorStrOff, u16 tableOff}` (the two u16s
-    at @8/@a are patched by `u16UpdateHeaderRecord` @0x00881b98; `u32@4` = whole-file size —
-    CHECKED DEU/POL: `u32@4 == filesize`);
+  - header record, `u32@0x00` = header-record size (0x194c..0x4c74 on card, 0x34 in the factory
+    template): `{u32 hdrSize, u32 totalFileSize, u16 authorStrOff, u16 tableOff}` — the two u16s at
+    @8/@a are patched by `rnw_tclNavRootKnitter::u16UpdateHeaderRecord` @0x00881b98; `u32@4` = whole-file
+    size (CHECKED all 17 regions: `u32@4 == filesize`). **@8 `authorStrOff` = build-string region
+    START, @a `tableOff` = build-string region END (terminator) — NOT a registry table** (see the
+    trRegionInfo note below);
   - at `0x0c` a `rnw_tclListDesc<nav_tclClusterInfo>` **root-cluster list descriptor**
     `{u16 payloadOff, u16 count}` (`bRead` @0x0089030c; read via `u16InterpreteHeader`
     @0x00891e4c after skipping 12 bytes), then a second descriptor for the
     **annotation list** `{u16 payloadOff, u16 count}`;
   - at `authorStrOff` the build-string region (`/mill/...databases//00001.wrk/bin/nav_root.dat`,
     `Copyright …`, version, compass-sector/country strings — the "NAV00001 = 00001.wrk" origin),
-    at `tableOff` a u16/u32 registry table ending 0x11 bytes before the root-cluster payload;
+    terminated at `tableOff`; the ≤0x11 slack between `tableOff` and the root-cluster payload is
+    padding the knitter reserves and the loader ignores;
   - at root-list `payloadOff`: `count` × the **same 24-byte `nav_tclClusterInfo` records** as the
     ci-adjacency lists (`nav_tclClusterInfo::bRead` @0x008910cc; stream stride 24, in-memory
     stride 0x34) — the region's **root (gateway) clusters**, addressed exactly like a TCI ref
@@ -555,9 +668,26 @@ byte-exact write layout is inferred from the reader + data. A region is three th
    **Generated-region workflow: `diag/merge_nav_root.py`** — appends our clusters as root records
    (refs/outline read from the generated NAV header), shifts the annotation chain and the records'
    shapeOffsets, patches both sizes; the global-area/instruction records after the header record are
-   byte-identical across stock regions and are copied through untouched. `diag/rnwcheck.py`
-   re-parses `NAV_ROOT.DAT` (desc → record/shape chain → annots) and hard-fails under `--generated`.
-- **TCI** is a set of *tiles*; each tile carries `#primcl` (primary-cluster count), `#cl`
+    byte-identical across stock regions and are copied through untouched. `diag/rnwcheck.py`
+    re-parses `NAV_ROOT.DAT` (desc → record/shape chain → annots) and hard-fails under `--generated`.
+  - **Region registry / trRegionInfo — RESOLVED (2026-09-19).** The per-region `NAV_ROOT.DAT` carries
+    **no** region-registry table: `authorStrOff`→`tableOff` is only the opaque build-provenance blob, and
+    the runtime interpreter `rnw_tclGlobalDatasetData::u16InterpreteHeader` @0x00891e4c skips the 12-byte
+    fixed header and reads *only* the root-cluster list + annotation list — it never seeks to `tableOff`.
+    Verified across all 17 regions: `tableOff == rootPayloadOff − 0x11` (registry span = 0 bytes; IBE −2
+    from 16-byte alignment). The authoritative region registry (regionIdent ↔ root-count/size/files) is the
+    separate **`DATA/DATA/MISC/CONTENT.DAT`** — a plain fixed-width **0x34-byte `trRegionInfo`** table
+    (fully decoded, field map in routing_algorithm.md §3.1; all 17 idents match `region_ident.tsv`, root
+    counts sum to the 52 gateway clusters of the global `CONNECT/RNW/NAV_ROOT.DAT`). The global
+    `CONNECT/RNW/NAV_ROOT.DAT` holds the 52 gateway root-refs + the 17 `DATASET{…}` build-provenance lines;
+    its binary `[tableOff,rootOff)` block is a high-entropy `TPNAV2`-magic signed manifest, **not** the
+    region table. **Consequence for the generator:** a native per-region `NAV_ROOT.DAT` needs NO registry
+    table (set `tableOff = rootPayloadOff − 0x11`, empty) and no registry edit **as long as the region
+    reuses an already-registered `regionIdent`** (our POL = `0x402`, already present in `CONTENT.DAT` +
+    the global root table). Onboarding a genuinely NEW market region means appending one plain 0x34-byte
+    `trRegionInfo` record to `CONTENT.DAT` (+ its root refs) — now decodable, but deferred (not needed for
+    the POL-reuse trial).
+ - **TCI** is a set of *tiles*; each tile carries `#primcl` (primary-cluster count), `#cl`
   (cluster count) and a list of **8-byte cluster entries**:
   ```
   +0x00  u32  fileOffset     offset of the cluster within its NAV file
@@ -631,12 +761,33 @@ by reader**), the Outline (`refLon/refLat/shift/?/ooff/ocnt` + points), then `li
   **ignored** by the reader → a writer emits any 4 bytes (e.g. `0,0`) when the bit is set.
   In POL data only bits 0,1,2,3,4,5,8,10 are ever set; 6,7,9 never appear.
 - **Onecell** = `{u32 hdr, u32 x, u16 listFlags, u16 offf}`; the `x` u32 is the **stored road
-  length** — `u32GetLength` @0x00913c7c returns `x & 0xffffff` (low 24 bits; units not yet pinned).
+  length** — `u32GetLength` @0x00913c7c returns `x & 0xffffff` (low 24 bits). **Unit pinned
+  2026-09-19 to 2⁸ PAU ≈ 2.3886 m** (`256·180·111320/2³¹`) via the `rnw2osm --routetest`
+  per-edge stored-vs-geodesic ratio: p50 = 1.00 on stock DEU (Munich + Hamburg), p10/p90 = 0.89/1.09.
+  Rare signed real-metre override lives in annot `0x1b` RealLength (`s16`, m) — only 1–2 OCs per
+  ~120-OC stock route carry it, so `x` is the effective length source the engine prices with.
   The onecell's *own* listFlags: bit 1 = shape points
   (type-2 rel8), bit 5 = shape points (type-3/4 absolute) — mutually exclusive; then upcells /
   downcells / overlaps. In-memory size 0x30 B (`ListDesc<Onecell>::bRead` @0x008904a8).
-- **Zerocell** = `{u16 f1, u16 listFlags, u16 offz}`; `f1` is a node type/flags field (values
-  `0`/`1` common, occasional `0x22xx`) — not fully mapped (§5).
+- **Zerocell** = `{u16 f1, u16 listFlags, u16 offz}`; `f1` (u16@0) → in-mem `+0x24` (stored **raw** by
+  `rnw_tclZerocellInternal::bRead` @0x00894734 — the display path does not decompose it). `listFlags` is
+  `0x2` (DCR only) or `0x3` (AnnotList+DCR) for ~99.9 % of nodes. `f1` **low** byte = rare flags
+  (bit1 rim `0x2`, bit4 cpx `0x10`, both `0x12`). `f1` **high** byte = a junction *category* that
+  empirically implies both the incident-road degree and whether turn matrices are stored (DEU+POL
+  ground-truth, `f1hi → degree`, `f1hi → % with AnnotList`):
+
+  | f1 high | degree | % with turn AnnotList | reads as |
+  |---------|--------|----------------------|----------|
+  | `0x00` | 2–6 (varies) | **99 %** | managed junction — carries turn-cost matrices (the bulk of §8c) |
+  | `0x01` | 1 | 0 % | dead-end / dangling endpoint |
+  | `0x02` | 2 | 14 % | simple bend (mostly no turn data) |
+  | `0x03`–`0x08` | 3 | ~0 % | unmanaged 3-way (no per-turn cost stored) |
+  | `0x0b/0x0e/0x16/0x21/0x26/0x32` | 4 | ~1 % | unmanaged 4-way / crossroad |
+
+  The exact enum sub-classification (`0x03`–`0x08`, and the high-bit codes → deg4) has **no consumer
+  found** — the only named bit-readers are rim(bit1)/cpx(bit4) (the `0xc000` LISA `bIsZeroCell*`
+  accessors test a different cell-control word, not this field); the high byte is an authoring-time
+  category. Write `0` (managed) for a junction with turn data, else the degN category; see §8c.
 
 #### Onecell header word (`hdr`, u32) — full attribute bit map
 
@@ -681,7 +832,8 @@ when set.
   a road's identity is its **index in the cluster's onecell list** — every up/down/overlap reference
   points to a road by that index (the converter emits it as `rnw_oncell_index`, and the raw length
   as `rn_length`).
-- **Zerocell `f1`:** node type/flags, partially understood; write `0` for simple nodes.
+- **Zerocell `f1`:** junction class byte (high) + rare rim/cpx flags (low) — see §5; write `0` for a
+  plain node. Node AnnotList turn matrices: §8c (PROCNAV-only; generator emits none → free turns).
 - **`u16PatchCluster` post-load step:** does two things — (a) resolves cross-cluster references by
   position, and (b) applies any `CONNECT` `.PTH` patch to the cluster (base + delta merge; see
   [`PTH_overview.md`](../01%20-%20overview/PTH_overview.md)). For a minimal file: keep all geometry in

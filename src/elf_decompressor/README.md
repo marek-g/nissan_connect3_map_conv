@@ -16,7 +16,7 @@ post-processes every output byte with `b -> ~(b ^ 1)`; the tool applies this
 transform automatically based on the container magic.
 
 The full codec grammar and container header spec are in
-`doc/TravelMap_format/routing_algorithm.md` §1.4.
+`doc/TravelMap_format/routing_algorithm.md` §2.
 
 ## Requirements
 
@@ -60,4 +60,4 @@ exact header size and yield valid ARM ELFs.
 - `decompressed size N != header usize M` — wrong `--triton` blob or corrupt
   input.
 - `emulation faulted` — codec routine diverged; report the printed PC
-  (monitor blob offsets are documented in routing_algorithm.md §1.4).
+  (monitor blob offsets are documented in routing_algorithm.md §2).

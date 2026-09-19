@@ -580,10 +580,32 @@ fn read_names(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<Vec<String>> {
     names
 }
 
+// RealLength (0x1b) {i32} signed real length in metres (RNW_format.md §8a) — the OC's
+// authoritative metric length where present (the raw stored `length` field's units are
+// unpinned; --routetest prefers this annotation). Returns None when absent / nonpositive.
+fn read_real_len(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<u32> {
+    let mut q = ann_off;
+    for _ in 0..ann_cnt as usize {
+        if q + 8 > cd.len() {
+            break;
+        }
+        let size = u16le(cd, q) as usize;
+        let typ = u16le(cd, q + 2);
+        if size < 4 || size > 64 {
+            break;
+        }
+        if typ == 0x1b {
+            let v = i32::from_le_bytes([cd[q + 4], cd[q + 5], cd[q + 6], cd[q + 7]]);
+            return if v != 0 { Some(v.unsigned_abs()) } else { None };
+        }
+        q += size;
+    }
+    None
+}
+
 // BuiltUpLen (0x19) {u32 fwd, u32 bwd} metres — the engine's urban-speed split input
 // (RNW_format.md §8a; PROCNAV tclClExConverter::vCalcDrivingResistance).
-fn read_builtup(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<(u32, u32)> {
-    let mut q = ann_off;
+fn read_builtup(cd: &[u8], ann_off: usize, ann_cnt: u16) -> Option<(u32, u32)> {    let mut q = ann_off;
     for _ in 0..ann_cnt as usize {
         if q + 12 > cd.len() {
             break;
@@ -661,6 +683,7 @@ struct Road {
     name: Option<Vec<String>>,
     hdr: u32, // raw onecell header word: class fields + all attribute bits (decoded at emission)
     length: u32, // stored road length (onecell x field, low 24 bits; source's own units)
+    rl: u32,     // annot 0x1b RealLength metres (0 = annotation absent) — authoritative when set
     built: (u32, u32), // annot 0x19 BuiltUpLen metres {fwd,bwd}; (0,0) = no annotation
     overlaps: Vec<Overlap>,
 }
@@ -1034,9 +1057,11 @@ fn parse_cluster(
 
         let mut names = None;
         let mut built = (0u32, 0u32);
+        let mut rl = 0u32;
         if ann_cnt != 0 {
             names = read_names(cd, ann_off, ann_cnt);
             built = read_builtup(cd, ann_off, ann_cnt).unwrap_or((0, 0));
+            rl = read_real_len(cd, ann_off, ann_cnt).unwrap_or(0);
         }
         roads[k] = Some(Road {
             pts: Some(res),
@@ -1044,6 +1069,7 @@ fn parse_cluster(
             name: names,
             hdr,
             length: oclen,
+            rl,
             built,
             overlaps,
         });
@@ -1190,6 +1216,403 @@ fn push_unique(v: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBu
 // main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// --routetest: offline wavefront replay (routing_algorithm.md §4)
+// ---------------------------------------------------------------------------
+
+// Global annotation stream of NAV_ROOT.DAT (ListDesc {u16 off, u16 cnt} at file +0x10,
+// frames {u16 size, u16 type} — RNW_format.md §8b). Returns the 0x16 SpeedFactors tab
+// (achievable km/h, [road class 0..7][segment {urban, open, freeway}]) for `want`'s Bosch
+// country id, or the sole entry when `want` is None.
+fn read_speed_factors(path: &str, want: Option<u16>) -> Option<[[u16; 3]; 8]> {
+    let d = fs::read(path).ok()?;
+    if d.len() < 0x14 {
+        return None;
+    }
+    let mut p = u16le(&d, 0x10) as usize;
+    let cnt = u16le(&d, 0x12) as usize;
+    for _ in 0..cnt {
+        if p + 4 > d.len() {
+            return None;
+        }
+        let size = u16le(&d, p) as usize;
+        let typ = u16le(&d, p + 2);
+        if size < 4 || p + size > d.len() {
+            return None;
+        }
+        if typ == 0x16 {
+            let q = p + 4;
+            if q + 2 > d.len() {
+                return None;
+            }
+            let n = u16le(&d, q) as usize;
+            let mut found: Option<[[u16; 3]; 8]> = None;
+            let mut hits = 0usize;
+            for e in 0..n {
+                let base = q + 2 + e * 50;
+                if base + 50 > d.len() {
+                    break;
+                }
+                let id = u16le(&d, base);
+                if want.is_some_and(|w| w != id) {
+                    continue;
+                }
+                hits += 1;
+                let mut tab = [[0u16; 3]; 8];
+                for rc in 0..8 {
+                    for seg in 0..3 {
+                        tab[rc][seg] = u16le(&d, base + 2 + (rc * 3 + seg) * 2);
+                    }
+                }
+                found = Some(tab);
+            }
+            if hits == 1 {
+                return found;
+            }
+            if hits == 0 {
+                eprintln!(
+                    "--routetest: 0x16 frame in {} has no entry for country 0x{:04X}",
+                    path,
+                    want.unwrap_or(0)
+                );
+            } else {
+                eprintln!("--routetest: {} entries match in {} — pass --country", hits, path);
+            }
+            return None;
+        }
+        p += size;
+    }
+    eprintln!("--routetest: no global 0x16 SpeedFactors frame in {} (engine would fail 0x21800111)", path);
+    None
+}
+
+#[derive(Clone)]
+struct RtEdge {
+    to: u32,
+    cost: u64,
+    len: u32,
+    built: u32,
+    fw: u32,
+    rc: u32,
+    secs: f64,
+    geo: f64, // polyline length of pts in metres (independent check against the stored length)
+    rl_src: bool, // edge length came from annot 0x1b (else raw stored field)
+    raw: u32,     // raw stored length field (diagnostics)
+}
+
+// One engine-faithful-enough OC cost (routing_algorithm.md §4 "Per-OC resistance model"):
+// split the length into built-up (annot 0x19) / freeway (hdr bit 30) / open parts, price
+// each as len*0x895/speed on the 0x16 tab, sum. METRE SOURCES (calibrated 2026-09-19):
+// annot 0x1b RealLength (metres) when present, else the raw stored field — whose unit is
+// 2^8 PAU ≈ 2.3886 m (raw/geometry ratio measured 0.419 in DEU Munich AND Hamburg,
+// latitude-independent; 256 PAU * 111320/deg / (2^31/180) = 2.3886). Built-up (0x19) is
+// documented "OC length ×2" (RNW_format.md §8a): half-metres until individually calibrated.
+// Returns {engine ticks, wall seconds} for the OC.
+const LEN_UNIT_M: f64 = 256.0 * 111320.0 / (1i64 << 31) as f64 * 180.0;
+
+fn rt_oc_cost(r: &Road, tab: &[[u16; 3]; 8]) -> (u64, f64) {
+    let rc = (r.hdr & 7) as usize;
+    let len = if r.rl > 0 {
+        r.rl as f64
+    } else {
+        r.length as f64 * LEN_UNIT_M
+    };
+    if len < 1.0 {
+        return (1, 0.0);
+    }
+    let urban = ((r.built.0 as f64 / 2.0) * LEN_UNIT_M).min(len);
+    let fw = if (r.hdr >> 30) & 1 != 0 { len - urban } else { 0.0 };
+    let rest = len - urban - fw;
+    let s = |seg: usize| tab[rc][seg].max(1) as f64;
+    let ticks = urban * 0x895 as f64 / s(0) + fw * 0x895 as f64 / s(2) + rest * 0x895 as f64 / s(1) + 3.0;
+    let secs = (urban / s(0) + fw / s(2) + rest / s(1)) * 3.6;
+    (ticks as u64, secs)
+}
+
+fn rt_node_of(
+    nodes: &mut Vec<(i64, i64)>,
+    grid: &mut HashMap<(i64, i64), Vec<u32>>,
+    sp: i64,
+    snap: i64,
+    x: i64,
+    y: i64,
+) -> u32 {
+    let cell = (x.div_euclid(sp), y.div_euclid(sp));
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if let Some(v) = grid.get(&(cell.0 + dx, cell.1 + dy)) {
+                for &id in v {
+                    let (nx, ny) = nodes[id as usize];
+                    if (nx - x).abs().max((ny - y).abs()) <= snap {
+                        return id;
+                    }
+                }
+            }
+        }
+    }
+    let id = nodes.len() as u32;
+    nodes.push((x, y));
+    grid.entry(cell).or_default().push(id);
+    id
+}
+
+fn run_routetest(
+    all: &[(String, ClusterData)],
+    origin_idx: &HashMap<(i64, i64), Vec<usize>>,
+    want_fine: bool,
+    snap_pau: i64,
+    spec: &str,
+    root: Option<&str>,
+    country: Option<u16>,
+) -> ! {
+    let Some(root) = root else {
+        eprintln!("--routetest requires --root <NAV_ROOT.DAT> (the 0x16/0x39 speed tables live there)");
+        exit(1);
+    };
+    let Some(tab) = read_speed_factors(root, country) else { exit(1) };
+    let (a, b) = spec.split_once(':').unwrap_or_else(|| {
+        eprintln!("invalid --routetest '{}' (expected lon1,lat1:lon2,lat2)", spec);
+        exit(1);
+    });
+    let pt = |s: &str| -> (i64, i64) {
+        let (x, y) = s.split_once(',').unwrap_or_else(|| {
+            eprintln!("invalid --routetest point '{}'", s);
+            exit(1);
+        });
+        let d = |v: &str| -> i64 {
+            v.trim()
+                .parse::<f64>()
+                .unwrap_or_else(|_| {
+                    eprintln!("invalid --routetest coordinate '{}'", v);
+                    exit(1);
+                })
+                .mul_add(PAU, 0.0)
+                .round() as i64
+        };
+        (d(x), d(y))
+    };
+    let (qlon0, qlat0) = pt(a);
+    let (qlon1, qlat1) = pt(b);
+
+    // Junction nodes are positional (RNW has no global node id): merge endpoints across
+    // clusters within `snap_pau`, grid-search like OsmBuilder does for output.
+    let mut nodes: Vec<(i64, i64)> = Vec::new();
+    let mut grid: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+    let sp = snap_pau.max(1);
+    let mut pending: Vec<(u32, u32, RtEdge, RtEdge)> = Vec::new();
+    let mut n_edges = 0usize;
+    let mut n_noshape = 0usize;
+    let mut n_refined = 0usize;
+    for (_, c) in all.iter() {
+        for (oi, r) in c.roads.iter().enumerate().filter_map(|(i, ro)| ro.as_ref().map(|r| (i, r))) {
+            // Same coarse-vs-fine de-duplication the OSM emission applies (u16BreakDownNextOC):
+            // a coarse OC whose complete fine breakdown is loaded is a placeholder — pricing it
+            // directly would give the wavefront free super-edges over unsplittable coarse links.
+            if want_fine {
+                let dl = &c.down[oi];
+                if !dl.is_empty()
+                    && dl.iter().all(|o| {
+                        c.ci1.get(o.cli as usize).and_then(|n| {
+                            origin_idx.get(&(n.lon, n.lat)).and_then(|v| v.first()).map(|&ti| {
+                                all[ti].1.roads.get(o.cell as usize).is_some_and(|rr| rr.is_some())
+                            })
+                        }) == Some(true)
+                    })
+                {
+                    n_refined += 1;
+                    continue;
+                }
+            }
+            let Some(pts) = &r.pts else {
+                n_noshape += 1;
+                continue;
+            };
+            if pts.len() < 2 {
+                continue;
+            }
+            let (x0, y0) = pts[0];
+            let (x1, y1) = pts[pts.len() - 1];
+            let u = rt_node_of(&mut nodes, &mut grid, sp, snap_pau, x0, y0);
+            let v = rt_node_of(&mut nodes, &mut grid, sp, snap_pau, x1, y1);
+            if u == v {
+                continue;
+            }
+            let (cost, secs) = rt_oc_cost(r, &tab);
+            let len_m = if r.rl > 0 { r.rl as f64 } else { r.length as f64 * LEN_UNIT_M };
+            let built_m = (r.built.0 as f64 / 2.0).min(len_m);
+            let mut geo = 0f64;
+            for w in pts.windows(2) {
+                let dx = (w[1].0 - w[0].0) as f64 / PAU * 111320.0
+                    * ((w[0].1 as f64 / PAU).to_radians().cos()).max(0.05);
+                let dy = (w[1].1 - w[0].1) as f64 / PAU * 111320.0;
+                geo += (dx * dx + dy * dy).sqrt();
+            }
+            let mk = |to: u32| RtEdge {
+                to,
+                cost,
+                len: len_m.round() as u32,
+                built: built_m.round() as u32,
+                fw: if (r.hdr >> 30) & 1 != 0 {
+                    (len_m - built_m).round() as u32
+                } else {
+                    0
+                },
+                rc: (r.hdr & 7) as u32,
+                secs,
+                geo,
+                rl_src: r.rl > 0,
+                raw: r.length,
+            };
+            pending.push((u, v, mk(v), mk(u)));
+            n_edges += 1;
+        }
+    }
+    let mut adj: Vec<Vec<RtEdge>> = vec![Vec::new(); nodes.len()];
+    for (u, v, uv, vu) in pending {
+        adj[u as usize].push(uv);
+        adj[v as usize].push(vu);
+    }
+
+    let nearest = |qlon: i64, qlat: i64| -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for (i, &(x, y)) in nodes.iter().enumerate() {
+            let d = ((x - qlon) as i128 * (x - qlon) as i128 + (y - qlat) as i128 * (y - qlat) as i128) as u64;
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, i as u32));
+            }
+        }
+        best.map(|(_, i)| i)
+    };
+    let Some(src) = nearest(qlon0, qlat0) else {
+        eprintln!("--routetest: graph is empty");
+        exit(1);
+    };
+    let dst = nearest(qlon1, qlat1).unwrap();
+
+    // Dijkstra (the engine's wavefront with the generation pruning switched off).
+    let inf = u64::MAX;
+    let mut dist = vec![inf; nodes.len()];
+    let mut prev: Vec<(u32, u32)> = vec![(u32::MAX, u32::MAX); nodes.len()]; // (node, edge idx)
+    let mut pq: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>> = std::collections::BinaryHeap::new();
+    dist[src as usize] = 0;
+    pq.push(std::cmp::Reverse((0, src)));
+    while let Some(std::cmp::Reverse((d, u))) = pq.pop() {
+        if d > dist[u as usize] {
+            continue;
+        }
+        if u == dst {
+            break;
+        }
+        for (ei, e) in adj[u as usize].iter().enumerate() {
+            let nd = d + e.cost;
+            if nd < dist[e.to as usize] {
+                dist[e.to as usize] = nd;
+                prev[e.to as usize] = (u, ei as u32);
+                pq.push(std::cmp::Reverse((nd, e.to)));
+            }
+        }
+    }
+
+    println!(
+        "--routetest: {} junctions, {} OCs ({} shape-less, {} refined-dropped), snap {} PAU; speed tab from {} (rc0 = {:?})",
+        nodes.len(), n_edges, n_noshape, n_refined, snap_pau, root, tab[0]
+    );
+    if dist[dst as usize] == inf {
+        // Component probe: which side of the seam is missing.
+        let comp = |s: u32| -> usize {
+            let mut seen = vec![false; nodes.len()];
+            let mut st = vec![s];
+            seen[s as usize] = true;
+            let mut n = 0;
+            while let Some(u) = st.pop() {
+                n += 1;
+                for e in adj[u as usize].iter() {
+                    if !seen[e.to as usize] {
+                        seen[e.to as usize] = true;
+                        st.push(e.to);
+                    }
+                }
+            }
+            n
+        };
+        println!(
+            "NO ROUTE (the engine's wavefront would exhaust here): comp(from)={} nodes, comp(to)={} nodes of {}",
+            comp(src),
+            comp(dst),
+            nodes.len()
+        );
+        exit(2);
+    }
+    let mut path: Vec<u32> = Vec::new();
+    let mut cur = dst;
+    let mut len = 0u64;
+    let mut secs = 0f64;
+    let mut built_m = 0u64;
+    let mut fw_m = 0u64;
+    let mut geo_m = 0f64;
+    let mut raw_m = 0u64;
+    let mut n_rl = 0u64;
+    let mut ratios: Vec<f64> = Vec::new();
+    let mut hist: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    while cur != src {
+        path.push(cur);
+        let (p, ei) = prev[cur as usize];
+        if p == u32::MAX {
+            eprintln!("--routetest: broken parent chain (internal error)");
+            exit(1);
+        }
+        let e = &adj[p as usize][ei as usize];
+        len += e.len as u64;
+        secs += e.secs;
+        built_m += e.built as u64;
+        fw_m += e.fw as u64;
+        geo_m += e.geo;
+        raw_m += e.raw as u64;
+        if e.geo > 1.0 {
+            ratios.push(e.len as f64 / e.geo);
+        }
+        if e.rl_src {
+            n_rl += 1;
+        }
+        *hist.entry(e.rc).or_default() += 1;
+        cur = p;
+    }
+    path.push(src);
+    path.reverse();
+    let hist_s: Vec<String> = hist.iter().map(|(rc, n)| format!("rc{}={}", rc, n)).collect();
+    println!(
+        "route found: {} junctions, cost {} engine-ticks, stored {:.0} m vs geometry {:.0} m, ETA {:.0} s ({:.1} min), built-up {:.0} m ({:.1} %), freeway {:.0} m",
+        path.len(),
+        dist[dst as usize],
+        len,
+        geo_m,
+        secs,
+        secs / 60.0,
+        built_m,
+        if len > 0 { built_m as f64 * 100.0 / len as f64 } else { 0.0 },
+        fw_m
+    );
+    println!("  class histogram: {}", hist_s.join(" "));
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if !ratios.is_empty() {
+        let q = |p: f64| ratios[((ratios.len() as f64 - 1.0) * p).round() as usize];
+        println!(
+            "  metre-vs-geometry per-edge ratio p10={:.2} p50={:.2} p90={:.2} (≈1.0 confirms the 2^8-PAU unit model)",
+            q(0.10), q(0.50), q(0.90)
+        );
+    }
+    println!(
+        "  length-source probe: path used {} edges, priced length sum {} m (raw field sum {} in 2^8-PAU units, {} edges had annot 0x1b), geometry sum {:.0} m, len/geo ratio {:.2}",
+        path.len() - 1,
+        len,
+        raw_m,
+        n_rl,
+        geo_m,
+        if geo_m > 0.0 { len as f64 / geo_m } else { 0.0 }
+    );
+    exit(0);
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut bbox_spec = "-30,30,60,75".to_string(); // whole EUR dataset (as rnw_extract)
@@ -1201,6 +1624,9 @@ fn main() {
     let mut only_secondary = false; // --secondary: emit only the secondary LOD layer; default emits only primary
     let mut dump_cid: Option<u16> = None; // --dump N: print cluster N's down-cell structure and exit
     let mut count_box_spec: Option<String> = None; // --countbox W,S,E,N: count in-box roads across parsed clusters, then exit
+    let mut route_spec: Option<String> = None; // --routetest lon1,lat1:lon2,lat2: offline wavefront replay, then exit
+    let mut root_path: Option<String> = None; // --root PATH: NAV_ROOT.DAT supplying the 0x16 speed table for --routetest
+    let mut country_id: Option<u16> = None; // --country HEX: Bosch country id inside the 0x16 table (default: sole entry)
     let mut level: u32 = 1; // --level N: 0 = coarse tier only, 1 (default) = include the finer tier
     let mut inputs: Vec<String> = Vec::new();
 
@@ -1240,6 +1666,21 @@ fn main() {
             }
             "--countbox" if i + 1 < args.len() => {
                 count_box_spec = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--routetest" if i + 1 < args.len() => {
+                route_spec = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--root" if i + 1 < args.len() => {
+                root_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--country" if i + 1 < args.len() => {
+                country_id = Some(u16::from_str_radix(args[i + 1].trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                    eprintln!("invalid --country '{}'", args[i + 1]);
+                    exit(1);
+                }));
                 i += 2;
             }
             "--level" if i + 1 < args.len() => {
@@ -1493,6 +1934,10 @@ fn main() {
         );
         let _ = di;
         return;
+    }
+
+    if let Some(spec) = route_spec {
+        run_routetest(&all, &origin_idx, want_fine, snap_pau, &spec, root_path.as_deref(), country_id);
     }
 
     // Phase B: emit every road + outline, recording each onecell's endpoint node
@@ -1896,6 +2341,9 @@ fn usage() {
                                the coarser representation in isolation; not a usable map on its own.\n\
               Diagnostics:\n\
                  --dump CID     print one cluster's neighbour/down-cell structure and exit\n\
-                 --countbox W,S,E,N   count roads falling in a box across parsed clusters (by class) and exit\n"
+                 --countbox W,S,E,N   count roads falling in a box across parsed clusters (by class) and exit\n\
+                 --routetest lon1,lat1:lon2,lat2  offline engine replay (Dijkstra with the §8b cost model) and exit;\n\
+                 --root NAV_ROOT.DAT  supplies the global 0x16 SpeedFactors table for --routetest\n\
+                 --country HEX        Bosch country id inside the 0x16 table (e.g. 41EC = POL)\n"
     );
 }

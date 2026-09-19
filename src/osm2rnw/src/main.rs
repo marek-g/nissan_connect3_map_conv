@@ -668,6 +668,7 @@ fn main() {
 
     // Built-up length per segment (annot 0x19): full length when both endpoints are inside
     // a settlement ring (onecells here are straight a->b, so no partial clipping applies).
+    // Stored in the x2 fixed-point of the raw length unit (see LEN_RAW_UNIT_M).
     let seg_built: Vec<u32> = segs
         .iter()
         .map(|s| {
@@ -675,7 +676,7 @@ fn main() {
                 && pt_in_any(gnodes[s.a as usize], &rings)
                 && pt_in_any(gnodes[s.b as usize], &rings)
             {
-                seg_len(&gnodes, s) as u32
+                (seg_len(&gnodes, s) / LEN_RAW_UNIT_M * 2.0).round() as u32
             } else {
                 0
             }
@@ -1078,7 +1079,7 @@ struct ClusterBlob {
     // ci2 overlap links (filled by build_overlaps; serialized as cluster bit3 + onecell bit4).
     ci2: Vec<usize>,                            // neighbour cluster indices, in ci2-slot order
     oc_ovl: Vec<Vec<(u16, u16, usize)>>,        // per onecell: (ci2_index, nbr onecell local, nbr cluster)
-    oc_built: Vec<u32>,                         // per onecell: built-up length m (annot 0x19; 0 = none)
+    oc_built: Vec<u32>,                         // per onecell: built-up len, 2x raw-units (annot 0x19; 0 = none)
 }
 
 fn build_blobs(
@@ -1377,7 +1378,8 @@ fn serialize(
         if s.attr.oneway > 0 { hdr |= 1 << 20; } else if s.attr.oneway < 0 { hdr |= 1 << 21; }
         if s.attr.freeway { hdr |= 1 << 30; }
         put_u32(&mut b, p, hdr);
-        put_u32(&mut b, p + 4, (seg_len(gnodes, s) as u32) & 0x00FF_FFFF);
+        let raw_len = (seg_len(gnodes, s) / LEN_RAW_UNIT_M).round().max(1.0) as u32;
+        put_u32(&mut b, p + 4, raw_len & 0x00FF_FFFF);
         let mut lfo: u16 = 0;
         if has_name[oi] || has_built[oi] {
             lfo |= 1;
@@ -1433,10 +1435,18 @@ fn serialize(
 fn seg_len(g: &[(i64, i64)], s: &Seg) -> f64 {
     let (x0, y0) = g[s.a as usize];
     let (x1, y1) = g[s.b as usize];
-    let dx = (x1 - x0) as f64 * 180.0 / (1i64 << 31) as f64 * 111320.0;
-    let dy = (y1 - y0) as f64 * 180.0 / (1i64 << 31) as f64 * 111320.0 * (y0 as f64 / PAU).to_radians().cos();
+    // x = longitude (cosine on the dx axis), y = latitude — calibrated 2026-09-19 against
+    // the rnw2osm --routetest per-edge length/geometry ratio (was on the wrong axis before).
+    let dx = (x1 - x0) as f64 * 180.0 / (1i64 << 31) as f64 * 111320.0 * (y0 as f64 / PAU).to_radians().cos();
+    let dy = (y1 - y0) as f64 * 180.0 / (1i64 << 31) as f64 * 111320.0;
     (dx * dx + dy * dy).sqrt().max(1.0)
 }
+
+// Stock onecell storedLength unit = 2^8 PAU = 2.3886 m (calibrated 2026-09-19: DEU stock raw
+// length / true geometry = 0.419 constant at Munich AND Hamburg latitude; see rnw2osm
+// --routetest). Annotation 0x19 shares the unit in x2 fixed-point (stock builtup/length
+// ratio <= 0.875 rules out half-metres).
+const LEN_RAW_UNIT_M: f64 = 256.0 * 111320.0 * 180.0 / (1i64 << 31) as f64;
 
 fn write_nav(
     blobs: &[ClusterBlob],
