@@ -518,7 +518,8 @@ Node annotations are read by `tagZEROCELLELEMENT` accessors that index a **degre
 junction degree `N = u16@(zce+0x12)` (= incident-road count): cell = `(fromIdx−1)·N + (toIdx−1)`
 (`iu16GetMatrixIndex` @0x348298). Each matrix = `{shift header, N² cells}` — u8 cells + a shift for
 time/distance/gen-instr, u16 cells + a 2-byte shift for instruction — value = `cell << shift`, with a
-`0xff`/`0xffff` **sentinel** = "no turn". Accessors: `u32GetTimeValue` @0x348320 (from `zce+0`),
+`0xff`/`0xffff` **sentinel** = "no turn" (what the shift header actually holds on disk: RESOLVED
+below — for `0x0f` it is the degree byte `N` itself, not an independent scale). Accessors: `u32GetTimeValue` @0x348320 (from `zce+0`),
 `u32GetDistanceValue` @0x34836c (from `zce+6`), `iu16GetInstructionIndex` @0x3483c4 (from `zce+2`),
 `rGetGeneralizedInstruction` @0x3483fe (from `zce+0xe`), `prGetComplexIntersection` @0x44b5ae,
 `bTurnIsProhibited` @0x44b4c0. The turn cost is consumed by `vCreateZerocellResistance` @0x640d7c /
@@ -629,8 +630,11 @@ rnw_join    RNW.jsonl MAP_L2.osm OUT.osm # OSM XML in and out; ~10 s for N6E2 L2
 `-b` sets the geographic sanity filter (degrees) for the 16KB-aligned cluster scan.
 Default `-30,30,60,75` covers the whole EUR dataset (Iceland..Turkey, Morocco..N.
 Scandinavia). The old hardcoded N6E2 box silently dropped ~88% of clusters (141k of
-161k); with the default box the full dataset yields **22.3M roads** (~71 s, I/O bound)
-vs 1.83M before. `none` disables the filter and is for diagnostics only — without it,
+161k); with the default box the full dataset yields **36.5M roads** (8,257 files,
+36,502,506 roads / 18,666,334 named / 36,462,296 with geometry; 14 GB JSONL, ~1.5 h,
+I/O bound — 2026-09-20 re-extract with BOTH tier planes, §2a; the previous 22.3M figure
+was the coarse-plane-only number, itself vs 1.83M under the old hardcoded N6E2 box).
+`none` disables the filter and is for diagnostics only — without it,
 padding/continuation blocks that pass the structural checks are accepted and emit
 garbage multi-kilobyte shape lists (the ref lon/lat is what normally rejects them).
 
@@ -647,18 +651,24 @@ with from/to chosen by DCR bit 15 (§5). A prior build tested the always-zero bi
 so `from_node` was never assigned and ~218k relative-shape roads emitted as a single
 point. After the fix (POL): single-point/empty roads **219,342 → 597** (−99.7 %),
 roads with usable geometry in the join index **462k → 681k**, and the named-road MAP
-cross-check improved **94.6 % → 96.7 %**. The remaining 597 have neither endpoint node
+cross-check improved **94.6 % → 96.7 %** (POL, coarse-plane corpus — see the Results
+block below for the both-planes numbers). The remaining 597 have neither endpoint node
 in the local cluster and are dropped from the join index (`pts.len() >= 2`).
 
-Results on N6E2 L2 (70,504 MAP road ways):
-- 1,830,749 RNW roads extracted from 8,257 files; 703,145 named (38%).
-- **6,844 previously-unnamed MAP roads gained names**. All matched roads also get
+Results on N6E2 L2 (70,504 MAP road ways) — re-run 2026-09-20 on the BOTH-planes corpus:
+- 36,502,506 RNW roads extracted from 8,257 files (36,462,296 with usable geometry).
+  (Old coarse-plane-only run: 1,830,749 roads.)
+- **21,586 previously-unnamed MAP roads gained names** (was 6,844 on the coarse-only
+  corpus — the dense plane supplies the local street names). All matched roads also get
   the RNW class attributes (`rn_class/rn_netclass/rn_roadtype/rn_link/rn_sec/
-  rn_freeway`) and a derived OSM `highway=*` tag (see §6a).
-- Named-road cross-check: 12,031/13,795 (87%) component names agree with the
-  existing MAP name. Disagreements are concentrated in Budapest
-  embankments/bridges where parallel named sections lie <30 m apart
-  (genuinely ambiguous), plus sparse-RNW areas (HU/UA).
+  rn_freeway`) and a derived OSM `highway=*` tag (see §6a); 53,151 matched ways carry
+  `highway` now.
+- Named-road cross-check (STRICT case-folded exact string on matched named ways):
+  **15,918/20,699 (76.9 %)** — the strict metric under-counts (accents/abbrev/alias
+  variants count as disagreement); the comparison base roughly doubled vs the coarse
+  run (12,031/13,795 = 87 % there), the new disagreements are mostly parallel named
+  sections (embankments/bridges, dual-carriageway frontages) that are genuinely
+  ambiguous at the 30 m join radius, plus sparse-RNW border areas.
 - Join method: a RNW road is a *component* of a MAP road when both its
   endpoints lie ≤30 m on the MAP polyline and ≥80 % of its points are
   ≤30 m from it; names/attributes are combined over all components.
