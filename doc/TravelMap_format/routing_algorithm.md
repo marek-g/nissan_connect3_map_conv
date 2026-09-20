@@ -316,8 +316,9 @@ side: `u32GetTransitionResistance` adds turn/direction costs from ZEROCELLELEMEN
 (turn-prohibition, complex-intersection lane matrices) — these come from the **zerocell node
 annotations** (`tagZEROCELLELEMENT::u32GetTimeValue`/`u32GetDistanceValue`/`prGetProhibQuadMatrix`
 0x77/`prGetComplexIntersection`), a degree² per-junction matrix; on-disk format + PROCNAV-only
-consumption in RNW_format.md §8c (the DAPIAPP display loader skips them; `osm2rnw` emits none →
-PROCNAV prices all turns free).
+consumption in RNW_format.md §8c (the DAPIAPP display loader skips them). `osm2rnw` now emits a
+full `0x0f` time matrix on every junction (deflection-bucket cells, stock angle modes — §8c
+RESOLVED block), so generated regions price turns from 2026-09-20 (trial 26).
 
 **Where the speed tabs come from (`tclRouteCountryInfo::vLoadSpeedTables` @0x006309bc).** The
 8×3 tabs are NOT compiled in — they are **global header annotations of `NAV_ROOT.DAT`** (§3.2):
@@ -354,6 +355,19 @@ no-limit) per Bosch country id (POL 0x41EC, DEU 0x10B5), plus **0x55 StatusTable
 9. What stresses the search most: ci-chain completeness (glue-area neighbour discovery) and OC
    cobounding zero-cell lists (wave expansion) — §4 steps 1/3 fail silently to "no route" when
    either is broken.
+10. **Cluster tiers are an optimization, not a requirement** (census + RE 2026-09-19,
+    RNW_format.md §2a): stock ships a dense leaf plane (tier word `0x0000`/`0x0008`) plus a
+    sparse top plane (`0x0001`, 1–2 % of OCs, ~10× area, `ci1` = child clusters, down-cell
+    refs). The engine joins them via upcell refs (`rnw_bIsUpLink` @0x34b7ce = hdr bit13+
+    desc bit2; CLEX ancestor `NAncestor::Init` @0x33bac2), materializes uplink edges in
+    `tagRS_UPLINKTAB::vBuild` @0x641d20, expands parents for flag-bit-0 clusters only
+    (`rs_GetParentNbrCl` @0x411f22), and refines top-plane routes downward
+    (`rs_GetDownClOfRoute` @0x412f5a). The `vOptimize` wavefront itself stays flat over the
+    glue area, so an `osm2rnw` single-plane region is routing-complete; a top plane only
+    shrinks the glue area (and the top plane is where turn annotations are 100 %). Region
+    ROOT clusters across all 17 stock regions carry tier word `0x0023`/`0x00a3`
+    (bit0|bit1|bit5 + optional PTH bit7) — `merge_nav_root.py` applies that signature to
+    generated roots.
 
 ## 6. Open questions / next steps (ordered)
 

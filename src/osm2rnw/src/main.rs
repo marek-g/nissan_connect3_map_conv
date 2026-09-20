@@ -111,14 +111,24 @@ impl Network {
 }
 
 // Way/relation tags that mark a settlement (built-up) area polygon.
+// OSM carries almost no real settlement polygons for PL (boundary=place there is
+// ethnographic boundary LINES); stock POL ships 0x19 on ~5 % of OCs (census 2026-09), so the
+// practical built-up proxy is the built-up landuse classes, mapped 1:1 onto the urban-area cost.
+fn is_settlement_landuse(tags: &HashMap<String, String>) -> bool {
+    matches!(tags.get("landuse").map(String::as_str),
+             Some("residential") | Some("commercial") | Some("industrial") | Some("retail"))
+}
 fn is_place_area(tags: &HashMap<String, String>) -> bool {
     if tags.contains_key("place") {
         return true;
     }
-    tags.get("boundary").map(|b| b == "place").unwrap_or(false)
+    if tags.get("boundary").map(|b| b == "place").unwrap_or(false) {
+        return true;
+    }
+    is_settlement_landuse(tags)
 }
 fn is_boundaryish(tags: &HashMap<String, String>) -> bool {
-    tags.contains_key("boundary") || tags.contains_key("place")
+    tags.contains_key("boundary") || tags.contains_key("place") || is_settlement_landuse(tags)
 }
 
 fn collect_poly(net: &mut Network, id: i64, ids: Vec<i64>, tags: &HashMap<String, String>) {
@@ -368,9 +378,10 @@ fn str_of(a: &quick_xml::events::attributes::Attribute) -> String {
 // Built-up (settlement) area polygons -> RNW onecell annotation 0x19
 // {u32 fwd, u32 bwd} metres (RNW_format.md §8a; engine consumer
 // tclClExConverter::vCalcDrivingResistance, routing_algorithm.md §5). Rings come from the
-// SAME input file: closed ways tagged place=* / boundary=place, and place-like
-// multipolygon relations assembled from their outer member ways. An onecell is annotated
-// when BOTH endpoints fall inside any ring (builtup length = full onecell length).
+// SAME input file: closed ways tagged place=* / boundary=place / landuse=residential|
+// commercial|industrial|retail, and matching multipolygon relations assembled from their
+// outer member ways. An onecell carries the PARTIAL length inside the rings (stock POL
+// semantics: a trunk OC through a village gets its through-town portion; census 2026-09).
 // ---------------------------------------------------------------------------
 
 // Exact integer even-odd ray cast (PAU coords; x-crossing compared without division).
@@ -403,10 +414,122 @@ fn ring_bbox(r: &[(i64, i64)]) -> (i64, i64, i64, i64) {
     b
 }
 
-fn pt_in_any(p: (i64, i64), rings: &[((i64, i64, i64, i64), Vec<(i64, i64)>)]) -> bool {
-    rings.iter().any(|(bb, r)| {
-        p.0 >= bb.0 && p.0 <= bb.2 && p.1 >= bb.1 && p.1 <= bb.3 && pt_in_ring(p, r)
-    })
+// Built-up length of a straight segment vs. settlement rings, as the stock does it:
+// POL-stock census (2026-09) shows 0x19 = the PARTIAL metre length inside the built-up area
+// (median OC 1,082 m carrying median builtup 221 m), not a both-endpoints-inside flag — so
+// a trunk OC crossing a village gets its through-town portion, and a fully-inside OC gets
+// its full length. Clipping = ring-boundary crossings along the segment (t-parameter),
+// inside-intervals tested at midpoints. Rings are indexed in a uniform PAU grid (cell 2^20
+// PAU ~ 0.088 deg ~ 6 km); the supercovered cells of the segment line form
+// a complete candidate filter (a ring touching the line is registered in a line cell).
+const RING_CELL_SHIFT: u32 = 20;
+
+struct RingIndex {
+    grid: HashMap<(i64, i64), Vec<usize>>,
+}
+
+impl RingIndex {
+    fn new(rings: &[((i64, i64, i64, i64), Vec<(i64, i64)>)]) -> RingIndex {
+        let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, (bb, _)) in rings.iter().enumerate() {
+            for cx in (bb.0 >> RING_CELL_SHIFT)..=(bb.2 >> RING_CELL_SHIFT) {
+                for cy in (bb.1 >> RING_CELL_SHIFT)..=(bb.3 >> RING_CELL_SHIFT) {
+                    grid.entry((cx, cy)).or_default().push(i);
+                }
+            }
+        }
+        RingIndex { grid }
+    }
+
+    // All rings whose bbox can touch segment a-b (supercover cell walk along the line:
+    // a ring touching the line contains a line point, whose cell is registered by the ring
+    // bbox, so the walk is a COMPLETE candidate filter — no ring that clips the segment is
+    // missed; final accept is always the exact inside_fraction).
+    fn query(&self, a: (i64, i64), b: (i64, i64)) -> Vec<usize> {
+        let (mut cx, mut cy) = (a.0 >> RING_CELL_SHIFT, a.1 >> RING_CELL_SHIFT);
+        let (ex, ey) = (b.0 >> RING_CELL_SHIFT, b.1 >> RING_CELL_SHIFT);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut seen_cells: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        let mut visit = |cx: i64, cy: i64, seen: &mut Vec<usize>| {
+            if seen_cells.insert((cx, cy)) {
+                if let Some(v) = self.grid.get(&(cx, cy)) {
+                    seen.extend(v.iter().copied());
+                }
+            }
+        };
+        visit(cx, cy, &mut seen);
+        // t along a->b of the next cell-border crossing per axis (None = axis stationary)
+        let next_t = |c: i64, origin: i64, delta: i64| -> Option<f64> {
+            if delta == 0 {
+                return None;
+            }
+            let border =
+                if delta > 0 { (c + 1) << RING_CELL_SHIFT } else { c << RING_CELL_SHIFT };
+            Some((border - origin) as f64 / delta as f64)
+        };
+        let (mut tx, mut ty) = (next_t(cx, a.0, dx), next_t(cy, a.1, dy));
+        loop {
+            if (cx, cy) == (ex, ey) {
+                break;
+            }
+            let (nx, ny) = (tx.unwrap_or(f64::MAX), ty.unwrap_or(f64::MAX));
+            if nx <= ny {
+                cx += dx.signum();
+                tx = next_t(cx, a.0, dx);
+            } else {
+                cy += dy.signum();
+                ty = next_t(cy, a.1, dy);
+            }
+            visit(cx, cy, &mut seen);
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    }
+}
+
+// Fraction of t in [0,1] of segment a-b lying inside the ring (f64, PAU coords).
+fn inside_fraction(a: (i64, i64), b: (i64, i64), ring: &[(i64, i64)]) -> f64 {
+    let (ax, ay) = (a.0 as f64, a.1 as f64);
+    let (bx, by) = (b.0 as f64, b.1 as f64);
+    let dx = bx - ax;
+    let dy = by - ay;
+    let mut ts = vec![0.0f64, 1.0f64];
+    for k in 0..ring.len() {
+        // ring vertices are stored WITHOUT the repeated closing point: wrap the last edge
+        let w = (ring[k], ring[(k + 1) % ring.len()]);
+        let ((x0, y0), (x1, y1)) = w;
+        let (cx, cy) = (x0 as f64, y0 as f64);
+        let (ddx, ddy) = (x1 as f64 - cx, y1 as f64 - cy);
+        let den = dx * ddy - dy * ddx;
+        if den == 0.0 {
+            continue;
+        }
+        let (ox, oy) = (cx - ax, cy - ay);
+        let t = (ox * ddy - oy * ddx) / den;
+        if t <= 0.0 || t >= 1.0 {
+            continue;
+        }
+        let s = (ox * dy - oy * dx) / den;
+        if s >= 0.0 && s <= 1.0 {
+            ts.push(t);
+        }
+    }
+    ts.sort_by(|p, q| p.partial_cmp(q).unwrap());
+    let mut frac = 0.0;
+    for pair in ts.windows(2) {
+        let (t0, t1) = (pair[0], pair[1]);
+        if t1 - t0 <= 1e-12 {
+            continue;
+        }
+        let tm = (t0 + t1) / 2.0;
+        let p = (ax + dx * tm, ay + dy * tm);
+        if pt_in_ring((p.0 as i64, p.1 as i64), ring) {
+            frac += t1 - t0;
+        }
+    }
+    frac
 }
 
 // Concatenate member-way id-chains of one multipolygon into closed rings (greedy, both ends).
@@ -666,19 +789,30 @@ fn main() {
         exit(1);
     }
 
-    // Built-up length per segment (annot 0x19): full length when both endpoints are inside
-    // a settlement ring (onecells here are straight a->b, so no partial clipping applies).
-    // Stored in the x2 fixed-point of the raw length unit (see LEN_RAW_UNIT_M).
+    // Built-up length per segment (annot 0x19): the PARTIAL length of the straight a->b
+    // inside settlement rings (stock semantics, POL census RNW_format.md §8a). Stored in the
+    // x2 fixed-point of the raw length unit (LEN_RAW_UNIT_M); capped at the stock bound 0.875*x.
+    let ridx = if rings.is_empty() { None } else { Some(RingIndex::new(&rings)) };
     let seg_built: Vec<u32> = segs
         .iter()
         .map(|s| {
-            if !rings.is_empty()
-                && pt_in_any(gnodes[s.a as usize], &rings)
-                && pt_in_any(gnodes[s.b as usize], &rings)
-            {
-                (seg_len(&gnodes, s) / LEN_RAW_UNIT_M * 2.0).round() as u32
-            } else {
-                0
+            let raw = seg_len(&gnodes, s) / LEN_RAW_UNIT_M;
+            match &ridx {
+                Some(ix) => {
+                    let (a, b) = (gnodes[s.a as usize], gnodes[s.b as usize]);
+                    let (bw, bs, be, bn) =
+                        (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+                    let mut frac = 0.0f64;
+                    for &ri in &ix.query(a, b) {
+                        let (rbb, ring) = &rings[ri];
+                        if rbb.2 < bw || rbb.0 > be || rbb.3 < bs || rbb.1 > bn {
+                            continue;
+                        }
+                        frac += inside_fraction(a, b, ring);
+                    }
+                    (2.0 * raw * frac.min(1.0)).min(1.75 * raw).round() as u32
+                }
+                None => 0,
             }
         })
         .collect();
@@ -749,8 +883,8 @@ fn main() {
             "NOTE (car load): clusters are located at runtime via a per-tile `.tci` cluster-index\n\
             \t  under data/data/map/. Pass --tci --map-idx <step1 MAP out> to emit a matching\n\
             \t  `.tci` (tile -> {{u32 (clusterOffset&~0x3fff)|regionIdent, u16 fileId={file_id}, u16 length}}).\n\
-            \t  Cluster header flags byte keeps bit 0x80 CLEAR (osm2rnw flags=0x0001), so stale\n\
-            \t  NAV____n.PTH patches are not applied over the clusters."
+            \t  Cluster header flags word is written 0x0000 (dense leaf tier, bit 0x80 PTH clear),\n\
+            \t  so stale NAV____n.PTH patches are not applied over the clusters."
         );
     }
 }
@@ -1246,13 +1380,76 @@ fn serialize(
         node_dcr[cb.oc_from[oi] as usize].push(((oi + 1) as u16) & 0x3FF);
         node_dcr[cb.oc_to[oi] as usize].push((((oi + 1) as u16) & 0x3FF) | 0x8000);
     }
+    // Turn-cost matrices (node annot 0x0f, RNW_format.md §8c/§5): full frame
+    // {u16 size,u16 type}{u8 N,u8[N*N] cells,u8 default=0x5a,u8 0}. Engine (PROCNAV
+    // u32GetTimeValue @0x348320) adds cell<<N to the edge cost, matrix index =
+    // (from-1)*N+(to-1) resolved by OC number in the DCR list (iu16GetMatrixIndex
+    // @0x348298 masks off the dir bit). Stock leaf-plane cell modes (POL census
+    // 2026-09): {0,3,5,10} straight family, 45/90 angle turns, 150-155 U-turns,
+    // 0xff=no-turn (we never forbid; prohibitions would be type 0x77).
+    let mut node_turn: Vec<Option<Vec<u8>>> = vec![None; zc];
+    {
+        let cos_lat = |ny: i64| ((ny as f64 / PAU).to_radians().cos()).max(0.05);
+        for i in 0..zc {
+            let n = node_dcr[i].len();
+            if n < 2 || n > 16 {
+                continue;
+            }
+            let (nx, ny) = gnodes[cb.local_nodes[i] as usize];
+            let c = cos_lat(ny);
+            let mut arms: Vec<(f64, f64)> = Vec::with_capacity(n);
+            for &w in &node_dcr[i] {
+                let oi = ((w & 0x3FF) - 1) as usize;
+                let far = if cb.oc_from[oi] as usize == i { cb.oc_to[oi] } else { cb.oc_from[oi] };
+                let (fx, fy) = gnodes[cb.local_nodes[far as usize] as usize];
+                arms.push(((fx - nx) as f64 * c, (fy - ny) as f64));
+            }
+            let mut cells = Vec::with_capacity(n * n);
+            for r in 0..n {
+                for k in 0..n {
+                    if r == k {
+                        cells.push(152u8); // U-turn back onto the same onecell
+                        continue;
+                    }
+                    let (ar, br) = arms[r];
+                    let (ak, bk) = arms[k];
+                    let nr = (ar * ar + br * br).sqrt();
+                    let nk = (ak * ak + bk * bk).sqrt();
+                    if nr < 1e-9 || nk < 1e-9 {
+                        cells.push(0u8);
+                        continue;
+                    }
+                    // deflection from the reversed entry arm to the exit arm
+                    let mut cs = (-ar * ak - br * bk) / (nr * nk);
+                    cs = cs.clamp(-1.0, 1.0);
+                    let deg = cs.acos().to_degrees();
+                    cells.push(if deg <= 12.0 { 0 } else if deg <= 30.0 { 3 } else if deg <= 50.0 { 10 } else if deg <= 70.0 { 45 } else if deg <= 110.0 { 90 } else if deg <= 150.0 { 150 } else { 152 });
+                }
+            }
+            let size = (cells.len() + 7) as u16; // 4 hdr + 1 N + N*N + 2 trail
+            let mut fr = Vec::with_capacity(size as usize);
+            fr.extend_from_slice(&size.to_le_bytes());
+            fr.extend_from_slice(&0x000fu16.to_le_bytes());
+            fr.push(n as u8);
+            fr.extend_from_slice(&cells);
+            fr.extend_from_slice(&[0x5a, 0x00]);
+            node_turn[i] = Some(fr);
+        }
+    }
     let mut dcr_desc = vec![0u16; zc];
     let mut dcr_data = vec![0u16; zc];
+    let mut node_ann = vec![0u16; zc];
     for i in 0..zc {
         dcr_desc[i] = var as u16;
-        var += 4;
+        var += if node_turn[i].is_some() { 8 } else { 4 };
         dcr_data[i] = var as u16;
         var += 2 * node_dcr[i].len();
+    }
+    for i in 0..zc {
+        if let Some(fr) = &node_turn[i] {
+            node_ann[i] = var as u16;
+            var += fr.len();
+        }
     }
 
     // ci2 neighbour-cluster records (24 B each): num@u16+4, origin lon/lat @i32+8/+12; the
@@ -1308,7 +1505,11 @@ fn serialize(
     let mut b = vec![0u8; var];
 
     put_u16(&mut b, 0x00, cluster_id.max(1));
-    put_u16(&mut b, 0x02, 0x0001);
+    // Tier word (u16@2): 0x0000 = dense leaf plane (RNW_format.md §2a — the plane half of every
+    // stock region carries; the top 0x0001 plane has ci1/downcells we do not emit). The region
+    // ROOT cluster must present the stock root signature 0x0023 (bit0|bit1|bit5, no PTH bit7);
+    // diag/merge_nav_root.py patches that bit into the referenced cluster when it registers roots.
+    put_u16(&mut b, 0x02, 0x0000);
     put_u32(&mut b, 0x04, 0);
     put_i32(&mut b, 0x08, cb.origin.0 as i32);
     put_i32(&mut b, 0x0c, cb.origin.1 as i32);
@@ -1358,10 +1559,22 @@ fn serialize(
     for i in 0..zc {
         let p = zero_off + i * 6;
         put_u16(&mut b, p, if cb.node_border.get(i).copied().unwrap_or(false) { 0x2 } else { 0 });
-        put_u16(&mut b, p + 2, 0x02);
-        put_u16(&mut b, p + 4, dcr_desc[i]);
-        put_u16(&mut b, dcr_desc[i] as usize, dcr_data[i]);
-        put_u16(&mut b, dcr_desc[i] as usize + 2, node_dcr[i].len() as u16);
+        if let Some(fr) = &node_turn[i] {
+            // AnnotDesc+DcrDesc (lzf bits 0|1), then the 0x0f frame at annOff
+            put_u16(&mut b, p + 2, 0x03);
+            put_u16(&mut b, p + 4, dcr_desc[i]);
+            put_u16(&mut b, dcr_desc[i] as usize, node_ann[i]);
+            put_u16(&mut b, dcr_desc[i] as usize + 2, 1);
+            put_u16(&mut b, dcr_desc[i] as usize + 4, dcr_data[i]);
+            put_u16(&mut b, dcr_desc[i] as usize + 6, node_dcr[i].len() as u16);
+            let a = node_ann[i] as usize;
+            b[a..a + fr.len()].copy_from_slice(fr);
+        } else {
+            put_u16(&mut b, p + 2, 0x02);
+            put_u16(&mut b, p + 4, dcr_desc[i]);
+            put_u16(&mut b, dcr_desc[i] as usize, dcr_data[i]);
+            put_u16(&mut b, dcr_desc[i] as usize + 2, node_dcr[i].len() as u16);
+        }
         for (j, &v) in node_dcr[i].iter().enumerate() {
             put_u16(&mut b, dcr_data[i] as usize + j * 2, v);
         }
@@ -1519,8 +1732,9 @@ fn usage() {
           \t--target-oc    segments/cluster <=1024 (default 700)\n\
           \t--bbox         only roads inside W,S,E,N degrees (default: input extent)\n\
            \t--no-overlaps  skip ci2 overlap links (border markers only; default emits ci2)\n\
-           \tBuilt-up annot 0x19: emitted automatically for onecells whose endpoints lie inside\n\
-           \t\t   settlement polygons (place=* / boundary=place ways or relations) present in the input\n\
+            \tBuilt-up annot 0x19: emitted automatically for onecells whose endpoints lie inside\n\
+            \t\t   built-up polygons in the input: place=* / boundary=place / landuse=\n\
+            \t\t   residential|commercial|industrial|retail closed ways or their multipolygon relations\n\
           \t--tci          also emit the tile->cluster locator <out>/MAP/<shard>.TCI\n\
           \t--map-idx      DIR with the step-1 osm2map <REGION>AA.IDX (source of the region tile grid)\n\
           \t--region-ident override the ref regionIdent (default: derived from --region via baked table)\n\
@@ -1616,13 +1830,96 @@ mod builtup_tests {
     }
 
     #[test]
-    fn assemble_rings_joins_open_member_ways() {
-        // square split into two open ways (shared endpoints 3 and 1)
+    fn inside_fraction_clips_partial_length() {
+        let sq = vec![(0i64, 0i64), (100, 0), (100, 100), (0, 100)];
+        // half of the segment crosses the square
+        let f = inside_fraction((-100, 50), (100, 50), &sq);
+        assert!((f - 0.5).abs() < 1e-9, "got {f}");
+        // fully outside but inside the bbox column (tests the CLOSING edge too)
+        assert!(inside_fraction((-50, 150), (150, 150), &sq) < 1e-6);
+        // fully inside
+        assert!((inside_fraction((10, 50), (90, 50), &sq) - 1.0).abs() < 1e-9);
+        // diagonal crossing two opposite corners: inside length = |inside|/|total|
+        let g = inside_fraction((-100, -100), (200, 200), &sq);
+        assert!((g - (100.0f64 * 2f64.sqrt()) / (300.0f64 * 2f64.sqrt())).abs() < 1e-9, "got {g}");
+    }
+
+    #[test]
+    fn ring_index_finds_all_crossing_rings() {
+        let rings = vec![
+            (ring_bbox(&[(0, 0), (100, 0), (100, 100), (0, 100)]),
+             vec![(0i64, 0i64), (100, 0), (100, 100), (0, 100)]),
+            (ring_bbox(&[(0, 100), (100, 100), (100, 200), (0, 200)]),
+             vec![(0i64, 100), (100, 100), (100, 200), (0, 200)]),
+        ];
+        let ix = RingIndex::new(&rings);
+        // long vertical segment through both squares must find both
+        let cand = ix.query((50, -30_000_000), (50, 30_000_000));
+        assert_eq!(cand, vec![0, 1]);
+        // far-away parallel segment finds nothing
+        assert!(ix.query((30_000_000, -30_000_000), (30_000_000, 30_000_000)).is_empty());
+    }
+
+    #[test]
+    fn assemble_rings_joins_open_member_ways() {        // square split into two open ways (shared endpoints 3 and 1)
         let rings = assemble_rings(vec![vec![1, 2, 3], vec![3, 4, 1]]);
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].first(), rings[0].last());
         assert_eq!(rings[0].len(), 5);
         assert!(assemble_rings(vec![vec![1, 2, 3], vec![7, 8]]).is_empty());
+    }
+
+    #[test]
+    fn serialize_emits_turn_matrix_at_junction() {
+        // hub (node 0) with two arms: east and north -> 90 deg deflection
+        let gnodes = vec![(0i64, 0i64), (30_000, 0), (0, 30_000)];
+        let segs = vec![
+            Seg { a: 0, b: 1, mid: (15_000, 0), attr: Attr::default(), name: None },
+            Seg { a: 0, b: 2, mid: (0, 15_000), attr: Attr::default(), name: None },
+        ];
+        let blobs = build_blobs(&segs, &gnodes, &[vec![0usize, 1usize]], &[0, 0]);
+        let (b, _sites) = serialize(&blobs[0], &blobs, &gnodes, &segs, 1);
+        // locate zero list desc (bit4 of cluster listFlags, order [ci2] zero one pos)
+        let ooff = u16le(&b, 0x12) as usize;
+        let ocnt = u16le(&b, 0x14) as usize;
+        let lf = u16le(&b, 0x16);
+        let mut d = ooff + 4 * ocnt;
+        for bit in 0..4 {
+            if lf >> bit & 1 == 1 {
+                d += 4;
+            }
+        }
+        let (zero_off, zc) = (u16le(&b, d) as usize, u16le(&b, d + 2) as usize);
+        assert_eq!(zc, 3);
+        let mut found = 0;
+        for i in 0..zc {
+            let lzf = u16le(&b, zero_off + i * 6 + 2);
+            let offz = u16le(&b, zero_off + i * 6 + 4) as usize;
+            if lzf & 1 == 0 {
+                assert_eq!(lzf, 0x02, "degree-1 stubs keep DCR-only");
+                continue;
+            }
+            assert_eq!(lzf, 0x03);
+            found += 1;
+            let (ann, cnt, dcr, dcnt) = (
+                u16le(&b, offz) as usize,
+                u16le(&b, offz + 2),
+                u16le(&b, offz + 4),
+                u16le(&b, offz + 6),
+            );
+            assert_eq!((cnt, dcnt), (1, 2), "hub node: DCR degree 2, one matrix frame");
+            let (size, typ) = (u16le(&b, ann), u16le(&b, ann + 2));
+            assert_eq!((size, typ), (0x0B, 0x000F), "N=2 frame = 4+1+4+2 bytes of type 0x0f");
+            assert_eq!(b[ann + 4], 2, "payload[0] = N (engine shift byte)");
+            // DCR order at hub: seg0 dir0 then seg1 dir0 -> rows/cols (armE, armN)
+            assert_eq!(u16le(&b, dcr as usize), 1);
+            assert_eq!(u16le(&b, dcr as usize + 2), 2);
+            let cells = &b[ann + 5..ann + 9];
+            assert_eq!((cells[0], cells[3]), (152, 152), "diagonals = same-arm U-turn");
+            assert_eq!((cells[1], cells[2]), (90, 90), "E->N and N->E = 90 deg");
+            assert_eq!(&b[ann + 9..ann + 11], &[0x5a, 0x00], "trailing default + pad");
+        }
+        assert_eq!(found, 1, "only the hub carries a matrix");
     }
 
     fn u16le(b: &[u8], o: usize) -> u16 {

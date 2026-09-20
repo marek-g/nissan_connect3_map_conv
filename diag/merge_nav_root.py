@@ -88,6 +88,20 @@ def main():
         new_shape += outline
         q += 4 * ocnt
 
+    # Stock root signature (RNW_format.md §2a): every stock root cluster in all 17 regions
+    # carries tier-word bits 0|1|5 (0x0023; the 0x00a3 variant adds the PTH-applied bit 7).
+    # Generated roots must present it, or the entry cluster does not look like a gateway.
+    # NOTE: writes only into --rnw-dir (generated files by definition — never stock).
+    for fid, off, cid, *_ in specs:
+        nav = os.path.join(a.rnw_dir, f"NAV{fid:05d}.DAT")
+        n = bytearray(open(nav, "rb").read())
+        cur = int.from_bytes(n[off + 2 : off + 4], "little")
+        want = cur | 0x23
+        if want != cur:
+            struct.pack_into("<H", n, off + 2, want)
+            open(nav, "wb").write(bytes(n))
+            print(f"  root flag: NAV{fid:05d}.DAT @{off:#x} {cur:#06x} -> {want:#06x}")
+
     shift_total = len(new_rec) + len(new_shape)
     out = bytearray(d[:root_end])
     out += new_rec

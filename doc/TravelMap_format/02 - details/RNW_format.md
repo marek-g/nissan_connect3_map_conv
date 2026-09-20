@@ -32,7 +32,7 @@ per-file build-metadata header block (see §11).
 | off | size | field | notes |
 |-----|------|-------|-------|
 | 0x00 | u16 | A | cluster ID. **Not unique per file** — 702/8257 files contain duplicates (checked on the EUR dataset); do not use as a key without the file id |
-| 0x02 | u16 | flags | bit 0x40 → coordType 4 (rel24), else 3 (rel16). **Not a validity bit** — `0x0000` is a perfectly valid value. The word distinguishes the two cluster *tiers*: coarse clusters carry `0x0001`/`0x0008` (and other combos); the **finer tier** (dense residential grid) carries `0x0000`. A scanner that requires this word to be non-zero silently drops the entire fine tier — ~half the roads in a city |
+| 0x02 | u16 | flags | **tier word**, see §2a. bit 0x40 → coordType 4 (rel24), else 3 (rel16). **Not a validity bit** — `0x0000` is a perfectly valid value: the dense leaf plane carries it (~half of every region's clusters). The **top plane** carries `0x0001` (ci1 + downcells); root/gateway clusters OR in `0x22`. A scanner that requires this word to be non-zero silently drops the whole `0x0000` leaf plane — ~half the roads in a city (this bug lived in `rnw_extract` until 2026-09-19) |
 | 0x04 | u32 | C | sequence number. **Not monotonic within a file** (only ~3111/8257 files are strictly increasing); do not use for ordering/validation |
 | 0x08 | s32 | refLon | PAU = deg·2³¹/180 |
 | 0x0C | s32 | refLat | |
@@ -46,6 +46,50 @@ per-file build-metadata header block (see §11).
 Outline: `ocnt` points at S+ooff, each **4B** `{s16 dlon, s16 dlat}`
 (coordType 3) or **6B** `{s24 dlon, s24 dlat}` (type 4);
 point = ref + delta<<shift. (Cluster boundary polygon — not needed for roads.)
+
+### 2a. Cluster tiers and the routing hierarchy (census 2026-09-19, POL+DEU full + PROCNAV RE)
+
+The `flags` word is a **tier word**. A full scan of every POL/DEU cluster
+(POL 12,358 / DEU 29,820; heuristic 16KB scan, same guards as `rnw_extract`) plus the
+PROCNAV engine symbols resolves the complete model:
+
+| tier word | role | POL | DEU | structure |
+|-----------|------|----:|----:|-------------|
+| `0x0000` | **dense leaf plane** (half of it) | 6,569 | 17,513 | ci2 = leaf neighbours, upcell refs on 30–40 % of OCs, **no ci1, no downcells** |
+| `0x0008` | **dense leaf plane** (other flavour — identical structure/density, interleaved with 0x0000 via ci2; bit 3 semantics not found, behaviourally irrelevant) | 4,499 | 9,130 | same |
+| `0x0001` | **top (long-distance) plane** | 883 (7 %) | 2,519 | sparse: 1–2 % of the region's OCs, median area **526/183 km²** (leaf: 43/25), `downcells` on many OCs (dn ≈ 10/OC), **ci1 = child leaf clusters** (targets: 100 % tier-0 clusters), ci2 = top-plane neighbours; 100 % of zerocells carry turn annotations (leaf ≈ 20–40 %), rim/cpx markers never |
+| bit 5 `0x20`, bit 1 `0x02` | **gateway markers**: ORed into the word of the region's ROOT cluster(s) | | | all 52 stock root clusters across all 17 regions carry **0x0023** (or 0x00a3 = plus the PTH bit 7 already applied) |
+| bit 7 `0x80` | `.PTH` patchable (`u16PatchCluster` applies the CONNECT patch) | | | see §11 |
+
+The two planes interlock by **references, not by position**:
+
+* **Upcells** (onecell desc bit 2): a 4-byte slot holding **two DCR-shaped u16 refs**
+  `{(ocIdx+1)&0x3FF | 0x8000-direction}` — the up-plane onecell in the FROM and TO travel
+  direction (both slots usually identical). No cluster word: the target cluster comes from
+  the cluster's **ancestor** relation (PROCNAV `NAncestor::Init` @0x33bac2,
+  `tagCLEX::prGetAncestor/prGetFirstAncestor` @0x458c54).
+* **Downcells** (onecell desc bit 3): top→leaf continuation refs (same 4-byte encoding);
+  in the leaf clusters they resolve through the top cluster's ci1 child list.
+* Engine consumption (`PROCNAV_dec.out`): `rnw_bIsUpLink` = hdr bit 13 (link) AND desc bit 2
+  (@0x34b7ce); `tagRS_UPLINKTAB::vBuild` @0x641d20 materializes uplink edges inside the glue
+  area; `rs_GetParentNbrCl` @0x411f22 expands **flag-bit-0 clusters only**;
+  `rs_GetDownClOfRoute` @0x412f5a refines a top-plane route into the leaf clusters during
+  route assembly. The wavefront core (`vOptimize`) is a **flat** Dijkstra over the glue
+  area's RESISTANCETAB — the hierarchy is *enrichment* (parent expansion, uplink waves,
+  down-cell refinement), never a correctness requirement.
+
+**Writer decision (osm2rnw, 2026-09-19):** a **single dense plane is routing-complete** —
+flat search + ci2 adjacency + overlap stitch; no upcells/downcells/ci1/top plane required
+(multi-tier = a long-distance *performance* optimization, deferred). Consequences applied:
+cluster tier word written **0x0000** (was 0x0001, which falsely advertised top-plane
+membership); `diag/merge_nav_root.py` now ORs the stock gateway signature **0x0023** into the
+referenced root cluster's tier word.
+
+> **Scanner fix (2026-09-19):** the §2 "not a validity bit" pitfall was LIVE in
+> `rnw_extract` (`hdr_flags != 0` gate) — it silently dropped the whole 0x0000 leaf plane
+> (POL: 568,697 → **1,250,586** roads after the fix, named 314k → 702k). Default now includes
+> both planes (`--coarse-only` restores the old scope). `rnw2osm` already parsed both
+> (`--level`, default 1).
 
 ## 3. Descriptor sequence
 
@@ -421,8 +465,16 @@ is a flag**, code = `type & 0x7fff`:
   0x19 confirmed ON-DISK in cluster onecell annotlists (DEU: 197 frames in 4.7 MB NAV32642.DAT,
   e.g. `0c 00 19 00 39 000000 39 000000` = `0x39` 57 half-units both dirs ≈ 68 m under the ×2 model);
   0x2f frames NOT found in stock RNW
-  DEU files — freeway length is presumably carried via AEX export or derived at runtime from the
-  OC class flags (`onecell +0x1c` bit 0x200 / `+0x14` bit 0x40000000 fallback paths).
+   DEU files — freeway length is presumably carried via AEX export or derived at runtime from the
+   OC class flags (`onecell +0x1c` bit 0x200 / `+0x14` bit 0x40000000 fallback paths).
+   **Semantics = PARTIAL length, not a flag** (POL census 2026-09, 30 stock files: OC polyline p50
+   1,082 m vs builtup p50 206 m — a trunk OC crossing a village carries its through-town portion;
+   both-dirs values usually equal). `osm2rnw` (2026-09-20) replicates this exactly: partial length
+   of each OC inside the input's built-up rings (grid-indexed, stock 0.875·x bound). OSM input:
+   for PL `boundary=place` polygons DO NOT EXIST as settlements (they are ethnographic boundary
+   lines — 791 ways, 43 rings nationwide), so the built-up layer is `landuse=residential|
+   commercial|industrial|retail` (583k closed rings in the PL extract); OSM's place-area gap is a
+   data-world fact, stock Bosch data has its own settlement layer.
 
 > Note: this is the **NAV cluster** annotation system. The separate **AEX "extern annotation"** files (§13)
 > are a different on-disk format with their own type-code space and are parsed client-side, *not* by this
@@ -495,12 +547,27 @@ OC's `anGenTimeDist` (OC annot **0x17** §8a) base/max before applying the node'
 > generically; the setter is a runtime index), so `0x0f`/`0x82` rest on frequency+pairing, not a
 > literal `switch(type){…case 0x0f: zce[0]=…}`.
 >
-> **Writer note (`osm2rnw`):** the generator emits **no node annotations** today, so PROCNAV prices
-> every junction turn as free (turn/turn-cost + manoeuvre features unavailable) — acceptable for a
-> minimal single-region route. To emit them: per junction of degree `N`, write the time matrix as code
-> `0x0f` (`{u16 shift, u8[N²]}`, `0xff` = no-turn), instruction `0x01` (`{u16 shift, u16[N²]}`,
-> `0xffff` = none), optional distance `0x02`, under the `{u16 size, u16 type}` frame; exact shift
-> (scale) encoding per cell still to pin against `u32GetTimeValue`'s `<<shift`.
+> **RESOLVED (2026-09-20) — frame encoding + cell semantics** (engine `u32GetTimeValue` @0x348320
+> decompiled + POL stock scan, 110 k `0x0f` frames): the `0x0f` payload is
+> **`{u8 N, u8[N²] cells, u8 default, u8 0}`** — there is NO separate scale byte: the engine reads
+> its `sbyte` shift from the matrix base, which on disk is exactly the **`N` byte**, so the engine
+> costs a turn `cell << N` (stock data bakes degree in as scale). Cells are **turn-angle cost
+> codes** (distinct-value census): modes `{0, 1, 2, 3, 5, 10}` (straight/near-straight, priority
+> nudges), `45`/`90` (and 93/99 = angle ± priority correction) for angle turns,
+> `150/151/152/155` for U-turns (diagonal cells `from==to` are the same-arm U-turn: small where
+> forbidden-by-design, `155` where costly-but-allowed); trailing `u8` = per-node default cost
+> (stock modes `0x5A`=90 regular / `0x2D`=45 ramp-style junctions), then `00` pad.
+> `0xff` = no-turn (rare, 4.5 k frames). Two cell families correlate with junction style
+> (A: 90-based 57 k frames, trail `5a 00`; B: 45+U-turn-based 36 k, trail `2d 00`).
+>
+> **Writer (`osm2rnw`, implemented 2026-09-20):** every junction with DCR degree 2..16 gets a
+> full `0x0f` matrix (`size = N²+7`, zerocell `lzf |= 1` with AnnotDesc+DcrDesc 8-byte desc):
+> rows/cols = DCR-entry order (engine `iu16GetMatrixIndex` masks the dir bit off, so the OC number
+> alone selects row/col), cell = stock angle mode from the geometric deflection between the
+> reversed entry arm and the exit arm (0/3/10/45/90/150/152 buckets at ≤12/30/50/70/110/150°),
+> diagonals = 152 (U-turn), default byte `0x5A`, no prohibitions (those would be type `0x77`).
+> Trial build: 29,849 matrices on the PL trunk net, zero malformed frames under a strict
+> cluster-true-bounds walk; byte layout validated against stock by the same scanner.
 
 ### 8b. Global header annotations (NAV_ROOT.DAT) — the routing country tables
 

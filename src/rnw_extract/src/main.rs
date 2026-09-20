@@ -3,7 +3,12 @@
 // Python version; formatting uses native Rust conventions (plain float
 // display, raw UTF-8 in strings instead of \uXXXX escapes).
 //
-// Usage: rnw_extract <CCP_DIR> <out.jsonl> [-b W,S,E,N|none]
+// Usage: rnw_extract <CCP_DIR> <out.jsonl> [-b W,S,E,N|none] [--coarse-only]
+//
+// Default output includes BOTH stock cluster planes (RNW_format.md §2a): the dense leaf
+// plane (u16@2 == 0x0000) and the 0x0008 + top-0x0001 planes. --coarse-only restores the
+// pre-2026-09 behaviour that skipped the 0x0000 plane (it mis-read the flags word as a
+// validity bit and silently dropped ~half of every region's roads).
 //
 // Format notes: see rnw_extract.py in the parent directory.
 
@@ -170,11 +175,20 @@ struct Road {
     fw: u32,
 }
 
-fn parse_cluster(d: &[u8], start: usize, end: usize, bbox: &Option<BBox>) -> Option<Vec<Road>> {
+fn parse_cluster(
+    d: &[u8],
+    start: usize,
+    end: usize,
+    bbox: &Option<BBox>,
+    coarse_only: bool,
+) -> Option<Vec<Road>> {
     let cd = &d[start..end];
     let cluster_id = u16le(cd, 0);
+    // u16@2 is NOT a validity bit: the dense leaf plane carries 0x0000 (it is ~half of every
+    // region's clusters; tier census 2026-09, RNW_format.md §2a). Requiring it non-zero dropped
+    // that plane. Only --coarse-only skips it; structural guards are the real filter.
     let hdr_flags = u16le(cd, 2);
-    if cluster_id == 0 || hdr_flags == 0 {
+    if cluster_id == 0 || (coarse_only && hdr_flags == 0) {
         return None;
     }
     let lon = i32le(cd, 8) as i64;
@@ -413,7 +427,7 @@ fn parse_cluster(d: &[u8], start: usize, end: usize, bbox: &Option<BBox>) -> Opt
     Some(roads)
 }
 
-fn find_clusters(d: &[u8], bbox: &Option<BBox>) -> Vec<usize> {
+fn find_clusters(d: &[u8], bbox: &Option<BBox>, coarse_only: bool) -> Vec<usize> {
     let mut starts = Vec::new();
     let n = d.len();
     let stop = n.saturating_sub(0x20);
@@ -421,7 +435,7 @@ fn find_clusters(d: &[u8], bbox: &Option<BBox>) -> Vec<usize> {
     while start < stop {
         let cluster_id = u16le(d, start);
         let hdr_flags = u16le(d, start + 2);
-        if cluster_id != 0 && hdr_flags != 0 {
+        if cluster_id != 0 && !(coarse_only && hdr_flags == 0) {
             let lon = i32le(d, start + 8) as f64;
             let lat = i32le(d, start + 12) as f64;
             if bbox.as_ref().map_or(true, |bb| bb.contains(lon, lat)) {
@@ -441,7 +455,7 @@ fn find_clusters(d: &[u8], bbox: &Option<BBox>) -> Vec<usize> {
     starts
 }
 
-fn extract_file(path: &Path, bbox: &Option<BBox>) -> Vec<Road> {
+fn extract_file(path: &Path, bbox: &Option<BBox>, coarse_only: bool) -> Vec<Road> {
     let d = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -449,11 +463,11 @@ fn extract_file(path: &Path, bbox: &Option<BBox>) -> Vec<Road> {
             return Vec::new();
         }
     };
-    let starts = find_clusters(&d, bbox);
+    let starts = find_clusters(&d, bbox, coarse_only);
     let mut out = Vec::new();
     for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(d.len());
-        if let Some(c) = parse_cluster(&d, start, end, bbox) {
+        if let Some(c) = parse_cluster(&d, start, end, bbox, coarse_only) {
             out.extend(c);
         }
     }
@@ -521,6 +535,7 @@ fn write_line(fh: &mut impl Write, f_field: &str, r: &Road) -> io::Result<()> {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut bbox_spec = "-30,30,60,75".to_string(); // whole EUR dataset
+    let mut coarse_only = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -529,6 +544,9 @@ fn main() {
             i += 2;
         } else if let Some(spec) = args[i].strip_prefix("-b=") {
             bbox_spec = spec.to_string();
+            i += 1;
+        } else if args[i] == "--coarse-only" {
+            coarse_only = true;
             i += 1;
         } else {
             positional.push(args[i].clone());
@@ -612,7 +630,7 @@ fn main() {
     let mut fh = BufWriter::new(file);
     let (mut total, mut named, mut geom) = (0u64, 0u64, 0u64);
     for (dd, fn_) in &files {
-        let roads = extract_file(&dd.join(fn_), &bbox);
+        let roads = extract_file(&dd.join(fn_), &bbox, coarse_only);
         let f_field = format!(
             "{}/{}",
             dd.file_name().unwrap().to_string_lossy(),
