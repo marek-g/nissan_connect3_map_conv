@@ -1432,38 +1432,7 @@ pub fn encode(entries: &[NameEntry]) -> Vec<u8> {
 pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
     let with_city = entries.iter().any(|e| e.city.is_some());
 
-    // --- group by city (first-seen order), then chunk each city under MAX_NODES_PER_BLOCK ---
-    let mut groups: Vec<(Option<(i32, i32)>, Vec<&NameEntry>)> = Vec::new();
-    for e in entries {
-        if let Some(g) = groups.iter_mut().find(|(c, _)| *c == e.city) {
-            g.1.push(e);
-        } else {
-            groups.push((e.city, vec![e]));
-        }
-    }
-    let mut chunks: Vec<(Option<(i32, i32)>, Vec<NameEntry>)> = Vec::new(); // (anchor, entries)
-    for (anchor, ge) in groups {
-        let mut start = 0usize;
-        while start < ge.len() {
-            let (mut i, mut est) = (start, 1usize);
-            while i < ge.len() {
-                let add = ge[i].label.len() + 1; // upper bound (no prefix sharing)
-                if i > start && est + add > MAX_NODES_PER_BLOCK {
-                    break;
-                }
-                est += add;
-                i += 1;
-            }
-            chunks.push((
-                anchor,
-                ge[start..i]
-                    .iter()
-                    .map(|e| (*e).clone())
-                    .collect::<Vec<NameEntry>>(),
-            ));
-            start = i;
-        }
-    }
+    let chunks = chunk_entries(entries);
 
     let blocks: Vec<(Vec<u8>, usize)> = chunks
         .iter()
@@ -1551,6 +1520,153 @@ pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
         f.extend_from_slice(blk);
     }
     f
+}
+
+/// Group entries by city (first-seen order) and chunk each city under `MAX_NODES_PER_BLOCK`.
+/// Shared by [`encode_id`] and [`merge_name_list`] so appended blocks keep the SAME DFS order.
+fn chunk_entries(entries: &[NameEntry]) -> Vec<(Option<(i32, i32)>, Vec<NameEntry>)> {
+    let mut groups: Vec<(Option<(i32, i32)>, Vec<&NameEntry>)> = Vec::new();
+    for e in entries {
+        if let Some(g) = groups.iter_mut().find(|(c, _)| *c == e.city) {
+            g.1.push(e);
+        } else {
+            groups.push((e.city, vec![e]));
+        }
+    }
+    let mut chunks: Vec<(Option<(i32, i32)>, Vec<NameEntry>)> = Vec::new(); // (anchor, entries)
+    for (anchor, ge) in groups {
+        let mut start = 0usize;
+        while start < ge.len() {
+            let (mut i, mut est) = (start, 1usize);
+            while i < ge.len() {
+                let add = ge[i].label.len() + 1; // upper bound (no prefix sharing)
+                if i > start && est + add > MAX_NODES_PER_BLOCK {
+                    break;
+                }
+                est += add;
+                i += 1;
+            }
+            chunks.push((
+                anchor,
+                ge[start..i]
+                    .iter()
+                    .map(|e| (*e).clone())
+                    .collect::<Vec<NameEntry>>(),
+            ));
+            start = i;
+        }
+    }
+    chunks
+}
+
+fn u32at(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
+fn u16at(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+}
+fn vle_at(b: &[u8], mut p: usize, n: usize) -> (Vec<u32>, usize) {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut acc = 0u32;
+        loop {
+            let byte = b[p] as u32;
+            p += 1;
+            acc = if byte & 0x80 != 0 {
+                byte - 0x7f + acc * 128
+            } else {
+                byte + acc * 128
+            };
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        out.push(acc);
+    }
+    (out, p)
+}
+
+/// CARD-VALIDATED splice (2026-09-21, streets listed under KRZESZOWICE on device): keep a stock
+/// `NLNameList` file byte-for-byte and APPEND our entries as extra mode-C blocks with global
+/// element ids `stock_elem..`. Only the sub-header bookkeeping changes (element_count, A, sec0,
+/// sec1, extra, section offsets); the appended blocks anchor all coordinates to the stock file
+/// corner. Returns `(merged file, stock_elem)` — REL src ids must add `stock_elem`.
+/// Chunking matches [`encode_id`] exactly, so an element's DFS rank inside our appended part is
+/// the same as in the standalone encode (sid mapping from `read()` transfers by +stock_elem).
+pub fn merge_name_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, u32), String> {
+    if u32at(stock, 0x10) != crate::header::NL_HEADER_LEN as u32 {
+        return Err("merge: stock file does not split at 0x77".into());
+    }
+    let hdr = crate::header::NL_HEADER_LEN;
+    let extra = u32at(stock, 0x14) as usize;
+    let elem = u32at(stock, hdr);
+    let a = u16at(stock, hdr + 4) as usize;
+    let corner = (u32at(stock, hdr + 0x10) as i32, u32at(stock, hdr + 0x14) as i32);
+    let sec = |i: usize| (stock[hdr + 24 + 5 * i], u32at(stock, hdr + 25 + 5 * i) as usize);
+    let (c0, o0) = sec(0);
+    let (c1, o1) = sec(1);
+    let o5 = sec(5).1;
+    let o6 = sec(6).1;
+    if (c0, c1) != (0x14, 0x11) || o5 != o1 + 4 * a {
+        return Err("merge: unexpected stock section layout".into());
+    }
+    let sec0_old = &stock[o0..o1];
+    let (sizes, _) = vle_at(sec0_old, 0, a);
+    let sec5 = &stock[o5..o6];
+    let sec6 = &stock[o6..hdr + extra];
+
+    let blocks: Vec<(Vec<u8>, usize)> = chunk_entries(entries)
+        .iter()
+        .map(|(_, c)| build_block(Some(corner), c))
+        .collect();
+    let k: u32 = blocks.iter().map(|(_, e)| *e as u32).sum();
+
+    let mut sec0 = sec0_old.to_vec();
+    for (blk, _) in &blocks {
+        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
+    }
+    let na = a + blocks.len();
+    let no1 = hdr + 59 + sec0.len();
+    let no5 = no1 + 4 * na;
+    let nextra = 59 + sec0.len() + 4 * na + sec5.len() + sec6.len();
+    let nblocks0 = hdr + nextra;
+
+    let mut f = stock[..hdr].to_vec();
+    f[0x14..0x18].copy_from_slice(&(nextra as u32).to_le_bytes());
+    f.extend_from_slice(&(elem + k).to_le_bytes());
+    f.extend_from_slice(&(na as u16).to_le_bytes());
+    f.extend_from_slice(&stock[hdr + 6..hdr + 24]); // B..F + corner
+    for (code, off) in [
+        (0x14u8, hdr + 59),
+        (0x11, no1),
+        (0x11, no5),
+        (0x11, no5),
+        (0x11, no5),
+        (0x14, no5),
+        (0x14, no5 + sec5.len()),
+    ] {
+        f.push(code);
+        f.extend_from_slice(&(off as u32).to_le_bytes());
+    }
+    f.extend_from_slice(&sec0);
+    let mut p = nblocks0;
+    for sz in sizes.iter().map(|&x| x as usize).chain(blocks.iter().map(|(b, _)| b.len())) {
+        f.extend_from_slice(&(p as u32).to_le_bytes());
+        p += sz;
+    }
+    f.extend_from_slice(sec5);
+    f.extend_from_slice(sec6);
+    if f.len() != nblocks0 {
+        return Err("merge: section bookkeeping mismatch".into());
+    }
+    for i in 0..a {
+        let off = u32at(stock, o1 + 4 * i) as usize;
+        f.extend_from_slice(&stock[off..off + sizes[i] as usize]);
+    }
+    for (blk, _) in &blocks {
+        f.extend_from_slice(blk);
+    }
+    Ok((f, elem))
 }
 
 /// Build one block (a plain-trie name-list) for a chunk of entries. `anchor` = the city position the
@@ -2141,37 +2257,7 @@ mod tests {
 mod merge_test {
     use super::*;
 
-    fn u32b(b: &[u8], o: usize) -> u32 {
-        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
-    }
-    fn u16b(b: &[u8], o: usize) -> u16 {
-        u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
-    }
-    fn vled(b: &[u8], mut p: usize, n: usize) -> (Vec<u32>, usize) {
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut acc = 0u32;
-            loop {
-                let byte = b[p] as u32;
-                p += 1;
-                acc = if byte & 0x80 != 0 {
-                    byte - 0x7f + acc * 128
-                } else {
-                    byte + acc * 128
-                };
-                if byte & 0x80 == 0 {
-                    break;
-                }
-            }
-            out.push(acc);
-        }
-        (out, p)
-    }
-
-    /// Card experiment "KRZESZOWICE block splice": take the STOCK LID20006 byte-for-byte and append
-    /// ONE extra mode-C block with our Krzeszowice streets (global element ids 974871..), rewriting
-    /// only the sub-header bookkeeping (elem_count, A, sec0 sizes, sec1 table, extra). Everything
-    /// the device already accepts stays untouched — a failure localizes to OUR block content.
+    /// Card experiment "KRZESZOWICE block splice" via the shipped `merge_name_list` API.
     #[test]
     #[ignore = "card experiment: needs FW + krz.tsv"]
     fn splice_krz_block_into_stock() {
@@ -2179,25 +2265,6 @@ mod merge_test {
             "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/LID20006.DAT",
         )
         .unwrap();
-        let hdr = u32b(&stock, 0x10) as usize;
-        let extra = u32b(&stock, 0x14) as usize;
-        let elem = u32b(&stock, hdr);
-        let a = u16b(&stock, hdr + 4) as usize;
-        let corner = (u32b(&stock, hdr + 0x10), u32b(&stock, hdr + 0x14));
-        let sec = |i: usize| (stock[hdr + 24 + 5 * i], u32b(&stock, hdr + 25 + 5 * i) as usize);
-        let (c0, o0) = sec(0);
-        let (c1, o1) = sec(1);
-        let o5 = sec(5).1;
-        let o6 = sec(6).1;
-        assert_eq!((c0, c1), (0x14, 0x11));
-        assert_eq!(o5, o1 + 4 * a); // sec2..4 empty
-        let sizes_at = stock[o0..o1].to_vec();
-        let (sizes, _) = vled(&sizes_at, 0, a);
-        let sec5 = stock[o5..o6].to_vec();
-        let sec6 = stock[o6..hdr + extra].to_vec();
-        let blocks_end = stock.len();
-
-        // our entries (absolute PAU coords in tsv; anchor = stock file corner)
         let tsv = std::fs::read_to_string("/tmp/rnwwork/t27dbg/krz.tsv").unwrap();
         let entries: Vec<NameEntry> = tsv
             .lines()
@@ -2206,70 +2273,15 @@ mod merge_test {
                 let y: i32 = it.next().unwrap().parse().unwrap();
                 let x: i32 = it.next().unwrap().parse().unwrap();
                 let label = it.next().unwrap().replace("\\t", "\t");
-                NameEntry {
-                    label,
-                    x_pau: x,
-                    y_pau: y,
-                    city: None,
-                    belonging: None,
-                }
+                NameEntry { label, x_pau: x, y_pau: y, city: Some((0, 0)), belonging: None }
             })
             .collect();
-        let anchor = ((corner.0 as i32, corner.1 as i32));
-        let (blk, k) = build_block(Some(anchor), &entries);
-        assert_eq!(k, entries.len());
-        let elem0 = elem + k as u32;
-
-        // new sub-header: sec0 += our size, sec1 += one abs offset, extra shifts everything
-        let mut sec0 = sizes_at.clone();
-        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
-        let no1 = hdr + 59 + sec0.len();
-        let no5 = no1 + 4 * (a + 1);
-        let nextra = 59 + sec0.len() + 4 * (a + 1) + sec5.len() + sec6.len();
-        let nblocks0 = hdr + nextra;
-
-        let mut f = stock[..hdr].to_vec();
-        f[0x14..0x18].copy_from_slice(&(nextra as u32).to_le_bytes());
-        f.extend_from_slice(&elem0.to_le_bytes());
-        f.extend_from_slice(&((a + 1) as u16).to_le_bytes());
-        f.extend_from_slice(&stock[hdr + 6..hdr + 24]); // B..F + corner
-        for (code, off) in [
-            (0x14u8, hdr + 59),
-            (0x11, no1),
-            (0x11, no5),
-            (0x11, no5),
-            (0x11, no5),
-            (0x14, no5),
-            (0x14, no5 + sec5.len()),
-        ] {
-            f.push(code);
-            f.extend_from_slice(&(off as u32).to_le_bytes());
-        }
-        f.extend_from_slice(&sec0);
-        let mut p = nblocks0;
-        for sz in sizes.iter().map(|&x| x as usize).chain(std::iter::once(blk.len())) {
-            f.extend_from_slice(&(p as u32).to_le_bytes());
-            p += sz;
-        }
-        f.extend_from_slice(&sec5);
-        f.extend_from_slice(&sec6);
-        assert_eq!(f.len(), nblocks0);
-        for i in 0..a {
-            let off = u32b(&stock, o1 + 4 * i) as usize;
-            let sz = if i + 1 < a {
-                u32b(&stock, o1 + 4 * (i + 1)) as usize - off
-            } else {
-                blocks_end - off
-            };
-            // NOTE: sizes[] above are byte sizes from sec0; they must match the offsets delta
-            assert_eq!(sz, sizes[i] as usize, "stock block size mismatch {i}");
-            f.extend_from_slice(&stock[off..off + sz]);
-        }
-        f.extend_from_slice(&blk);
+        let (f, base) = merge_name_list(&stock, &entries).unwrap();
         std::fs::create_dir_all("/tmp/rnwwork/t27dbg/outG").unwrap();
         std::fs::write("/tmp/rnwwork/t27dbg/outG/LID20006.DAT", &f).unwrap();
-        println!("spliced: elem {elem0} (stock {elem} + {k}), A {}, size {:#x}", a + 1, f.len());
         let nl = read(&f).expect("merged file must read back");
-        assert_eq!(nl.element_count as u32, elem0);
+        let our: Vec<&str> = nl.elements[base as usize..].iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(our.len(), entries.len());
+        println!("spliced base {base} + {} elems, size {:#x}", our.len(), f.len());
     }
 }

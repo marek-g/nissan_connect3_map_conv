@@ -153,9 +153,11 @@ pub fn get_relations(
         for c in 0..cols {
             for r in 0..rows {
                 let ci = c * rows + r;
-                let start = u16v(b, off + 2 * ci) as usize;
+                // device (`enGetRelationsByType`): table = raw[1+ci] (count word at raw[0]),
+                // stream offsets ABSOLUTE from the block base.
+                let start = u16v(b, off + 2 + 2 * ci) as usize;
                 let end = if ci + 1 < tcs {
-                    let e = u16v(b, off + 2 * (ci + 1)) as usize;
+                    let e = u16v(b, off + 2 + 2 * (ci + 1)) as usize;
                     if e < start {
                         return Err(format!("rel: cell {g} CSR not monotonic at {ci}"));
                     }
@@ -346,7 +348,9 @@ pub fn write_rel_grid(
         // encoded length differ from the pair count, so the CSR head must use real offsets.
         let mut streams: Vec<Vec<u8>> = Vec::with_capacity(tcs);
         let mut starts: Vec<u16> = Vec::with_capacity(tcs);
-        let mut cur = tcs;
+        // device layout: raw[0] = cell count, raw[1+k] = ABSOLUTE u16 offset of cell k's stream
+        // counted from the block base (the count word counts as u16 index 0).
+        let mut cur = tcs + 1;
         for k in 0..tcs {
             let lo = hist[k];
             let hi = hist[k + 1];
@@ -369,6 +373,7 @@ pub fn write_rel_grid(
             return Err(format!("rel: cell {g} tile exceeds device limit"));
         }
         let mut tile = Vec::with_capacity(2 * cur);
+        tile.extend_from_slice(&(tcs as u16).to_le_bytes());
         for w in &starts {
             tile.extend_from_slice(&w.to_le_bytes());
         }
@@ -543,12 +548,52 @@ mod tests {
 
 #[cfg(test)]
 mod card_tests {
+    #[test]
+    #[ignore = "needs FW files"]
+    fn xcheck_full_dump() {
+        for path in [
+            "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT",
+        ] {
+            let b = std::fs::read(path).unwrap();
+            let idx = super::RelIndex::parse(&b).unwrap();
+            let all = super::get_relations(&b, &idx, true, 0, idx.d[2] + 1).unwrap();
+            let mut c: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+            for (s_, t_) in all {
+                c.entry(t_).or_default().push(s_);
+            }
+            for city in [109625u32, 7427, 160202] {
+                let v = c.get(&city).cloned().unwrap_or_default();
+                println!("{path} full-dump city {city} -> {} {:?}", v.len(), &v[..v.len().min(6)]);
+            }
+        }
+    }
+
+    /// Cross-check the python device-path simulator (relsim.py) counts per file.
+    #[test]
+    #[ignore = "needs /tmp + FW files"]
+    fn xcheck_relsim() {
+        for path in [
+            "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT",
+            "/tmp/rnwwork/t27dbg/outH/REL00001.DAT",
+            "/tmp/rnwwork/t27dbg/outI/REL00001.DAT",
+        ] {
+            let b = std::fs::read(path).unwrap();
+            let idx = super::RelIndex::parse(&b).unwrap();
+            for city in [109625u32, 7427, 160202] {
+                let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
+                let mut v: Vec<u32> = r.iter().map(|&(_, t)| t).collect();
+                v.sort_unstable();
+                println!("{path} city {city} -> {} head={:?}", r.len(), &v[..v.len().min(5)]);
+            }
+        }
+    }
+
     /// Card-debug probe (run manually): row-query (by_source=false, tgt=city id) our generated
     /// REL00001 for KRZESZOWICE's city element id; must return the street src ids.
     #[test]
     #[ignore = "needs /tmp card files"]
     fn city_to_street_rows() {
-        for path in ["/tmp/rnwwork/t27dbg/outE/REL00001.DAT"] {
+        for path in ["/tmp/rnwwork/t27dbg/outH/REL00001.DAT"] {
             let b = std::fs::read(path).unwrap();
             let idx = super::RelIndex::parse(&b).unwrap();
             for city in [109625u32] {
@@ -661,5 +706,29 @@ mod merge_rel_test {
         let waw = super::get_relations(&mine, &midx, false, 160202, 160203).unwrap();
         println!("control city 160202 rows: {}", waw.len());
         assert!(!waw.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod outH_verify {
+    /// Verify the outH merged REL00001: replaced towns answer with our (shifted) ids only,
+    /// a stock control city keeps its stock rows.
+    #[test]
+    #[ignore = "needs outH"]
+    fn merged_rel_cities() {
+        let b = std::fs::read("/tmp/rnwwork/t27dbg/outH/REL00001.DAT").unwrap();
+        let idx = super::RelIndex::parse(&b).unwrap();
+        for city in [109625u32, 209548, 219722, 220146, 235786] {
+            let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
+            println!("city {city} -> {} streets", r.len());
+            assert!(!r.is_empty());
+            assert!(r.iter().all(|&(_, s)| s >= 974871), "city {city}: stock ids leaked");
+        }
+        for city in [160202u32, 7427] {
+            let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
+            println!("control {city} -> {}", r.len());
+            assert!(!r.is_empty());
+            assert!(r.iter().all(|&(_, s)| s < 974871), "control {city}: ours leaked");
+        }
     }
 }

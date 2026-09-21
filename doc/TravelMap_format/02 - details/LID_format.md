@@ -609,6 +609,33 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
 * `osm2lid` now emits the stock street shape (verified by a `LoadHeader` byte-simulator: stock files
   and our new files PASS, the pre-fix files REJECT at `code 0x00` sections).
 
+### 11.4d Merge-into-stock workflow + city-id mapping (**[CONFIRMED 2026-09-21, card-validated merge]**)
+
+Regenerating a full name-list for a region and shipping it standalone FAILS on the card even when
+locally valid; splicing ours INTO the stock file works. `osm2lid --merge-stock DIR` does:
+
+* `LID20006` = stock elements + ours appended (`merge_name_list`: new blocks with a fresh template
+  pass, section 1 table grown, `element_count` patched). Base = stock element count (974871 POL).
+* All list-3 ids above `base` are OURS: `RelIndex` gets the shifted rows only for cities the OSM
+  extract maps (stock city rows for those ids replaced; foreign cities' rows untouched).
+* `LID40006` (GenAttr) = stock TOC+blocks then OUR blocks appended (`merge_gen_attr`); shipping a
+  standalone rebased GenAttr would WIPE the stock national HNR coverage.
+* `PA_20006` / `LID30006` / `LID20000` are NOT shipped (stock stays; POL card carries no PA and its
+  LID30006 is a legacy variant; stock LID20000 is a 194k place gazetteer, different content class).
+* META0000 unchanged (relation entry #1 already covers REL00001).
+
+City-id mapping (`--auto-city`, deterministic, no fuzzy): `fold(name)` (upper + deaccent + `[A-
+Z0-9-. ]`) equality against stock `LID20001` element names with the author's `"NN NNN "` postal
+prefix stripped. Names the stock list lacks (tiny hamlets) fall back to the nearest mapped city
+within `--city-radius` PAU. Two open correctness limits:
+* appending NEW city elements is blocked - `LID20001` carries author-only sec2/3/4 sections
+  (§11.4c: link-pair mirror + extra REL list ids `[2,60,61]`) that `merge_name_list` cannot synthesize;
+* same-named villages are indistinguishable by name alone (stock has ~30 plain `PIASKI` elements,
+  one per village; postal prefixes only separate the prefixed variants). The stock city LIST
+  positions (`x_pau`/`y_pau`) are a per-file private encoding (non-geographic unit mix, not the
+  PAU of §11.5) and cannot validate a match - a geo validator via stock REL -> GenAttr `0xc11`
+  cell ids -> RNW cluster coordinates is planned (cell-id namespace mapping pending).
+
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
 A block's places have **no per-record lon/lat field**. Positions live in `NLPositionAttrVector` (tag `0x407`):

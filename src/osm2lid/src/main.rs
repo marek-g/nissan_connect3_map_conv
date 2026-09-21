@@ -94,6 +94,9 @@ fn main() {
     let mut no_crossings = false;
     let mut no_addr_list = false;
     let mut stock_city_map: Option<String> = None;
+    let mut auto_city = false;
+    let mut merge_stock: Option<String> = None;
+    let mut city_radius: i64 = 500_000;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -118,9 +121,18 @@ fn main() {
             "--no-pa" => no_pa = true,
             "--no-crossings" => no_crossings = true,
             "--no-addr-list" => no_addr_list = true,
+            "--auto-city" => auto_city = true,
             "--stock-city-map" => {
                 i += 1;
                 stock_city_map = args.get(i).cloned();
+            }
+            "--merge-stock" => {
+                i += 1;
+                merge_stock = args.get(i).cloned();
+            }
+            "--city-radius" => {
+                i += 1;
+                city_radius = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(city_radius);
             }
             "-h" | "--help" => {
                 usage();
@@ -178,7 +190,11 @@ fn main() {
     // card (device city index needs per-element language+position columns we do not emit —
     // LID_format.md §10.4 vPopulateCityIndices); we only ship streets/HNR/PA + REL whose city
     // ids are looked up in the stock name-list.
-    let stock_cities = stock_city_map.is_some();
+    let stock_cities = stock_city_map.is_some() || auto_city;
+    if auto_city && merge_stock.is_none() {
+        eprintln!("--auto-city requires --merge-stock (reads the stock LID20001)");
+        exit(1);
+    }
     let npoi = if stock_cities {
         0
     } else {
@@ -196,9 +212,122 @@ fn main() {
     } else {
         write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox)
     };
-    let (ncit, city_idx) =
+    let (ncit, city_idx, city_entries) =
         write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2, !stock_cities);
-    let city_ids: HashMap<String, Vec<u32>> = match &stock_city_map {
+    let city_ids: HashMap<String, Vec<u32>> = if auto_city {
+        // Deterministic city mapping: fold(name) equality against the stock LID20001 element
+        // names (author adds "NN NNN " postal prefixes to many entries - strip them). Towns the
+        // stock list does not carry are APPENDED to the stock name-list as brand-new city
+        // elements (no fuzzy matching anywhere).
+        let dir = merge_stock.as_ref().unwrap();
+        let p = Path::new(dir).join("LID20001.DAT");
+        let stock = fs::read(&p).unwrap_or_else(|e| {
+            eprintln!("--auto-city {p:?}: {e}");
+            exit(1);
+        });
+        let nl = lid_format::read(&stock).unwrap_or_else(|e| {
+            eprintln!("--auto-city stock LID20001: {e}");
+            exit(1);
+        });
+        let mut m: HashMap<String, Vec<u32>> = HashMap::new();
+        for (i, e) in nl.elements.iter().enumerate() {
+            let key = fold(&strip_postal(&e.name));
+            m.entry(key).or_default().push(i as u32);
+        }
+        let origin = nl.origin;
+        let mut out: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut append: Vec<lid_format::NameEntry> = Vec::new();
+        let mut added: Vec<String> = Vec::new();
+        for name in city_idx.keys() {
+            if let Some(ids) = m.get(&fold(name)).cloned() {
+                out.insert(name.clone(), ids);
+            } else {
+                added.push(name.clone());
+            }
+        }
+        // Region filter (deterministic): stock city entries carry a 2-digit Polish postal-code
+        // region prefix in the name ("32 063 KRZESZOWICE"); a same-named village elsewhere in
+        // the country has a different prefix (all "PIASKI": 21/23/63 vs local 32). Expected
+        // region = mode of the prefixes among all matched entries; entries with no prefix are
+        // kept (no information), entries from a foreign prefix are dropped and reported.
+        fn postal_prefix(name: &str) -> Option<String> {
+            let p = name.get(..2)?;
+            if p.bytes().all(|c| c.is_ascii_digit()) && name.as_bytes().get(2) == Some(&b' ') {
+                Some(p.to_string())
+            } else {
+                None
+            }
+        }
+        // Anchor town = matched town whose element center sits closest to the extracted
+        // data's bbox center; its stock entries' postal prefix defines the expected region.
+        let mut cx = 0i64;
+        let mut cy = 0i64;
+        for e in &city_entries {
+            cx += e.x_pau as i64;
+            cy += e.y_pau as i64;
+        }
+        let n_ce = city_entries.len().max(1) as i64;
+        cx /= n_ce;
+        cy /= n_ce;
+        let mut region: Option<String> = None;
+        let mut best: u64 = u64::MAX;
+        for (name, ids) in &out {
+            let ent = &city_entries[*city_idx.get(name).unwrap() as usize];
+            let d = ((ent.x_pau as i64 - cx) as u64) + ((ent.y_pau as i64 - cy) as u64);
+            if d < best {
+                if let Some(r) = ids
+                    .iter()
+                    .filter_map(|&i| postal_prefix(&nl.elements[i as usize].name))
+                    .next()
+                {
+                    best = d;
+                    region = Some(r);
+                }
+            }
+        }
+        let region = region.map(|p| (p, 1usize));
+        if let Some((region, _)) = &region {
+            // WARN-ONLY for now: dropping needs the geo validator (LID20001 coord units are a
+            // per-block private encoding and same-named villages without a postal prefix
+            // (30 plain "PIASKI") are indistinguishable by name alone).
+            let mut foreign = 0usize;
+            let mut plain = 0usize;
+            for (_, ids) in out.iter() {
+                for &i in ids.iter() {
+                    match postal_prefix(&nl.elements[i as usize].name) {
+                        None => plain += 1,
+                        Some(p) if p != *region => foreign += 1,
+                        Some(_) => {}
+                    }
+                }
+            }
+            eprintln!(
+                "auto-city: anchor postal region \"{region}\": {foreign} ids prefixed from other \
+                 regions, {plain} ids unprefixed (kept; enable geo drop after anchor validator)"
+            );
+        }
+        eprintln!(
+            "auto-city: {} towns matched stock ids, {} to append {added:?}",
+            out.len(),
+            added.len()
+        );
+        if !append.is_empty() {
+            match lid_format::merge_name_list(&stock, &append) {
+                Ok((merged, base2)) => {
+                    let _ = fs::write(outdir.join("LID20001.DAT"), &merged);
+                    for (j, name) in added.iter().enumerate() {
+                        out.insert(name.clone(), vec![base2 + j as u32]);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "NOTE --auto-city: cannot append city elements yet ({e}); unmatched towns \
+                     fall back to the nearest mapped city (stock LID20001 stays on the card)"
+                ),
+            }
+        }
+        out
+    } else {
+        match &stock_city_map {
         Some(p) => {
             let mut m: HashMap<String, Vec<u32>> = HashMap::new();
             let txt = fs::read_to_string(p).unwrap_or_else(|e| {
@@ -225,6 +354,7 @@ fn main() {
             m
         }
         None => city_idx.iter().map(|(k, v)| (k.clone(), vec![*v])).collect(),
+        }
     };
     let segs = build_onecells(&data, bbox);
     eprintln!(
@@ -259,12 +389,42 @@ fn main() {
             });
         }
     }
+    // nearest-mapped-city fallback: streets whose nearest `place` node has no stock city id
+    // (unmapped villages) would get belonging=NULL and vanish from every city list (card-proven).
+    // Fall back to the nearest MAPPED city within `city_radius` PAU (~11.9M PAU per degree).
+    if stock_cities {
+        let mut mapped: Vec<(&String, (i64, i64))> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
+            for (n, c, _) in &data.places {
+                if city_ids.contains_key(n.as_str()) && seen.insert(n) {
+                    mapped.push((n, *c));
+                }
+            }
+        }
+        for (e, town) in st_entries.iter_mut().zip(city_of.iter_mut()) {
+            if town.as_ref().is_some_and(|t| city_ids.contains_key(t.as_str())) {
+                continue;
+            }
+            let mut best: Option<(i64, &String, (i64, i64))> = None;
+            for (n, c) in &mapped {
+                let d2 = (c.0 - e.x_pau as i64).pow(2) + (c.1 - e.y_pau as i64).pow(2);
+                if d2 <= city_radius * city_radius && best.is_none_or(|(b, _, _)| d2 < b) {
+                    best = Some((d2, n, *c));
+                }
+            }
+            if let Some((_, n, c)) = best {
+                *town = Some(n.clone());
+                e.city = Some((c.0 as i32, c.1 as i32));
+            }
+        }
+    }
     // street -> owning city element id (column 0x40c): the device lists a city's streets through
     // this in-file column, same ids REL00001 uses as targets (ambiguous names: first stock id).
     for (e, town) in st_entries.iter_mut().zip(city_of.iter()) {
         e.belonging = town.as_ref().and_then(|t| city_ids.get(t)).and_then(|v| v.first()).copied();
     }
-    let (nst, streets) =
+    let (nst, mut streets) =
         write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
     // city coordinate registry (first node per unique name — same order `write_cities` numbers elements)
     let city_coords: std::collections::BTreeMap<&String, (i64, i64)> = {
@@ -282,6 +442,84 @@ fn main() {
         &city_ids,
         &city_coords,
     );
+    // --merge-stock DIR (raw stock LID20006.DAT + REL00001.DAT): overwrite our standalone outputs
+    // with the CARD-VALIDATED splice (2026-09-21): stock bytes kept verbatim, our streets appended
+    // as extra blocks with ids base.., our REL rows merged into the stock matrix (rows for the
+    // city ids we cover replaced, stock grid d4..d7 reused).
+    let mut id_lo = 0u32; // GenAttr tiles [id_lo, id_lo+nst); merge mode rebases our sids by +base
+    if let Some(dir) = &merge_stock {
+        use lid_format::rel;
+        let read_raw = |p: String, what: &str| -> Vec<u8> {
+            let b = fs::read(&p).unwrap_or_else(|e| {
+                eprintln!("merge-stock: read {p}: {e}");
+                exit(1);
+            });
+            if b.len() < 12 || &b[4..10] != b"CPRNAV" {
+                b
+            } else {
+                eprintln!("merge-stock: {what} is CPRNAV-compressed; decompress the stock copy first");
+                exit(1);
+            }
+        };
+        let sl = read_raw(format!("{dir}/LID20006.DAT"), "LID20006.DAT");
+        let (merged, base) = lid_format::merge_name_list(&sl, &st_entries).unwrap_or_else(|e| {
+            eprintln!("merge-stock LID20006: {e}");
+            exit(1);
+        });
+        fs::write(outdir.join("LID20006.DAT"), &merged).unwrap();
+        let sr = read_raw(format!("{dir}/REL00001.DAT"), "REL00001.DAT");
+        let ridx = rel::RelIndex::parse(&sr).unwrap_or_else(|e| {
+            eprintln!("merge-stock REL00001: {e}");
+            exit(1);
+        });
+        let mut pairs =
+            rel::get_relations(&sr, &ridx, true, 0, ridx.d[2] + 1).expect("stock rel query");
+        let ourf = fs::read(outdir.join("REL00001.DAT")).unwrap();
+        let oidx = rel::RelIndex::parse(&ourf).expect("our rel reparse");
+        let ours = rel::get_relations(&ourf, &oidx, true, 0, oidx.d[2] + 1).expect("our rel query");
+        let our_t: std::collections::HashSet<u32> = ours.iter().map(|&(_, t)| t).collect();
+        pairs.retain(|&(_, t)| !our_t.contains(&t));
+        pairs.extend(ours.iter().map(|&(s, t)| (s + base, t)));
+        pairs.sort_unstable();
+        pairs.dedup();
+        let mr = rel::write_rel_grid(
+            u64::from(base) + nst as u64,
+            u64::from(ridx.d[3]),
+            ridx.d[0] as u16,
+            ridx.d[1] as u16,
+            u64::from(ridx.d[4]),
+            u64::from(ridx.d[5]),
+            u64::from(ridx.d[6]),
+            u64::from(ridx.d[7]),
+            &pairs,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("merge-stock REL write: {e}");
+            exit(1);
+        });
+        fs::write(outdir.join("REL00001.DAT"), &mr).unwrap();
+        // rebase our list-3 element ids so the companion files reference the MERGED element numbers
+        for sid in &mut streets.sid_of_entry {
+            if *sid != u32::MAX {
+                *sid += base;
+            }
+        }
+        for ids in streets.by_label.values_mut() {
+            for (sid, _) in ids.iter_mut() {
+                *sid += base;
+            }
+        }
+        id_lo = base;
+        eprintln!(
+            "merge-stock: base {base}, our elems {nst}, merged pairs {} (city rows replaced: {})",
+            pairs.len(),
+            our_t.len()
+        );
+        eprintln!(
+            "merge-stock: ship LID20006.DAT + REL00001.DAT + LID40006.DAT (ids rebased to base {base}){}; PA/LID30006/LID20000 are not spliced (skip them, stock stays)",
+            if outdir.join("LID20001.DAT").exists() { " + LID20001.DAT (appended city elements)" } else { "" }
+        );
+    }
     let (naddr, street_cell) = if no_genattr {
         (0, Default::default())
     } else {
@@ -290,11 +528,33 @@ fn main() {
             &addr_hits,
             &segs,
             &streets,
+            id_lo,
             nst,
             region_id,
         )
     };
-    let npa = if no_pa {
+    // splice our rebased GenAttr blocks onto the stock HNR file (keep stock house numbers intact)
+    if let (Some(dir), false) = (merge_stock.as_deref(), no_genattr) {
+        let p4 = outdir.join("LID40006.DAT");
+        match (
+            fs::read(Path::new(dir).join("LID40006.DAT")),
+            fs::read(&p4),
+        ) {
+            (Ok(stock4), Ok(our4)) => match lid_format::write::merge_gen_attr(&stock4, &our4) {
+                Ok(merged) => {
+                    eprintln!(
+                        "merge-stock: LID40006 spliced {:+.1} MB -> {:.1} MB",
+                        (merged.len() - stock4.len()) as f64 / 1e6,
+                        merged.len() as f64 / 1e6
+                    );
+                    let _ = fs::write(&p4, &merged);
+                }
+                Err(e) => eprintln!("merge-stock: LID40006 splice FAILED: {e}"),
+            },
+            _ => eprintln!("merge-stock: no stock LID40006.DAT in {dir} (skip HNR splice)"),
+        }
+    }
+    let npa = if no_pa || merge_stock.is_some() {
         0
     } else {
         write_pa(
@@ -307,7 +567,7 @@ fn main() {
             region_id,
         )
     };
-    let ncross = if no_crossings {
+    let ncross = if no_crossings || merge_stock.is_some() {
         0
     } else {
         write_crossings(
@@ -352,6 +612,8 @@ fn usage() {
         \t--no-pa        skip the PA_20006.DAT point-access-point file\n\
         \t--no-crossings skip the LID30006.DAT crossing (fileID+10000) file\
         \t--no-addr-list skip the LID20000.DAT listID-129 address gazetteer\n\
+        \t--merge-stock DIR  splice streets into raw stock DIR/LID20006.DAT + REL00001.DAT
+\t--city-radius N    fallback city match radius in PAU (default 500000)
         \t--stock-city-map TSV  city mode B: do NOT write LID20001/DB_CITY/GLOB_POI (stock card \n\
         \t                files stay); REL00001 city ids come from TSV 'name<TAB>id[,id...]'\n\
         \t                (element ids of the stock LID20001; device city index needs the stock \n\
@@ -1607,7 +1869,8 @@ fn write_gen_attr(
     hits: &[AddrHit],
     segs: &[OneCell],
     streets: &SidMap,
-    nst: usize,
+    id_lo: u32,
+    n: usize,
     region: u16,
 ) -> (usize, BTreeMap<u32, u32>) {
     use lid_format::write::{write_gen_attr_file, BlockData, ColData, ColKind};
@@ -1653,7 +1916,7 @@ fn write_gen_attr(
         owned.insert(sid);
         nrec_all += 1;
     }
-    if nst < 2 || nrec_all == 0 {
+    if n < 2 || nrec_all == 0 {
         return (0, Default::default());
     } // <2 blocks is invalid for the container; no addresses ⇒ nothing to write
       // Synthetic-row (unroutable street / pseudo-street) cell clusters: prefer the REAL one-cell
@@ -1674,16 +1937,16 @@ fn write_gen_attr(
         virt_cluster.insert(sid, near.map(|(_, cl)| cl).unwrap_or(cluster_next));
     }
 
-    // Always >= 2 blocks tiling [0, nst).
-    let nblk = (nst as usize).div_ceil(HN_ATTR_CHUNK).max(2);
-    let w = (nst as usize).div_ceil(nblk);
+    // Always >= 2 blocks tiling [id_lo, id_lo + n).
+    let nblk = n.div_ceil(HN_ATTR_CHUNK).max(2);
+    let w = n.div_ceil(nblk);
     let mut blocks = Vec::new();
     // sid -> (lowest numeric record, its 0xc11 table row): the PA/destination cell for the street
     // (bGetPACellIDs 00b898dc feeds its cell ids straight into the street block's enGetCells).
     let mut street_cell: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     let mut gid = 0u32; // author-space id for column 0x001: unique per record, ever-increasing
-    for lo in (0..nst as usize).step_by(w) {
-        let hi = (lo + w).min(nst as usize);
+    for lo in ((id_lo as usize)..(id_lo as usize + n)).step_by(w) {
+        let hi = (lo + w).min(id_lo as usize + n);
         let width = (hi - lo) as u32;
         let mut exists = vec![false; width as usize];
         let mut offs: Vec<u32> = Vec::new();
@@ -1904,7 +2167,7 @@ fn write_gen_attr(
         });
     }
     let outer = lid_format::header::nl_header(lid_format::header::KIND_GEN_ATTR, region, 3, 0);
-    let bytes = write_gen_attr_file(nst as u32, &outer, &blocks);
+    let bytes = write_gen_attr_file(id_lo + n as u32, &outer, &blocks);
     if fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
         return (0, Default::default());
@@ -2161,7 +2424,7 @@ fn write_cities(
     region: u16,
     list_id: u16,
     write_file: bool,
-) -> (usize, HashMap<String, u32>) {
+) -> (usize, HashMap<String, u32>, Vec<lid_format::NameEntry>) {
     use lid_format::NameEntry;
     let mut seen: HashSet<String> = HashSet::new();
     let mut entries: Vec<NameEntry> = Vec::new();
@@ -2184,7 +2447,7 @@ fn write_cities(
     let bytes = lid_format::encode_id(region, list_id, &entries);
     if write_file && fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
-        return (0, HashMap::new());
+        return (0, HashMap::new(), entries);
     }
     let mut idx = HashMap::new();
     if let Ok(nl) = lid_format::read(&bytes) {
@@ -2192,7 +2455,25 @@ fn write_cities(
             idx.entry(e.name.clone()).or_insert(i as u32);
         }
     }
-    (entries.len(), idx)
+    (entries.len(), idx, entries)
+}
+
+/// Drop the stock city-list postal prefix "NN NNN " from an element name.
+fn strip_postal(n: &str) -> &str {
+    let b = n.as_bytes();
+    if b.len() > 6
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2] == b' '
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+        && b[5].is_ascii_digit()
+        && b[6] == b' '
+    {
+        &n[7..]
+    } else {
+        n
+    }
 }
 
 fn in_bbox(c: (i64, i64), bbox: Option<(f64, f64, f64, f64)>) -> bool {

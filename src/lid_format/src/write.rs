@@ -431,3 +431,94 @@ mod crossing_tests {
         assert!(ci.decode_crossings(&bytes, 1).unwrap().is_empty());
     }
 }
+
+/// Splice OUR GenAttr file's blocks onto a STOCK GenAttr file (same card-validated idea as
+/// `lid_format::merge_name_list` for name-lists): keep every stock block byte-for-byte, append
+/// our blocks (their element ranges must start at/after the stock element count), rebuild the TOC
+/// and sub-header counters. Block sizes stay derived from consecutive TOC offsets.
+pub fn merge_gen_attr(stock: &[u8], our: &[u8]) -> Result<Vec<u8>, String> {
+    let u32b = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let parse = |b: &[u8]| -> Result<(usize, u32, u32, Vec<(usize, u32, u32)>), String> {
+        if b.len() < 0x18 || u32b(b, 0x10) < 0x10 {
+            return Err("genattr: bad outer header".into());
+        }
+        let hdr = u32b(b, 0x10) as usize;
+        if hdr + 12 > b.len() {
+            return Err("genattr: sub-header past EOF".into());
+        }
+        let elem = u32b(b, hdr);
+        let n = u32b(b, hdr + 8) as usize;
+        if hdr + 12 + 12 * n > b.len() {
+            return Err("genattr: TOC past EOF".into());
+        }
+        let toc = (0..n)
+            .map(|i| {
+                (
+                    u32b(b, hdr + 12 + 12 * i) as usize,
+                    u32b(b, hdr + 16 + 12 * i),
+                    u32b(b, hdr + 20 + 12 * i),
+                )
+            })
+            .collect();
+        Ok((hdr, elem, n as u32, toc))
+    };
+    let (sh, s_elem, s_n, s_toc) = parse(stock)?;
+    let (oh, o_elem, o_n, o_toc) = parse(our)?;
+    if oh != sh {
+        return Err("genattr: header split mismatch".into());
+    }
+    let first_start = s_toc
+        .first()
+        .map(|&(_, s, _)| s)
+        .ok_or("genattr: empty stock TOC")?;
+    if o_toc.iter().any(|&(_, s, _)| s < s_elem && s != first_start) {
+        return Err("genattr: our ranges overlap the stock id space".into());
+    }
+    // block payloads by TOC order (size = next offset, last runs to EOF)
+    let cut = |b: &[u8], toc: &[(usize, u32, u32)]| -> Vec<Vec<u8>> {
+        toc.iter()
+            .enumerate()
+            .map(|(i, &(o, _, _))| {
+                let e = if i + 1 < toc.len() {
+                    toc[i + 1].0
+                } else {
+                    b.len()
+                };
+                b[o.min(b.len())..e.max(o.min(b.len()))].to_vec()
+            })
+            .collect()
+    };
+    let s_blocks = cut(stock, &s_toc);
+    let o_blocks = cut(our, &o_toc);
+
+    let total = s_n as usize + o_n as usize;
+    let hdr = sh;
+    let toc_size = 16 + 12 * total;
+    let blocks_off = ((hdr + toc_size + 3) & !3).max(hdr + toc_size);
+    let mut out = stock[..hdr].to_vec();
+    out.resize(blocks_off, 0);
+    // sub-header @hdr: elem_count, x = total block bytes, toc_count; region size @0x14 per author rule
+    let total_bytes: usize = s_blocks.iter().map(|v| v.len()).sum::<usize>()
+        + o_blocks.iter().map(|v| v.len()).sum::<usize>();
+    out[hdr..hdr + 4].copy_from_slice(&o_elem.max(s_elem).to_le_bytes());
+    out[hdr + 4..hdr + 8].copy_from_slice(&(total_bytes as u32).to_le_bytes());
+    out[hdr + 8..hdr + 12].copy_from_slice(&(total as u32).to_le_bytes());
+    out[0x14..0x18].copy_from_slice(&((hdr + toc_size) as u32).to_le_bytes());
+    let mut bo = blocks_off;
+    let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(total);
+    for (blk, &(_, s, e)) in s_blocks.iter().zip(s_toc.iter()).chain(o_blocks.iter().zip(o_toc.iter()))
+    {
+        entries.push((bo as u32, s, e));
+        bo += blk.len();
+    }
+    for (i, (o, s, e)) in entries.iter().enumerate() {
+        let p = hdr + 12 + 12 * i;
+        out[p..p + 4].copy_from_slice(&o.to_le_bytes());
+        out[p + 4..p + 8].copy_from_slice(&s.to_le_bytes());
+        out[p + 8..p + 12].copy_from_slice(&e.to_le_bytes());
+    }
+    for blk in s_blocks.iter().chain(o_blocks.iter()) {
+        out.extend_from_slice(blk);
+    }
+    Ok(out)
+}
