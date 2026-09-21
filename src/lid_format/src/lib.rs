@@ -1397,6 +1397,9 @@ pub struct NameEntry {
     pub x_pau: i32,
     pub y_pau: i32,
     pub city: Option<(i32, i32)>,
+    /// Owning city element id (list 2) -> column 0x40c (stock street list fills it; the device
+    /// uses it to group streets under a city). `None` = street not listed under any city.
+    pub belonging: Option<u32>,
 }
 
 struct TrieNode {
@@ -1660,6 +1663,20 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
         }
     }
 
+    // --- belonging column (0x40c, stock street flavor): per-element owning city element id as
+    //     LSB-first existence bitmap (flags 0x4000 row) + VLE values (flags 0 row). The device
+    //     groups streets under a city through this column (stock street blocks fill ~3/4 rows). ---
+    let mut bel_bits = vec![0u8; (elem_count + 7) / 8];
+    let mut bel_vals: Vec<u8> = Vec::new();
+    let mut nbel = 0u32;
+    for (i, &id) in term.iter().enumerate() {
+        if let Some(b) = entries.get(id_to_leaf[id]).and_then(|e| e.belonging) {
+            bel_bits[i / 8] |= 1 << (i % 8);
+            bel_vals.extend_from_slice(&vle_encode(b));
+            nbel += 1;
+        }
+    }
+
     // --- numeric/flag streams ---
     let od_bytes = simple9_encode(&outdeg.iter().map(|&d| d as u32).collect::<Vec<u32>>(), 16);
     let loff_bytes: Vec<u8> = loff.iter().fold(Vec::new(), |acc, &o| {
@@ -1713,8 +1730,15 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
         (0x040a, 0x11, empty, 0),
         (0x440b, 0x02, empty, elem_count as u32),
         (0x040b, 0x11, empty, 0),
-        (0x440c, 0x02, empty, elem_count as u32), // belonging bitmap: none linked in-file
-        (0x040c, 0x11, empty, 0),                 // belonging values: none
+        (0x440c,
+         if anchor.is_some() && nbel > 0 { 0x01 } else { 0x02 },
+         if anchor.is_some() && nbel > 0 { &bel_bits } else { empty },
+         elem_count as u32), // belonging bitmap (LSB-first, stock row [26] code 0x01)
+        if anchor.is_some() && nbel > 0 {
+            (0x040c, 0x14, &bel_vals, nbel) // belonging city-element ids (VLE, row [27])
+        } else {
+            (0x040c, 0x11, empty, 0)
+        },
         (0x8415, 0x18, &binlist_bytes, elem_count as u32), // mandatory BinList (zero stream)
         (0x0415, 0x01, empty, 0),
         (0x040f, 0x02, empty, elem_count as u32),
@@ -1758,6 +1782,7 @@ mod tests {
             x_pau: x,
             y_pau: 5,
             city: Some((100, cy)),
+            belonging: None,
         };
         let entries = vec![
             e("Osada", 10, 1),
@@ -2109,5 +2134,142 @@ mod tests {
             assert_eq!(s.param, 3, "{col:03x} existence param");
             assert!(s.bits.iter().all(|&b| !b), "{col:03x} all missing");
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_test {
+    use super::*;
+
+    fn u32b(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+    fn u16b(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+    }
+    fn vled(b: &[u8], mut p: usize, n: usize) -> (Vec<u32>, usize) {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut acc = 0u32;
+            loop {
+                let byte = b[p] as u32;
+                p += 1;
+                acc = if byte & 0x80 != 0 {
+                    byte - 0x7f + acc * 128
+                } else {
+                    byte + acc * 128
+                };
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            out.push(acc);
+        }
+        (out, p)
+    }
+
+    /// Card experiment "KRZESZOWICE block splice": take the STOCK LID20006 byte-for-byte and append
+    /// ONE extra mode-C block with our Krzeszowice streets (global element ids 974871..), rewriting
+    /// only the sub-header bookkeeping (elem_count, A, sec0 sizes, sec1 table, extra). Everything
+    /// the device already accepts stays untouched — a failure localizes to OUR block content.
+    #[test]
+    #[ignore = "card experiment: needs FW + krz.tsv"]
+    fn splice_krz_block_into_stock() {
+        let stock = std::fs::read(
+            "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/LID20006.DAT",
+        )
+        .unwrap();
+        let hdr = u32b(&stock, 0x10) as usize;
+        let extra = u32b(&stock, 0x14) as usize;
+        let elem = u32b(&stock, hdr);
+        let a = u16b(&stock, hdr + 4) as usize;
+        let corner = (u32b(&stock, hdr + 0x10), u32b(&stock, hdr + 0x14));
+        let sec = |i: usize| (stock[hdr + 24 + 5 * i], u32b(&stock, hdr + 25 + 5 * i) as usize);
+        let (c0, o0) = sec(0);
+        let (c1, o1) = sec(1);
+        let o5 = sec(5).1;
+        let o6 = sec(6).1;
+        assert_eq!((c0, c1), (0x14, 0x11));
+        assert_eq!(o5, o1 + 4 * a); // sec2..4 empty
+        let sizes_at = stock[o0..o1].to_vec();
+        let (sizes, _) = vled(&sizes_at, 0, a);
+        let sec5 = stock[o5..o6].to_vec();
+        let sec6 = stock[o6..hdr + extra].to_vec();
+        let blocks_end = stock.len();
+
+        // our entries (absolute PAU coords in tsv; anchor = stock file corner)
+        let tsv = std::fs::read_to_string("/tmp/rnwwork/t27dbg/krz.tsv").unwrap();
+        let entries: Vec<NameEntry> = tsv
+            .lines()
+            .map(|l| {
+                let mut it = l.rsplitn(3, '|');
+                let y: i32 = it.next().unwrap().parse().unwrap();
+                let x: i32 = it.next().unwrap().parse().unwrap();
+                let label = it.next().unwrap().replace("\\t", "\t");
+                NameEntry {
+                    label,
+                    x_pau: x,
+                    y_pau: y,
+                    city: None,
+                    belonging: None,
+                }
+            })
+            .collect();
+        let anchor = ((corner.0 as i32, corner.1 as i32));
+        let (blk, k) = build_block(Some(anchor), &entries);
+        assert_eq!(k, entries.len());
+        let elem0 = elem + k as u32;
+
+        // new sub-header: sec0 += our size, sec1 += one abs offset, extra shifts everything
+        let mut sec0 = sizes_at.clone();
+        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
+        let no1 = hdr + 59 + sec0.len();
+        let no5 = no1 + 4 * (a + 1);
+        let nextra = 59 + sec0.len() + 4 * (a + 1) + sec5.len() + sec6.len();
+        let nblocks0 = hdr + nextra;
+
+        let mut f = stock[..hdr].to_vec();
+        f[0x14..0x18].copy_from_slice(&(nextra as u32).to_le_bytes());
+        f.extend_from_slice(&elem0.to_le_bytes());
+        f.extend_from_slice(&((a + 1) as u16).to_le_bytes());
+        f.extend_from_slice(&stock[hdr + 6..hdr + 24]); // B..F + corner
+        for (code, off) in [
+            (0x14u8, hdr + 59),
+            (0x11, no1),
+            (0x11, no5),
+            (0x11, no5),
+            (0x11, no5),
+            (0x14, no5),
+            (0x14, no5 + sec5.len()),
+        ] {
+            f.push(code);
+            f.extend_from_slice(&(off as u32).to_le_bytes());
+        }
+        f.extend_from_slice(&sec0);
+        let mut p = nblocks0;
+        for sz in sizes.iter().map(|&x| x as usize).chain(std::iter::once(blk.len())) {
+            f.extend_from_slice(&(p as u32).to_le_bytes());
+            p += sz;
+        }
+        f.extend_from_slice(&sec5);
+        f.extend_from_slice(&sec6);
+        assert_eq!(f.len(), nblocks0);
+        for i in 0..a {
+            let off = u32b(&stock, o1 + 4 * i) as usize;
+            let sz = if i + 1 < a {
+                u32b(&stock, o1 + 4 * (i + 1)) as usize - off
+            } else {
+                blocks_end - off
+            };
+            // NOTE: sizes[] above are byte sizes from sec0; they must match the offsets delta
+            assert_eq!(sz, sizes[i] as usize, "stock block size mismatch {i}");
+            f.extend_from_slice(&stock[off..off + sz]);
+        }
+        f.extend_from_slice(&blk);
+        std::fs::create_dir_all("/tmp/rnwwork/t27dbg/outG").unwrap();
+        std::fs::write("/tmp/rnwwork/t27dbg/outG/LID20006.DAT", &f).unwrap();
+        println!("spliced: elem {elem0} (stock {elem} + {k}), A {}, size {:#x}", a + 1, f.len());
+        let nl = read(&f).expect("merged file must read back");
+        assert_eq!(nl.element_count as u32, elem0);
     }
 }

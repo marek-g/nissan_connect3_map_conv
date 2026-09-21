@@ -255,8 +255,14 @@ fn main() {
                 x_pau: *cx as i32,
                 y_pau: *cy as i32,
                 city: city_coord,
+                belonging: None,
             });
         }
+    }
+    // street -> owning city element id (column 0x40c): the device lists a city's streets through
+    // this in-file column, same ids REL00001 uses as targets (ambiguous names: first stock id).
+    for (e, town) in st_entries.iter_mut().zip(city_of.iter()) {
+        e.belonging = town.as_ref().and_then(|t| city_ids.get(t)).and_then(|v| v.first()).copied();
     }
     let (nst, streets) =
         write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
@@ -767,6 +773,7 @@ fn collect_street_entries(
             x_pau: cx as i32,
             y_pau: cy as i32,
             city: city.map(|(_, c)| c),
+            belonging: None,
         });
     }
     (entries, city_of)
@@ -1315,6 +1322,7 @@ fn write_addr_list(
             x_pau: -1,
             y_pau: -1,
             city: None,
+            belonging: None,
         })
         .collect();
     let bytes = lid_format::encode_id(region, 129, &list);
@@ -2170,6 +2178,7 @@ fn write_cities(
             x_pau: c.0 as i32,
             y_pau: c.1 as i32,
             city: None,
+            belonging: None,
         });
     }
     let bytes = lid_format::encode_id(region, list_id, &entries);

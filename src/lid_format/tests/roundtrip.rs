@@ -14,6 +14,7 @@ fn roundtrip(names: &[&str]) {
             } else {
                 Some((300_000_000, 250_000_000))
             },
+            belonging: None,
         })
         .collect();
     let bytes = encode(&entries);
@@ -78,6 +79,7 @@ fn gazetteer_has_no_positions() {
             x_pau: 100 * i as i32,
             y_pau: -7 * i as i32,
             city: None,
+            belonging: None,
         })
         .collect();
     let bytes = encode(&entries);
@@ -102,6 +104,7 @@ fn many_blocks() {
                 x_pau: i as i32 * 13,
                 y_pau: -(i as i32) * 11,
                 city: Some((0, 0)),
+                belonging: None,
             }
         })
         .collect();

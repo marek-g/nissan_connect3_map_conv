@@ -540,3 +540,126 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod card_tests {
+    /// Card-debug probe (run manually): row-query (by_source=false, tgt=city id) our generated
+    /// REL00001 for KRZESZOWICE's city element id; must return the street src ids.
+    #[test]
+    #[ignore = "needs /tmp card files"]
+    fn city_to_street_rows() {
+        for path in ["/tmp/rnwwork/t27dbg/outE/REL00001.DAT"] {
+            let b = std::fs::read(path).unwrap();
+            let idx = super::RelIndex::parse(&b).unwrap();
+            for city in [109625u32] {
+                let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
+                println!("{path} city {city} -> {} streets", r.len());
+            }
+        }
+    }
+
+    /// Same row query on the STOCK REL00001 for a stock Warsaw city id (control).
+    #[test]
+    #[ignore = "needs card files"]
+    fn city_to_street_rows_stock() {
+        let p = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT";
+        let b = std::fs::read(p).unwrap();
+        let idx = super::RelIndex::parse(&b).unwrap();
+        for city in [7427u32, 160202, 300619] {
+            let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
+            println!("stock REL00001 by_tgt city {city} -> {} streets", r.len());
+        }
+        let known: Vec<(String, bool, u32)> = vec![
+            ("/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT".into(), true, 5),
+            ("/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT".into(), false, 160202),
+            ("/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00002.DAT".into(), true, 7427),
+            ("/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00000.DAT".into(), true, 7427),
+        ];
+        for (p2, bs, id) in known {
+            let b = std::fs::read(&p2).unwrap();
+            let idx = super::RelIndex::parse(&b).unwrap();
+            let r = super::get_relations(&b, &idx, bs, id, id + 1).unwrap();
+            println!("{} by_src={} {id} -> {} rels", p2.split('/').next_back().unwrap(), bs, r.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod stock_reemit {
+    /// Emit stock REL00001 POL pairs through OUR writer into /tmp/rnwwork/t27dbg/outF for a card
+    /// isolation test (stock LID20006 + OUR re-emitted REL00001).
+    #[test]
+    #[ignore = "writes /tmp card-test file"]
+    fn reemit_stock_rel00001() {
+        let src = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT";
+        let b = std::fs::read(src).unwrap();
+        let idx = super::RelIndex::parse(&b).unwrap();
+        let mut rels = super::get_relations(&b, &idx, true, 0, idx.d[2] + 1).unwrap();
+        rels.sort_unstable();
+        rels.dedup();
+        println!("stock REL00001 pairs: {}", rels.len());
+        let mine = super::write_rel_grid(
+            u64::from(idx.d[2]),
+            u64::from(idx.d[3]),
+            idx.d[0] as u16,
+            idx.d[1] as u16,
+            u64::from(idx.d[4]),
+            u64::from(idx.d[5]),
+            u64::from(idx.d[6]),
+            u64::from(idx.d[7]),
+            &rels,
+        )
+        .unwrap();
+        std::fs::write("/tmp/rnwwork/t27dbg/outF/REL00001.DAT", &mine).unwrap();
+        let midx = super::RelIndex::parse(&mine).unwrap();
+        let back = super::get_relations(&mine, &midx, true, 0, idx.d[2] + 1).unwrap();
+        assert_eq!(back.len(), rels.len());
+        let crz = super::get_relations(&mine, &midx, false, 160202, 160203).unwrap();
+        println!("row-query 160202 -> {} streets", crz.len());
+        assert!(!crz.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod merge_rel_test {
+    /// Card experiment companion: REL00001 = stock pairs MINUS KRZESZOWICE(109625) rows PLUS rows
+    /// pointing at the spliced street elements (global ids 974871..974918) -> city 109625 must
+    /// answer with exactly our streets, other cities stay stock.
+    #[test]
+    #[ignore = "card experiment"]
+    fn merge_rel_krz() {
+        let src = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/REL00001.DAT";
+        let b = std::fs::read(src).unwrap();
+        let idx = super::RelIndex::parse(&b).unwrap();
+        let all = super::get_relations(&b, &idx, true, 0, idx.d[2] + 1).unwrap();
+        let mut rels: Vec<(u32, u32)> = all.iter().copied().filter(|&(_, t)| t != 109625).collect();
+        let base = idx.d[2]; // 974871
+        let nk = std::fs::read_to_string("/tmp/rnwwork/t27dbg/krz.tsv").unwrap().lines().count() as u32;
+        for i in 0..nk {
+            rels.push((base + i, 109625));
+        }
+        rels.sort_unstable();
+        rels.dedup();
+        let mine = super::write_rel_grid(
+            u64::from(base + nk),
+            u64::from(idx.d[3]),
+            idx.d[0] as u16,
+            idx.d[1] as u16,
+            u64::from(idx.d[4]),
+            u64::from(idx.d[5]),
+            u64::from(idx.d[6]),
+            u64::from(idx.d[7]),
+            &rels,
+        )
+        .unwrap();
+        std::fs::write("/tmp/rnwwork/t27dbg/outG/REL00001.DAT", &mine).unwrap();
+        let midx = super::RelIndex::parse(&mine).unwrap();
+        let krz = super::get_relations(&mine, &midx, false, 109625, 109626).unwrap();
+        println!("KRZ rows: {}", krz.len());
+        assert_eq!(krz.len(), nk as usize);
+        assert!(krz.iter().all(|&(t, s)| t == 109625 && s >= base));
+        let waw = super::get_relations(&mine, &midx, false, 160202, 160203).unwrap();
+        println!("control city 160202 rows: {}", waw.len());
+        assert!(!waw.is_empty());
+    }
+}
