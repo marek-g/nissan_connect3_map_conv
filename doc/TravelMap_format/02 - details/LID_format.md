@@ -376,6 +376,42 @@ Position = `PA` point if present, else `pos = street[i + idx/(n-1)]` between the
 
 ### 10.4 End-to-end flow (typed "city → street → number")
 
+> **City-index gating (CONFIRMED 2026-09-20, card trial 27 + `vPopulateCityIndices` @0x00c73b68
+> decompiled):** each city element's properties carry a **language set** and the index build
+> **drops every element whose set lacks the current UI language** (`u8GetCurrUILangIndex` →
+> `find` over the element's lang list, `skip` on miss); stock LID20001 = 45 blocks × 36 column
+> descriptors carrying those language + position vectors (blocks are ~alphabet chunks of ≈5 k
+> elements, each city repeated once per language spelling: 241 269 elements ≈ 89 k places).
+> A minimal name-list (1 block, trie + labels only, no lang/pos columns) builds an **empty city
+> index** — card symptom: empty city list, no error, no reboot. Consequences for `osm2lid`:
+> writing a consumable city list needs the full column model (**mode C, RE pending**); until then
+> use **`--stock-city-map` (mode B)**: ship *streets + GenAttr + PA + REL* only and pair the
+> streets with **stock LID20001 city element ids** (dump the stock name-list, match the folded
+> Polish name, keep gmina-ZIP-prefixed / prefix-less ids — the 10000/20000-variant arithmetic
+> and the `(src=street cat3, tgt=city cat2)` REL domains are stock-identical, verified REL00001
+> decodes back with 61 stock city ids). Whether the *street* step is language-filtered the same
+> way is UNTESTED (trial 27 rev B is the experiment).
+
+> **Card correction (2026-09-20, trial 27 bisect): the empty-city-list symptom is NOT sufficient
+> evidence for the language gate.** Rev B shipped the STOCK city files (LID20001 + GLOB_POI) yet
+> the list stayed empty — the list revived only after the stock `LID20006`/`LID40006`/`REL00001`
+> were restored, i.e. **our generated street-family LID files poison the whole NL init** (bisect
+> which one pending), and separately **deleting any META-listed LID file also kills NL init**
+> (a swapped file must be REPLACED, never removed). The language-column model above stands as a
+> property of `vPopulateCityIndices`, but is DEMOTED to *unproven as the failure cause* for
+> minimal files; the clean experiment (stock baseline + ONLY a generated LID20001) still has to
+> run before mode C is sized.
+>
+> **C1 RESULT (2026-09-20 eve) — the experiment RAN and the gate is CONFIRMED:** card = fully
+> stock LID + ONLY our generated `LID20001` (1 block, no language/position columns) → city list
+> empty; and the sibling experiment L1 = fully stock + ONLY our generated `LID20006` → ALL of
+> address search dead. NL init is **all-or-nothing** and rejects ANY minimal name-list, so the
+> **full 36-descriptor column model is a hard prerequisite for every generated name-list file**
+> (mode C), city and street alike — `--stock-city-map` (mode B) remains the only shippable
+> street/REL/GenAttr path until mode C lands. Stock street-name format note for mode C: elements
+> are `"NAME, SETTLEMENT"` in ONE name column and ALL 974 871 stock street elements carry position
+> columns (lid2dump `has_pos=1` everywhere).
+
 1. `bProcOSDEAddress` `00c337b0` → `bSearchAddress` `00c771a8`.
 2. Parse line by tags (`enParseLineForTags` `00c84cfc`: `city:→2 zip:→0x3d street:→3 houseno:→5`).
 3. `bSearchRootNames` `00c75f28` locates region roots (`CONNECT.DAT`/META PSF) → `bSearchStreetsAndCities` `00c766b4`
@@ -480,6 +516,98 @@ Block header `NLAsfBlock` @`00cdf404`: `u16 total, u16 x, u16 y, u16 ndescr` (le
 
 Fixed ints little-endian (`ReadUnsigned<u32>` `00cdb2e8`). Code `0x0d` is **invalid** (decoders reject it) →
 confirms the header `0d 00`s are counts, and `0x0dNN` high-bytes elsewhere are PA/GenAttr column tags.
+
+### 11.4b MODE C: the device-mandatory 36-descriptor template (**[CONFIRMED 2026-09 — device rejects anything less]**)
+
+Card-proven (L1 + C1, 2026-09-20): a name-list block carrying only our 8-column minimal set makes
+`NLProcessor` init fail all-or-nothing (city list empty / all address search dead) even when the file
+header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OUT`):
+
+* `NLAsfBlock::SetDataBlock` `00cdf404` → `enSetListDescriptions` `00cdc0c0` → `enDecodeTreeStructure`
+  `00cdf360` → `enDecodeAttrLists` `00cddf18`. Any sub-decode returning `!= 1` aborts the block.
+* Unknown descriptor kinds are silently skipped (`switch default:`), but the block object ALWAYS has the
+  fixed column slots (constructor `00cdedd8`) and ALWAYS decodes the ungated ones. An unset slot carries
+  descriptor `{code=0,off=0,count=0}` → `NLBitfieldDecoder`/`NLStandardDecoder` hit an invalid code path →
+  return 0 → **abort**. That is exactly why our minimal files die.
+* Kind → slot dispatch (`00cdc0c0`): `0x401` SimpleList<u16> outDegree, `0x402` BlockLink (bitmap+targets),
+  `0x403` EdgeLabelList (blob + edge-offsets), `0x404`/`0x405` ValueList<u16> (EDGE domain),
+  `0x406` SimpleList<u32> = **edge→child-target array** (device's PSF walk source of truth),
+  `0x407` Position, `0x408` SingleValue<u32>, `0x409` ValueList<u32>, `0x40a/0x40b/0x40c` SingleValue<u32>
+  (`0x40c` = belonging-city), `0x40d/0x40f/0x410/0x411/0x412/0x414/0x416` Binary, `0x40e` SingleValue<u32>,
+  `0x413` Binary (edge domain), `0x415` BinList.
+* **Tree pass (`00cdf360`, ALL FOUR always decoded, ungated):** `0x403` EdgeLabel, `0x402` BlockLink,
+  `0x406` child targets, `0x401` outDegree. `0x406` MUST carry the real per-edge target array (stock
+  street blk0: 10 764 u32 Simple9(code 0x18) in 4 196 B). `CalculateFirstEdgeIndex` +
+  `CalculateTerminatingElementIndex` run AFTER the decode.
+* **Attr pass gates** (`enDecodeAttrLists` + `NLAsfBlockElemDecodeOptions`): **ungated/mandatory:**
+  `0x404`, `0x405`, `0x413`, `0x415` (+ trailing `0x416`, return unchecked). Gated by options[0..12]:
+  `0x407`[0], `0x408`[1], `0x409`[2], `0x40c`[3], `0x40b`[4], `0x40a`[5], `0x40d`[6], `0x40e`[7],
+  `0x40f`[8], `0x410`[9], `0x411`[10], `0x412`[11], `0x414`[12]. A gated column may be absent only if its
+  option is off — the option set comes from the search context and we cannot rely on any subset being off
+  for all queries ⇒ **emit every column, every time.**
+* Every stock block (both LID20001 city and LID20006 street, all 45/98 blocks) uses the SAME 36-row
+  descriptor table in the SAME order. Stock street template (our target shape), row order + codecs:
+
+| # | row (raw u16 kind|flags) | code | param | content (street) |
+|---|---|---|---|---|
+| 0 | `0x4402` | 0x02 | nodes | block-link bitmap (all-clear if no links) |
+| 1 | `0x0402` | 0x14 | 2K | block-link (blk,node) pairs (0 = none) |
+| 2 | `0x0401` | **0x18** | nodes | outDegree Simple9 (**not 0x11**) |
+| 3 | `0x4404` | 0x02 | edges | existence bitmap all-clear |
+| 4 | `0x8404` | 0x11 | 0 | tertiary empty |
+| 5 | `0x0404` | 0x11 | 0 | values empty |
+| 6 | `0x4405` | 0x02 | edges | existence bitmap all-clear |
+| 7 | `0x8405` | 0x11 | 0 | empty |
+| 8 | `0x0405` | 0x11 | 0 | empty |
+| 9 | `0x8403` | 0x14 | edges | edge-label OFFSETS (flags **0x8000**, not 0x4000!) |
+| 10 | `0x0403` | 0x11 | blobLen | edge-label blob |
+| 11 | `0x0406` | **0x18** | edges | **child targets u32 (Simple9) — REAL DATA** |
+| 12 | `0x0413` | 0x02 | edges | binary all-clear |
+| 13 | `0x4407` | 0x03 | elems | has-position (sparse-clear=none, code 0x03+empty=all) |
+| 14 | `0x0407` | 0x14 | elems | coords VLE (interleaved X,Y of set bits) |
+| 15 | `0x440e` | 0x02 | elems | bitmap all-clear |
+| 16 | `0x040e` | 0x11 | 0 | empty |
+| 17 | `0x4408` | 0x01/02 | elems | per-element values bitmap |
+| 18 | `0x0408` | 0x14 | K | values (1 456 of 8 682 in street blk0) |
+| 19–21 | `0x4409`/`0x8409`/`0x0409` | 0x02/11/11 | elems/0/0 | triple, all-empty |
+| 22–23 | `0x440a`/`0x040a` | 0x02/0x11 | elems/0 | pair empty |
+| 24–25 | `0x440b`/`0x040b` | 0x02/0x11 | elems/0 | pair empty (city: 0x040b carries 4 718 values) |
+| 26–27 | `0x440c`/`0x040c` | 0x01/0x14 | elems/K | belonging-city bitmap + values (street real, city empty) |
+| 28 | `0x8415` | **0x18** | elems | BinList stream — REAL in street (8 682 vals in 1 244 B) |
+| 29 | `0x0415` | 0x01 | 0 | (values stream empty) |
+| 30 | `0x040f` | 0x01 | elems | raw bitmap — REAL in street (1 086 B = ⌈elems/8⌉) |
+| 31 | `0x0410` | 0x01 | elems | raw bitmap — REAL in street |
+| 32 | `0x0411` | 0x02 | elems | empty |
+| 33 | `0x0414` | 0x02 | elems | empty |
+| 34 | `0x0412` | 0x01 | elems | raw bitmap — REAL in street |
+| 35 | `0x040d` | 0x03 | elems | sparse-clear, empty span (runs to block end) |
+
+Semantics still unknown for street-real columns `0x40f`/`0x410`/`0x412` (elems-sized bitmaps) and the
+`0x415` BinList stream (elems u32, Simple9, ~7:1). For the FIRST device test these are emitted
+all-clear / all-zero (valid code+span); refine from stock data if a functional gap shows up.
+Empty-column legal patterns (all seen in stock): existence rows `kind|0x4000, code 0x02, param=count,
+span=0`; value rows `kind, code 0x11, param=0, span=0`. Rows may tie (same off) — span follows row order.
+
+### 11.4c The file-level gate: `NLNameList::LoadHeader` `00e0e63c` (**[CONFIRMED 2026-09-21 — the real L1/C1 poison]**)
+
+Card tests kept rejecting our name-lists even after the block template fix — because rejection
+happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; the header is not):
+
+* Sub-header (right after the 0x77 outer header): `u32 element_count`, **six u16 section counts**
+  `A B C D E F` (A = block count, F = `8` constant), `u32` origin X, `u32` origin Y, then
+  **7 section entries `{u8 code, u32 abs_off}`**.
+* Seven vectors MUST decode from their spans (`off[i+1]−off[i]`, last = `hdr+extra−off[6]`) with
+  **EXACT consumption** (cursor check after every stream; the last sec6 is exempt):
+  `sec0/1` u32 count A (`sec0` = block BYTE SIZES VLE, `sec1` = ABSOLUTE block offsets raw — the old
+  "flags u32 at +0x0c" was really counts `E|F<<16`), `sec2/3` u32 count B, `sec4` u16 count C,
+  `sec5` u16 count D, `sec6` u16 count E. Any absent section entry (code 0, garbage span) → return 0
+  → NL init all-or-nothing (that is why our files died even with correct blocks).
+* Stock content (POL): street `20006` → `B=0 C=0 D=1 sec5=[3]` (= its REL list id) `E=1 sec6=[39]`
+  (= the card POL language id); city `20001` → `B=180` (=4·blocks link-pair mirror: sec2 VLE
+  target-block, sec3 raw target-node), `C=4 sec4=[0,1,3,6]`, `D=3 sec5=[2,60,61]`, `E=29` = Simple9
+  list of every language id the file carries; gazetteer `20000` → `B=C=D=E=0`.
+* `osm2lid` now emits the stock street shape (verified by a `LoadHeader` byte-simulator: stock files
+  and our new files PASS, the pre-fix files REJECT at `code 0x00` sections).
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
@@ -1071,6 +1199,10 @@ any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card te
    points for houses; device-fallback-safe). All files carry the canonical 0x77 outer header with their
    `rIdxListID` identity (`lid_format::header`, byte-verified against stock); `osm2lid/tests/genattr.rs` and
    `osm2lid/tests/point_addr.rs` assert identities + REL matrix + PA device-walk end-to-end.
+   **Card test 2026-09-20 (trial 27):** street/GenAttr files accepted into the trees, but the generated
+   city list yields an EMPTY device city index (§10.4 language/position-column gate) → city mode B
+   (`osm2lid --stock-city-map TSV`: stock city files stay on the card, REL pairs streets to stock
+   city element ids); fully consumable city file = mode C (36-descriptor column writer), pending.
    **Nothing is on-device-validated yet — first card test pending.**
      **Still pending:** own META writer and on-device acceptance
      (`NLHnrToTree` against a real card). The crossing family (+10000) is **DECODED** (2026-09, golden

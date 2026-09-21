@@ -93,6 +93,7 @@ fn main() {
     let mut no_pa = false;
     let mut no_crossings = false;
     let mut no_addr_list = false;
+    let mut stock_city_map: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -117,6 +118,10 @@ fn main() {
             "--no-pa" => no_pa = true,
             "--no-crossings" => no_crossings = true,
             "--no-addr-list" => no_addr_list = true,
+            "--stock-city-map" => {
+                i += 1;
+                stock_city_map = args.get(i).cloned();
+            }
             "-h" | "--help" => {
                 usage();
                 exit(0);
@@ -169,16 +174,58 @@ fn main() {
         exit(1);
     });
 
-    let npoi = write_glob_poi(
-        &outdir.join("GLOB_POI.DAT"),
-        &data,
-        region_id,
-        lang,
-        bbox,
-        !no_poi,
-    );
-    let ncity = write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox);
-    let (ncit, city_idx) = write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2);
+    // City-stack mode: with --stock-city-map the STOCK LID20001/DB_CITY/GLOB_POI stay on the
+    // card (device city index needs per-element language+position columns we do not emit —
+    // LID_format.md §10.4 vPopulateCityIndices); we only ship streets/HNR/PA + REL whose city
+    // ids are looked up in the stock name-list.
+    let stock_cities = stock_city_map.is_some();
+    let npoi = if stock_cities {
+        0
+    } else {
+        write_glob_poi(
+            &outdir.join("GLOB_POI.DAT"),
+            &data,
+            region_id,
+            lang,
+            bbox,
+            !no_poi,
+        )
+    };
+    let ncity = if stock_cities {
+        0
+    } else {
+        write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox)
+    };
+    let (ncit, city_idx) =
+        write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2, !stock_cities);
+    let city_ids: HashMap<String, Vec<u32>> = match &stock_city_map {
+        Some(p) => {
+            let mut m: HashMap<String, Vec<u32>> = HashMap::new();
+            let txt = fs::read_to_string(p).unwrap_or_else(|e| {
+                eprintln!("--stock-city-map {p}: {e}");
+                exit(1);
+            });
+            for line in txt.lines() {
+                if let Some((n, ids)) = line.split_once('\t') {
+                    let v: Vec<u32> = ids
+                        .split(',')
+                        .filter_map(|x| x.trim().parse().ok())
+                        .collect();
+                    if !v.is_empty() {
+                        m.insert(n.trim().to_string(), v);
+                    }
+                }
+            }
+            let miss: Vec<&String> = city_idx.keys().filter(|k| !m.contains_key(k.as_str())).collect();
+            eprintln!(
+                "stock-city-map: {}/{} towns mapped to stock city ids; no map (city omitted from REL): {miss:?}",
+                city_idx.len() - miss.len(),
+                city_idx.len()
+            );
+            m
+        }
+        None => city_idx.iter().map(|(k, v)| (k.clone(), vec![*v])).collect(),
+    };
     let segs = build_onecells(&data, bbox);
     eprintln!(
         "onecells: {} clusters: {}",
@@ -226,7 +273,7 @@ fn main() {
         &st_entries,
         &city_of,
         &streets.sid_of_entry,
-        &city_idx,
+        &city_ids,
         &city_coords,
     );
     let (naddr, street_cell) = if no_genattr {
@@ -298,7 +345,11 @@ fn usage() {
         \t--no-genattr   skip the LID40006.DAT house-number (GenAttr +20000) file\n\
         \t--no-pa        skip the PA_20006.DAT point-access-point file\n\
         \t--no-crossings skip the LID30006.DAT crossing (fileID+10000) file\
-        \t--no-addr-list skip the LID20000.DAT listID-129 address gazetteer"
+        \t--no-addr-list skip the LID20000.DAT listID-129 address gazetteer\n\
+        \t--stock-city-map TSV  city mode B: do NOT write LID20001/DB_CITY/GLOB_POI (stock card \n\
+        \t                files stay); REL00001 city ids come from TSV 'name<TAB>id[,id...]'\n\
+        \t                (element ids of the stock LID20001; device city index needs the stock \n\
+        \t                per-element language+position columns — see LID_format.md sec.10.4)"
     );
 }
 
@@ -2034,7 +2085,7 @@ fn write_street_city_rel(
     entries: &[lid_format::NameEntry],
     city_of: &[Option<String>],
     sid_of_entry: &[u32],
-    city_idx: &HashMap<String, u32>,
+    city_idx: &HashMap<String, Vec<u32>>,
     city_coords: &std::collections::BTreeMap<&String, (i64, i64)>,
 ) -> usize {
     let src_elems = sid_of_entry
@@ -2043,24 +2094,30 @@ fn write_street_city_rel(
         .filter(|&s| s != u32::MAX)
         .max()
         .map_or(0, |m| m + 1) as u64;
-    let tgt_elems = city_idx.len() as u64;
+    let tgt_elems = city_idx
+        .values()
+        .flatten()
+        .max()
+        .map_or(0, |&m| m as u64 + 1);
     let mut rels: Vec<(u32, u32)> = Vec::new();
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    fn add_pairs(s: u32, cn: &Option<String>, m: &HashMap<String, Vec<u32>>, seen: &mut std::collections::HashSet<(u32, u32)>, rels: &mut Vec<(u32, u32)>) {
+        if let Some(ids) = cn.as_ref().and_then(|c| m.get(c.as_str())) {
+            for &t in ids {
+                if seen.insert((s, t)) {
+                    rels.push((s, t));
+                }
+            }
+        }
+    }
     for ((e, city), &s) in entries.iter().zip(city_of).zip(sid_of_entry) {
         if s == u32::MAX {
             continue;
         }
-        if let Some(t) = city.as_ref().and_then(|cn| city_idx.get(cn.as_str())) {
-            seen.insert((s, *t));
-            rels.push((s, *t));
-        }
+        add_pairs(s, city, city_idx, &mut seen, &mut rels);
         for (cn, cc) in city_coords {
             if pt_seg_d2((e.x_pau as i64, e.y_pau as i64), *cc, *cc) <= m2d2(3000.0) {
-                if let Some(t) = city_idx.get(cn.as_str()) {
-                    if seen.insert((s, *t)) {
-                        rels.push((s, *t));
-                    }
-                }
+                add_pairs(s, &Some(cn.to_string()), city_idx, &mut seen, &mut rels);
             }
         }
     }
@@ -2095,6 +2152,7 @@ fn write_cities(
     bbox: Option<(f64, f64, f64, f64)>,
     region: u16,
     list_id: u16,
+    write_file: bool,
 ) -> (usize, HashMap<String, u32>) {
     use lid_format::NameEntry;
     let mut seen: HashSet<String> = HashSet::new();
@@ -2115,7 +2173,7 @@ fn write_cities(
         });
     }
     let bytes = lid_format::encode_id(region, list_id, &entries);
-    if fs::write(path, &bytes).is_err() {
+    if write_file && fs::write(path, &bytes).is_err() {
         eprintln!("write {path:?} failed");
         return (0, HashMap::new());
     }

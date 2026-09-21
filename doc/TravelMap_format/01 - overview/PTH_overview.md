@@ -162,6 +162,15 @@ Source-file paths embedded in the binary (confirms the subsystems):
 - The records are read by `rnw_tclClusterSection::bReadPSF` (one per entry, count from the header).
 
 ### Not yet decoded (writer blockers)
+> **TRIGGER RESOLVED (2026-09-20, `u16PatchCluster` @0x0090ac3c decompiled).** The patch step is
+> **gated by the cluster tier word** `u16@+2`: `if (!(word & 0x80)) return;` — a cluster is only
+> ever matched against `.PTH` data when **bit 7** is set, and the **patch index is bits 0–2** of the
+> same word (`sprintf("NAV____%01u.PTH", word & 7)`; this is also why some stock roots read
+> `0x00a3` = gateway `0x23` | bit7 | index 3). A base file written WITHOUT bit7 (our generator:
+> leaves `0x0000`, root `0x0023` by design) makes `u16PatchCluster` a hard no-op — the CONNECT
+> tree is not even opened for it — so generated clusters can NEVER be hit by a stock `.PTH`
+> delta, regardless of cluster-id collisions. Items 1–3 below therefore no longer block the
+> writer; they only matter for reproducing the post-patch state of stock-patched regions.
 1. **`.PTH` header layout** — meaning of the preamble words (`0x1064`, `0x102e7400`, `0x1040`, …), where
    the section count lives, and the per-region `patchIndex` (the `%01u`, 0–3) selection rule.
 2. **`rnw_tclClusterSection::bReadPSF` record format** — what a single patch entry carries (which base

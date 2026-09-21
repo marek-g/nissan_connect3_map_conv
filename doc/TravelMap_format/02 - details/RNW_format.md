@@ -59,7 +59,7 @@ PROCNAV engine symbols resolves the complete model:
 | `0x0008` | **dense leaf plane** (other flavour — identical structure/density, interleaved with 0x0000 via ci2; bit 3 semantics not found, behaviourally irrelevant) | 4,499 | 9,130 | same |
 | `0x0001` | **top (long-distance) plane** | 883 (7 %) | 2,519 | sparse: 1–2 % of the region's OCs, median area **526/183 km²** (leaf: 43/25), `downcells` on many OCs (dn ≈ 10/OC), **ci1 = child leaf clusters** (targets: 100 % tier-0 clusters), ci2 = top-plane neighbours; 100 % of zerocells carry turn annotations (leaf ≈ 20–40 %), rim/cpx markers never |
 | bit 5 `0x20`, bit 1 `0x02` | **gateway markers**: ORed into the word of the region's ROOT cluster(s) | | | all 52 stock root clusters across all 17 regions carry **0x0023** (or 0x00a3 = plus the PTH bit 7 already applied) |
-| bit 7 `0x80` | `.PTH` patchable (`u16PatchCluster` applies the CONNECT patch) | | | see §11 |
+| bit 7 `0x80` | `.PTH` patchable — `u16PatchCluster` @0x90ac3c applies the CONNECT patch **only when this bit is set**; patch index = bits 0-2 of the same word (`NAV____%u.PTH`) | | | stock `0x00a3` roots = `0x23`\|bit7\|idx3; a generated file without bit7 is never patched (PTH_overview §5) |
 
 The two planes interlock by **references, not by position**:
 

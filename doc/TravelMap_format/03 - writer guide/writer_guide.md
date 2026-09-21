@@ -197,6 +197,11 @@ Steps:
 - Every non-empty IDX slot → a real block at that offset in `<REGION>1<prof>.MAP`.
 - Slot `length` (words) == block marker `len` (words) == actual block byte size / 4.
 - All offsets 4-byte aligned; all list starts obey the `start[i+1]=start[i]+count[i]*3` chain.
+- **The `DATA/CONNECT/MAP/<REGION>AA.IDX` twin MUST ship with the same bytes** as the
+  `DATA/DATA/MAP` one (stock: byte-identical, md5-verified; `assemble_trial.py` does this — a
+  manual assembly that skips it leaves the card's previous-trial CONNECT IDX in charge and the
+  engine then reads tiles from the wrong MAP file: blank render + loader never completes
+  — trial 27 rev A, card-confirmed 2026-09-20).
 
 ---
 

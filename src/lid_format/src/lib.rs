@@ -84,6 +84,41 @@ fn simple9_mode(m: u32) -> Option<(usize, usize)> {
     })
 }
 
+/// Encode values with the device's Simple9 scheme (code `0x18`, §11.4). `bits_max` is 28 for the
+/// u32 flavor (`DecodeSimple9<u32>`) and 16 for the u16 flavor (mode 9 narrows to `bits9`).
+pub fn simple9_encode(values: &[u32], bits_max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < values.len() {
+        let mut chosen = None;
+        for m in 1..=9u32 {
+            let (cnt, bits) = match simple9_mode(m) {
+                Some((c, b)) => (c, if m == 9 { bits9_of(bits_max) } else { b }),
+                None => continue,
+            };
+            let take = cnt.min(values.len() - i);
+            let maxv = values[i..i + take].iter().fold(0u32, |a, &v| a.max(v));
+            if (maxv as u64) < (1u64 << bits) {
+                chosen = Some((m, cnt, bits, take));
+                break;
+            }
+        }
+        let (m, _cnt, bits, take) = chosen.expect("value wider than codec");
+        let mut w = 0u32;
+        for k in (0..take).rev() {
+            w = (w << bits) | (values[i + k] & ((1u32 << bits) - 1));
+        }
+        w |= m << 28; // mode nibble lands in bits 28..32 AFTER packing the value window
+        out.extend_from_slice(&w.to_le_bytes());
+        i += take;
+    }
+    out
+}
+
+fn bits9_of(bits_max: usize) -> usize {
+    bits_max
+}
+
 struct Cur<'a> {
     b: &'a [u8],
     p: usize,
@@ -1056,14 +1091,18 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), npos),
             None => vec![],
         };
-        // belonging-name (city): col 0x40c -> bitmap (flags0) + COMPRESSED values (flags 0x4000)
-        let belongs_flag = match get(0x40c, 0) {
+        // belonging-name (city): col 0x40c -> existence bitmap on the 0x4000 sub-stream + values on the
+        // flags-0 sub-stream (stock template row order §11.4b: `0x440c` bitmap row, then `0x040c` values).
+        let belongs_flag = match get(0x40c, 0x4000).or_else(|| get(0x40c, 0)) {
             Some(d) => bitfield(b, d.code, bs + d.off as usize, span_end(d), elem_count_b),
             None => vec![false; elem_count_b],
         };
         let nbel = belongs_flag.iter().filter(|&&x| x).count();
-        let belongs_vals = match get(0x40c, 0x4000) {
-            Some(d) => decode_u32(b, d.code, bs + d.off as usize, span_end(d), nbel),
+        let belongs_vals = match get(0x40c, 0) {
+            Some(d) if d.code != 0x01 && d.code != 0x02 && d.code != 0x03 => {
+                decode_u32(b, d.code, bs + d.off as usize, span_end(d), nbel)
+            }
+            Some(_) => vec![], // a bitmap-pattern row here means "no values" (empty optional column)
             None => vec![],
         };
 
@@ -1438,47 +1477,73 @@ pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
     } else {
         (-1, -1)
     };
-    let flags: u32 = if with_city { 0x0008_0001 } else { 0x0008_0000 };
 
-    // --- container: canonical 0x77 outer header, then sub-header, block table (u32 starts), blocks ---
+    // --- file sub-header exactly as `NLNameList::LoadHeader` (00e0e63c) demands (§11.4c): u32
+    //     element_count, six u16 section counts (A=blocks, D=REL-list ids carried, E=language ids),
+    //     F=8, the file origin pair, then 7 {code, offset} section entries whose streams MUST each
+    //     consume their span EXACTLY (the device cursor-checks every one). Stock street shape:
+    //     sec0=VLE block sizes, sec1=raw block offsets, sec2..4 empty, sec5=VLE [list_id], sec6=VLE [39].
+    let linked = list_id == 3; // street lists mirror stock LID20006 (REL id + POL language vector)
+    let (d_ids, e_ids): (Vec<u32>, Vec<u32>) = if linked {
+        (vec![list_id as u32], vec![39]) // 39 = the card's POL language id (stock LID20006 §11.4c)
+    } else {
+        (vec![], vec![])
+    };
+    let mut sec0: Vec<u8> = Vec::new();
+    for (blk, _) in &blocks {
+        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
+    }
+    let mut sec5: Vec<u8> = Vec::new();
+    for v in &d_ids {
+        sec5.extend_from_slice(&vle_encode(*v));
+    }
+    let mut sec6: Vec<u8> = Vec::new();
+    for v in &e_ids {
+        sec6.extend_from_slice(&vle_encode(*v));
+    }
+
     let hdr = crate::header::NL_HEADER_LEN as u32;
-    let table_at = hdr as usize + 59;
-    let table_len = blocks.len() * 4;
-    let first_block_at = table_at + table_len;
-    let mut f = crate::header::nl_header(
-        crate::header::KIND_NAME_LIST,
-        region,
-        list_id,
-        (59 + table_len) as u32, // sub-header region size (stock keeps header+table there)
-    );
+    let sec1_len = (blocks.len() * 4) as u32;
+    let extra: u32 = 59 + sec0.len() as u32 + sec1_len + sec5.len() as u32 + sec6.len() as u32;
+    let mut f = crate::header::nl_header(crate::header::KIND_NAME_LIST, region, list_id, extra);
     let mut sh: Vec<u8> = Vec::new();
     sh = put_u32(sh, total_elem as u32); // element_count (global)
-    for i in 0..6 {
-        sh = put_u16(sh, if i == 0 { blocks.len() as u16 } else { 0 })
-    } // [0]=block count
-      // overwrite the two trailing u16 of that run (sub-header u32 @+0x0c) with the position flags
-    let fl = sh.len() - 4;
-    sh[fl..fl + 4].copy_from_slice(&flags.to_le_bytes());
+    sh = put_u16(sh, blocks.len() as u16); // A
+    sh = put_u16(sh, 0); // B
+    sh = put_u16(sh, 0); // C
+    sh = put_u16(sh, d_ids.len() as u16); // D
+    sh = put_u16(sh, e_ids.len() as u16); // E
+    sh = put_u16(sh, 8); // F (constant on stock)
     sh = put_u32(sh, corner.0 as u32);
     sh = put_u32(sh, corner.1 as u32); // file-level tNLHPosition (PAU)
-    for i in 0..7 {
-        let code = if i == 1 { 0x11u8 } else { 0u8 };
-        let off = if i == 1 { table_at as u32 } else { 0u32 };
+    let base = hdr + 59;
+    let o1 = base + sec0.len() as u32;
+    let o5 = o1 + sec1_len;
+    let o6 = o5 + sec5.len() as u32;
+    for (code, off) in [
+        (0x14u8, base),
+        (0x11, o1),
+        (0x11, o5),
+        (0x11, o5),
+        (0x11, o5),
+        (0x14, o5),
+        (0x14, o6),
+    ] {
         sh.push(code);
         sh = put_u32(sh, off);
     }
     assert_eq!(sh.len(), 59);
     f.extend_from_slice(&sh);
-    // block-offset table (absolute file offsets)
-    let mut offs: Vec<u32> = Vec::with_capacity(blocks.len());
-    let mut pos = first_block_at;
+    f.extend_from_slice(&sec0);
+    let blocks_abs0 = hdr + extra;
+    let mut p = blocks_abs0;
     for (blk, _) in &blocks {
-        offs.push(pos as u32);
-        pos += blk.len();
+        f = put_u32(f, p); // sec1: ABSOLUTE block offsets (stock convention)
+        p += blk.len() as u32;
     }
-    for &o in &offs {
-        f = put_u32(f, o);
-    }
+    f.extend_from_slice(&sec5);
+    f.extend_from_slice(&sec6);
+    assert_eq!(f.len(), blocks_abs0 as usize);
     for (blk, _) in &blocks {
         f.extend_from_slice(blk);
     }
@@ -1494,7 +1559,6 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     let mut leaf_of = vec![0usize; entries.len()];
     for (ei, e) in entries.iter().enumerate() {
         let mut h = 0usize;
-        let last = e.label.len();
         for &b in e.label.as_bytes().iter().chain(std::iter::once(&0u8)) {
             // Prefix edges merge like in any trie. The terminating 0x00 edge NEVER merges:
             // duplicate names are PARALLEL leaf edges — that is how stock stores several
@@ -1597,41 +1661,68 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     }
 
     // --- numeric/flag streams ---
-    let mut od_bytes: Vec<u8> = Vec::with_capacity(nc * 2);
-    for &d in &outdeg {
-        od_bytes = put_u16(od_bytes, d)
-    }
+    let od_bytes = simple9_encode(&outdeg.iter().map(|&d| d as u32).collect::<Vec<u32>>(), 16);
     let loff_bytes: Vec<u8> = loff.iter().fold(Vec::new(), |acc, &o| {
         let mut a = acc;
         a.extend_from_slice(&vle_encode(o));
         a
     });
-    let bl_bits = vec![0u8; (nc + 7) / 8]; // block-link bitmap: none
-    let bel_bits = vec![0u8; (elem_count + 7) / 8]; // belonging: none
+    // edge -> child-target array (col 0x406, the device's PSF walk source of truth §11.4b).
+    // In this plain-trie DFS layout edge #e always lands on node e+1.
+    let edge_count = nc.saturating_sub(1);
+    let targets: Vec<u32> = (1..=edge_count as u32).collect();
+    let targets_bytes = simple9_encode(&targets, 28);
+    // mandatory BinList (0x415) stream: stock carries elems u32 Simple9 — all-zero words (mode 1).
+    let binlist_bytes = simple9_encode(&vec![0u32; elem_count], 28);
 
-    // --- assemble block: 8B header + descriptors + data (offsets block-relative) ---
-    // Stock position flavor (§12.5): the existence row is a *zero-length* bitmap sub-stream with count
-    // `elem_count` — code 0x03 (sparse-clear) reads as "every element has a position", 0x02 (sparse-set)
-    // as "none do"; either way its `off` equals the coordinate row's `off`.
-    let (pos_wf, pos_code, pos_bytes): (u16, u16, &[u8]) = if anchor.is_some() {
-        (0x4407, 0x03, &[] as &[u8])
-    } else {
-        (0x4407, 0x02, &[] as &[u8])
-    };
-    let (coord_code, coord_param): (u16, u32) = if anchor.is_some() {
-        (0x11, (elem_count * 2) as u32)
-    } else {
-        (0x11, 0)
-    };
+    // --- assemble block: 8B header + descriptors + data, following the STOCK 36-row template
+    //     (§11.4b, DAPIAPP enSetListDescriptions/enDecodeAttrLists) so the device's fixed column
+    //     set gets a valid description for every always-decoded slot. Columns whose stock data we
+    //     cannot synthesize yet are emitted with valid all-clear rows (empty span, param=count). ---
+    let (pos_wf, pos_code): (u16, u16) = if anchor.is_some() { (0x4407, 0x03) } else { (0x4407, 0x02) };
+    let empty: &[u8] = &[];
     let descs: Vec<(u16, u16, &[u8], u32)> = vec![
-        (0x0401, 0x11, &od_bytes, nc as u32),     // outDegree (raw u16)
-        (0x4402, 0x01, &bl_bits, nc as u32),      // block-link bitmap (raw bits, flags 0x4000)
-        (0x0402, 0x14, &[] as &[u8], 0), // block-link targets: k=0 pairs (stock emits both rows, even empty)
-        (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob (raw bytes)
-        (0x4403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (VLE, flags 0x4000)
-        (pos_wf, pos_code, pos_bytes, elem_count as u32), // has-position sub-stream (flags 0x4000, tie off)
-        (0x0407, coord_code, &coords, coord_param), // coords interleaved X,Y (raw u32) or empty
-        (0x040c, 0x01, &bel_bits, elem_count as u32), // belonging bitmap
+        (0x4402, 0x02, empty, nc as u32), // block-link bitmap: none
+        (0x0402, 0x14, empty, 0),         // block-link targets: none
+        (0x0401, 0x18, &od_bytes, nc as u32), // outDegree Simple9-u16
+        (0x4404, 0x02, empty, edge_count as u32),
+        (0x8404, 0x11, empty, 0),
+        (0x0404, 0x11, empty, 0),
+        (0x4405, 0x02, empty, edge_count as u32),
+        (0x8405, 0x11, empty, 0),
+        (0x0405, 0x11, empty, 0),
+        (0x8403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (flags 0x8000)
+        (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob
+        (0x0406, 0x18, &targets_bytes, edge_count as u32), // child targets Simple9
+        (0x0413, 0x02, empty, edge_count as u32),
+        (pos_wf, pos_code, empty, elem_count as u32),
+        (
+            0x0407,
+            0x11,
+            &coords,
+            if anchor.is_some() { (elem_count * 2) as u32 } else { 0 },
+        ),
+        (0x440e, 0x02, empty, elem_count as u32),
+        (0x040e, 0x11, empty, 0),
+        (0x4408, 0x02, empty, elem_count as u32),
+        (0x0408, 0x11, empty, 0),
+        (0x4409, 0x02, empty, elem_count as u32),
+        (0x8409, 0x11, empty, 0),
+        (0x0409, 0x11, empty, 0),
+        (0x440a, 0x02, empty, elem_count as u32),
+        (0x040a, 0x11, empty, 0),
+        (0x440b, 0x02, empty, elem_count as u32),
+        (0x040b, 0x11, empty, 0),
+        (0x440c, 0x02, empty, elem_count as u32), // belonging bitmap: none linked in-file
+        (0x040c, 0x11, empty, 0),                 // belonging values: none
+        (0x8415, 0x18, &binlist_bytes, elem_count as u32), // mandatory BinList (zero stream)
+        (0x0415, 0x01, empty, 0),
+        (0x040f, 0x02, empty, elem_count as u32),
+        (0x0410, 0x02, empty, elem_count as u32),
+        (0x0411, 0x02, empty, elem_count as u32),
+        (0x0414, 0x02, empty, elem_count as u32),
+        (0x0412, 0x02, empty, elem_count as u32),
+        (0x040d, 0x03, empty, elem_count as u32),
     ];
 
     let hdr_sz = 8usize + descs.len() * 12;
