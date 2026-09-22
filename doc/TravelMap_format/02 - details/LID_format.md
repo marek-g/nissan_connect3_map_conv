@@ -633,8 +633,29 @@ within `--city-radius` PAU. Two open correctness limits:
 * same-named villages are indistinguishable by name alone (stock has ~30 plain `PIASKI` elements,
   one per village; postal prefixes only separate the prefixed variants). The stock city LIST
   positions (`x_pau`/`y_pau`) are a per-file private encoding (non-geographic unit mix, not the
-  PAU of §11.5) and cannot validate a match - a geo validator via stock REL -> GenAttr `0xc11`
-  cell ids -> RNW cluster coordinates is planned (cell-id namespace mapping pending).
+  PAU of §11.5) and cannot validate a match. A geo validator over stock data was ATTEMPTED and
+  proven IMPOSSIBLE: the REL -> GenAttr `0xc11` -> cell-row -> cluster chain resolves to nonsense
+  (NLCellID rows carry author-internal {u16,u32fileId?,u32} ids; on POL the `<TILEID>.TCI`
+  cluster locator is an empty stub and routing uses the NAV_ROOT ci1-walk instead, and with no
+  `PA_*.DAT` the device itself never resolves GenAttr cell coords - it interpolates). Empirically
+  a Krzeszowice city's cell rows land near Łódź = author tile numbering, not geometry.
+  Consequence accepted (same semantics as the card-validated merge): all same-name stock ids are
+  kept; wrong-region ones merely offer the same street list under a far-away town.
+
+### 11.4e The type-in key: stored names are matched BYTE-EXACT (**[CONFIRMED 2026-09-22, DAPIAPP RE + card]**)
+
+The entry-list filter (`LISA_tclHnrTree::bGetList` `00ca5f48`, also used for the STREET list:
+`dap_lifi_tclMsgGetEntryListMethodResult`) is case- and byte-sensitive in two places:
+`vConvertToUnicodeValues` `00ca4588` maps the typed string to unicode code values with NO folding,
+`vGoToBestMatchingEdge` `00ca410c` descends the trie with exact-code `bFind` per character, and
+`bDoesStringMatch` `00ca5eb4` confirms candidates with a plain `memcmp` of the code vectors.
+The car keyboard types uppercase, so **every entry needs the stock two-line label**: line 1 = the
+ASCII-folded UPPERCASE type-in key (`POLNEJ ROZY`), `0x09`, then the display line (§11.4c cut,
+`decode_name`). Card-confirmed consequence of storing only a mixed-case name: the street EXISTS
+(REL row present, list enumerates) but is invisible to the type filter - stock files carry zero
+lowercase bytes in their keys, which is why only ours were un-findable. `osm2lid` writes
+`fold(display)\tdisplay` for list-3 entries and orders entries by that key (DFS/element order must
+equal encoded-label byte order, the `write_name_list_idx` alignment invariant).
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 

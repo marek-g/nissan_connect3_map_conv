@@ -424,6 +424,31 @@ fn main() {
     for (e, town) in st_entries.iter_mut().zip(city_of.iter()) {
         e.belonging = town.as_ref().and_then(|t| city_ids.get(t)).and_then(|v| v.first()).copied();
     }
+    // Device typeahead is BYTE-EXACT over the stored name: `LISA_tclHnrTree::bGetList` converts the
+    // typed string to unicode values and walks trie edges with exact-code `bFind`, then confirms with
+    // `bDoesStringMatch` = plain `memcmp` (CHECKED on DAPIAPP 00ca5f48/00ca410c/00ca5eb4). Car keyboard
+    // types UPPERCASE, so a mixed-case/diacritic-only name is un-findable (card-confirmed: our
+    // "Polnej Róży" invisible to filter "POL" although the REL row carried it). Stock convention:
+    // line 1 = ASCII-folded type-in key, TAB, then the display line (`decode_name` cuts identically).
+    for e in &mut st_entries {
+        e.label = format!("{}\t{}", fold(&e.label), e.label);
+    }
+    // Element/DFS order must equal encoded-label byte order (mapping invariant in
+    // `write_name_list_idx`): sort by the new label, city groups keeping first-seen rank, moved
+    // atomically with the parallel `city_of` array.
+    {
+        let mut rank: HashMap<Option<(i32, i32)>, u32> = HashMap::new();
+        for e in st_entries.iter() {
+            let r = rank.len() as u32;
+            rank.entry(e.city).or_insert(r);
+        }
+        let mut pairs: Vec<(lid_format::NameEntry, Option<String>)> =
+            st_entries.drain(..).zip(city_of.drain(..)).collect();
+        pairs.sort_by(|a, b| {
+            rank[&a.0.city].cmp(&rank[&b.0.city]).then_with(|| a.0.label.cmp(&b.0.label))
+        });
+        (st_entries, city_of) = pairs.into_iter().unzip();
+    }
     let (nst, mut streets) =
         write_name_list_idx(&outdir.join("LID20006.DAT"), &st_entries, region_id, 3);
     // city coordinate registry (first node per unique name — same order `write_cities` numbers elements)
@@ -1091,6 +1116,12 @@ impl SidMap {
     }
 }
 
+/// Display part of a stored label: a label may carry the stock two-line form "KEY\tDISPLAY";
+/// the device (and `lid_format::read`) take everything after the first TAB as the name.
+fn disp(s: &str) -> &str {
+    s.split_once('\t').map_or(s, |(_, d)| d)
+}
+
 fn write_name_list_idx(
     path: &Path,
     entries: &[lid_format::NameEntry],
@@ -1124,12 +1155,12 @@ fn write_name_list_idx(
         let r = city_rank.len() as u32;
         city_rank.entry(e.city).or_insert(r);
     }
-    let mut occ: BTreeMap<&str, Vec<(u32, usize, usize)>> = BTreeMap::new(); // label -> (rank, seq, input idx)
+    let mut occ: BTreeMap<&str, Vec<(u32, usize, usize)>> = BTreeMap::new(); // display -> (rank, seq, input idx)
     let mut seq_cnt: HashMap<(&str, Option<(i32, i32)>), usize> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
         let rank = city_rank[&e.city];
         let s = seq_cnt.entry((e.label.as_str(), e.city)).or_default();
-        occ.entry(e.label.as_str()).or_default().push((rank, *s, i));
+        occ.entry(disp(e.label.as_str())).or_default().push((rank, *s, i));
         *s += 1;
     }
     let mut by_label: BTreeMap<String, Vec<(u32, (i64, i64))>> = BTreeMap::new();
@@ -1158,7 +1189,7 @@ fn write_name_list_idx(
         for (i, e) in entries.iter().enumerate() {
             if sid_of_entry[i] == u32::MAX {
                 if let Some(f) = decode_ids
-                    .get(e.label.as_str())
+                    .get(disp(e.label.as_str()))
                     .and_then(|v| v.first().copied())
                 {
                     sid_of_entry[i] = f;
@@ -1559,7 +1590,9 @@ fn write_addr_list(
     for (e, city) in entries.iter().zip(city_of) {
         let Some(city) = city else { continue };
         cities.insert(city);
-        names.insert(format!("{city}, {}", e.label));
+        // join keys are display strings (AddrHit labels carry the OSM display name, no type-in line)
+        let d = e.label.split_once('\t').map_or(e.label.as_str(), |(_, d)| d);
+        names.insert(format!("{city}, {d}"));
     }
     for hit in hits {
         let Some(sid) = streets.pick(&hit.label, hit.coord) else {
@@ -2495,8 +2528,7 @@ fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {
 }
 
 /// ASCII-fold a name for the FTS NAMENORM column: uppercase, strip accents, keep [A-Z0-9-. ]
-fn fold(s: &str) -> String {
-    s.to_uppercase()
+fn fold(s: &str) -> String {    s.to_uppercase()
         .chars()
         .map(|c| match c {
             'Ą' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',
