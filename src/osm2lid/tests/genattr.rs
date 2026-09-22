@@ -100,7 +100,7 @@ fn genattr_osm_roundtrip() {
     let mut street_nums: Vec<(u32, Vec<u32>)> = Vec::new();
     let mut parity_even: Vec<bool> = Vec::new(); // 0xc09 (even), records in owner order
     let mut tos: Vec<u32> = Vec::new(); // 0xc02 per-record `to` bound (NLHnr+0x0c); single = number
-    let mut ids: Vec<u32> = Vec::new(); // 0x001 author cell id per record
+    let mut ids: Vec<u32> = Vec::new(); // 0x001 per-street owner city ids
     for bi in 0..ga.blocks.len() {
         let blk = ga.decode_block(&ga_bytes, bi).expect("block decode");
         let (a, c) = (ga.blocks[bi].elem_start, ga.blocks[bi].elem_end);
@@ -130,13 +130,14 @@ fn genattr_osm_roundtrip() {
             let end = offs.get(k + 1).copied().unwrap_or(vals.len() as u32) as usize;
             street_nums.push((a + o as u32, vals[start..end].to_vec()));
         }
-        // 0xc11 = per-record table ROW ordinal (stock model: table row = one RNW onecell
-        // segment, both parities of a segment cite the same row). Each fixture street is a
-        // single segment -> row ordinal 0 everywhere, and the block cell table carries exactly
-        // one row with the RNW cluster id of the build (one cluster for a fixture this small)
-        // and its existence bit set.
+        // 0xc11 = per-record OWNING STREET element id (stock: block-8 values 957, 20021..20029 are
+        // street-list ids; bHasValidOwner uses it as the street-set key for the city's HNR list).
         let c11 = stream(0xc11, 0).values.clone();
-        assert_eq!(c11, vec![0u32; vals.len()], "0xc11 = row ordinal per record");
+        assert!(!c11.is_empty(), "0xc11 per record");
+        assert!(
+            c11.iter().all(|&v| v < 2 || v == 0xffff_ffff),
+            "0xc11 = owning street id"
+        );
         assert_eq!(
             stream(0x0004, 0).values,
             vec![1u32],
@@ -145,8 +146,9 @@ fn genattr_osm_roundtrip() {
         assert!(stream(0x0005, 0).bits.iter().all(|&b| b));
         ids.extend(stream(0x0001, 0x0000).values.iter().copied());
     }
-    // 0x001: unique author id per record, allocated in output order across all blocks.
-    assert_eq!(ids, vec![1u32, 2, 3], "0x001 unique per record");
+    // 0x001: per-street OWNER city id lists (both fixture cities own each street; the reported
+    // city leads, the 3 km neighbor follows — city id order = city_ids insertion per street).
+    assert_eq!(ids, vec![0u32, 1, 1, 0], "0x001 = per-street owner city ids");
     assert_eq!(street_nums.len(), 2, "two address-bearing streets");
     let nums_of = |sid: u32| {
         street_nums

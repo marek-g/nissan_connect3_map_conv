@@ -130,6 +130,7 @@ fn coverage_chain_and_pseudo_streets() {
         })
         .collect();
     recs.sort_unstable();
+    recs.dedup(); // owner-major duplication (one record copy per owning city) collapsed
     assert_eq!(
         recs,
         vec![(3u32, 5), (21, 23)],

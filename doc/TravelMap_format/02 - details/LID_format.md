@@ -611,6 +611,10 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
 
 ### 11.4d Merge-into-stock workflow + city-id mapping (**[CONFIRMED 2026-09-21, card-validated merge]**)
 
+(Card-check 2026-09-22l: the card validated the merged FILE loading + stock listings intact (outK);
+it did NOT validate that our appended streets list under cities - that required the GenAttr owner
+columns of §11.6 `0x001`/`0xc11`, see TODO 22l.)
+
 Regenerating a full name-list for a region and shipping it standalone FAILS on the card even when
 locally valid; splicing ours INTO the stock file works. `osm2lid --merge-stock DIR` does:
 
@@ -814,9 +818,9 @@ table — device-side the rows are `NLCellID`s joined to the RNW one-cell id typ
 
 | selector | slot (device member) | content |
 |---|---:|---|
-| `0x001` | +0x4dc (`NLValueListAttrVector`) | per-address-element VL, decoded last by BOTH `enDecodeHnr` and `enDecodeCells`, behind gate `this+0x26==0` (gate = presence of the author columns); **write-only on the device** — searched: no consumer of the member exists in the binary (instruction scan of `0x4dc` hits only unrelated frame slots). Stock: one unique u32 per record, scale reaching 240 k — author-side bookkeeping, [OPEN] |
+| `0x001` | +0x4dc (`NLValueListAttrVector`) | **per-street OWNING-CITY list** (CORRECTED 2026-09-22, was misread as write-only author ids): keyed by the block's street/owner ordinal; values = LID20001 city element ids that own the street (Kraków block 8 ord 415 → `[109626='32 065 KRZESZOWICE', 209546]`, ord 1004 → 6 cities). This is the device's city→street linkage: the selected-city street set (`vGetCityIDs`/ExtendLoc context ∩ this column) gates every HNR record via `bHasValidOwner 00ce5cf4` — a street without a city entry here never appears in the address street list of ANY city (our outH–outK failure root cause). Read by `enGetOwner 00e0bdd0` (+0x4dc) and the `bSetUpStreetIndices 00be0eac` → `bSetUpStreetIndcesByHnr 00be0b80` path. |
 | `0x002/0x003/0x004/0x005` (+ `0x8003`/`0x8004` variants) | +0x530 (`NLCellIdAttrVector`) | the cell table itself: local id list (+0x00 u16), global-recdesc search starts (+0x20, +0x60) over `NLRecordDescriptionAttrVector` +0x40, per-row extra list +0x80, row count +0x88, existence bit +0xa0 — assembled into `NLCellID{u16, u16, u32, bool}` by `enGetCells` |
-| `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record cell-row ordinal list** — the device model supports 1..N values, but every examined stock block carries ONE value per record (VL existence bits over the full record domain, `0x8000` starts stream empty ⇒ trivial offsets; e.g. Kraków block 37: 1064 owner elements / 15857 records / 15857 `0xc11` values). The ordinal < row-count (`+0x88`) check runs in `enGetCells`. (In `lid2dump`'s `cellmap` the `0xc11` rows are grouped per OWNER element with `k` = record index — a flattened export view, not a device domain.) |
+| `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record OWNING STREET id** (CORRECTED 2026-09-22, was misread as a cell-row ordinal): values are street-list element ids — Kraków block 8 records carry 957 = '16 PULKU ULANOW WIELKOPOL., ULICA' and 20021..20029 = consecutive 'BARTOSZA GLOWACKIEGO' copies (the id spaces collide across lists, which caused the earlier "city id" misinterpretation). One value per record (VL existence bits over the full record domain, `0x8000` starts stream empty). `bHasValidOwner 00ce5cf4`: owner == 0xffffffff passes, else the record lists only if its owner street is in the selected city's street set (col `0x001` link). The cell-row ordinal actually used by `enGetCells` is NOT this column ([OPEN] which column binds record→cell row). (In `lid2dump`'s `cellmap` the `0xc11` rows are grouped per OWNER element with `k` = record index — a flattened export view, not a device domain.) |
 | `0xc12` | +0x3d4 (`NLValueListAttrVector`) | **per-entry (name-list element: street/city) list of cell-row ordinals** — consumed by `bGetElementCellIDs` for element→cell lookup |
 | `0xc14` | +0x47c (`NLRangeAttrVector`) | range values **keyed by cell-row ordinal**; both read-paths look it up per ordinal (miss → `0xFFFFFFFF` sentinel) — [OPEN] what the value means |
 | `0xc0b/0xc0c/0xc0d` | +0x2c0/0x2e0/0x300 (`NLBinaryAttrVector`) | `NLHnrCellStatus` bytes {b0, b1, b2, u16=0xffff} — indexed **at the record's first `0xc11` value offset** (== row ordinal while 1 value/record), not by record number. Stock observation (data, not device): `0xc0b == 0xc09`, `0xc0c == 0xc0a` mirror the parity bits; `0xc0d` set on ~half the records — [OPEN] semantics |
@@ -824,7 +828,11 @@ table — device-side the rows are `NLCellID`s joined to the RNW one-cell id typ
 HNR placement path: `bGetHnrCellIDs` iterates the matching records → per record
 `enGetHnrCellReferences` → `enGetHnrCellIndices` reads the record's `0xc11` ordinal list →
 `enGetCells` assembles the `NLCellID`s (bounds-checked) → `0xc14::enGetValue` per ordinal →
-`0xc0b/0xc0c/0xc0d` bits at the `0xc11` value-offset window. Element path: `bGetElementCellIDs` →
+`0xc0b/0xc0c/0xc0d` bits at the `0xc11` value-offset window. [CORRECTION 2026-09-22: `0xc11` holds
+owning street ids (§table above), which exceed stock row counts, so this placement chain as
+described could not run on stock data — the chain's slot attribution needs a re-check against
+`SetDataBlock 00e09b60`; the record→cell binding column remains [OPEN].] Element path:
+`bGetElementCellIDs` →
 `enGetEntryCellReferences` reads `0xc12` per element and repeats the same `enGetCells`/`0xc14`
 steps (optionally filtered by `bHasValidOwner` against a street set). Destination read-model
 (CONFIRMED callers): `LISA_tclHnrProcessing::bDetermineCells 00be17f4` requires exactly one

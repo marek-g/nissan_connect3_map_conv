@@ -1,8 +1,8 @@
 // PA <-> GenAttr cell join integration. A PA detail cell id is passed verbatim by
 // `bGetPACellIDs 00b898dc` to `NLGenAttrProcessor::bGetCellOfBlock` -> the street block's
-// `NLCellIdAttrVector::enGetCells`, so it must be the `0xc11` table ordinal of the street's
-// lowest-numbered record — not any global id. Fixture: one street, two segments; the lowest
-// number (11) sits on the SECOND segment of the build -> the PA cell must be a non-zero row.
+// `NLCellIdAttrVector::enGetCells`, so it must be the block cell-table row ordinal of the
+// street's lowest-numbered record — not any global id. Fixture: one street, two segments; the
+// lowest number (11) sits on the SECOND segment of the build -> the PA cell must be row 1.
 
 use std::path::Path;
 use std::process::Command;
@@ -29,10 +29,12 @@ fn pa_cells_point_at_the_lowest_records_row() {
         .position(|e| e.name == "Duza")
         .expect("Duza element") as u32;
 
-    // GenAttr: per-record (number, 0xc11 row) for our street, owner order.
+    // GenAttr: the street's record numbers, owner order (0xc11 now carries the OWNER city id,
+    // not the table row — the PA cell id is the block table row assigned at build time).
     let ga_bytes = std::fs::read(out.join("LID40006.DAT")).unwrap();
     let ga = lid_format::read_gen_attr(&ga_bytes).expect("genattr index");
-    let mut recs: Vec<(u32, u32)> = Vec::new(); // (house number, table row)
+    let mut nums_all: Vec<u32> = Vec::new(); // our street's house numbers
+    let mut nrows = 0usize;
     for bi in 0..ga.blocks.len() {
         let blk = ga.decode_block(&ga_bytes, bi).expect("block");
         let stream = |cc: u32, fl: u32| {
@@ -51,7 +53,7 @@ fn pa_cells_point_at_the_lowest_records_row() {
         let owners: Vec<u32> = (0..bits.len() as u32).filter(|&i| bits[i as usize]).collect();
         let starts = stream(0xc01, 0x8000);
         let nums = stream(0xc01, 0);
-        let c11 = stream(0xc11, 0);
+        nrows += stream(0x0004, 0).len();
         for (k, &o) in owners.iter().enumerate() {
             if blk.elem_start + o != duza {
                 continue;
@@ -59,16 +61,13 @@ fn pa_cells_point_at_the_lowest_records_row() {
             let a = starts[k] as usize;
             let b = starts.get(k + 1).copied().unwrap_or(nums.len() as u32) as usize;
             for r in a..b.min(nums.len()).max(a) {
-                recs.push((nums[r], c11[r]));
+                nums_all.push(nums[r]);
             }
         }
     }
-    assert_eq!(recs.len(), 2, "one even + one odd consolidated record");
-    let want = recs.iter().min_by_key(|(n, _)| *n).expect("lowest record").1;
-    assert!(
-        recs.iter().any(|(_, row)| *row != recs[0].1),
-        "fixture must span two table rows"
-    );
+    assert_eq!(nums_all.len(), 2, "one even + one odd consolidated record");
+    assert!(nums_all.contains(&11), "lowest number 11 present");
+    assert_eq!(nrows, 2, "fixture street spans two table rows");
 
     // PA detail: the street's access point cites exactly that row.
     let pa_bytes = std::fs::read(out.join("PA_20006.DAT")).expect("PA file");
@@ -78,7 +77,7 @@ fn pa_cells_point_at_the_lowest_records_row() {
     let blk = lid_format::pa::decode_pa_detail_block(&pa_bytes, off, size).expect("decode");
     let det = &blk.entries[(duza - start) as usize];
     assert!(det.pos.is_some(), "access point position present");
-    assert_eq!(det.cell, want, "PA cell = 0xc11 row of the street's lowest record");
+    assert_eq!(det.cell, 1, "PA cell = table row of the lowest record's segment");
     assert_ne!(det.cell, 0, "fixture's lowest number sits on the second segment");
 
     std::fs::remove_dir_all(&out).ok();

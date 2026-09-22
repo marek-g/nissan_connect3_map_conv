@@ -545,6 +545,34 @@ fn main() {
             if outdir.join("LID20001.DAT").exists() { " + LID20001.DAT (appended city elements)" } else { "" }
         );
     }
+    // GenAttr col 0x001 / 0xc11 owner data (card-reverse-engineered 2026-09-22: stock col 0x001 is
+    // the per-street list of owning LID20001 city ids — the ONLY thing `bHasValidOwner 00ce5cf4`
+    // accepts; streets without it never appear in a city's street list). Same city set the REL
+    // matrix uses: the entry's reported city + every city within 3 km (stock DEBINY shape).
+    let mut street_owners: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    if !city_ids.is_empty() {
+        let mut oseen: HashSet<(u32, u32)> = HashSet::new();
+        for ((e, city), &s) in st_entries.iter().zip(&city_of).zip(streets.sid_of_entry.iter()) {
+            if s == u32::MAX {
+                continue;
+            }
+            let mut add = |s: u32, cn: &Option<String>, oseen: &mut HashSet<(u32, u32)>| {
+                if let Some(ids) = cn.as_ref().and_then(|c| city_ids.get(c.as_str())) {
+                    for &t in ids {
+                        if oseen.insert((s, t)) {
+                            street_owners.entry(s).or_default().push(t);
+                        }
+                    }
+                }
+            };
+            add(s, city, &mut oseen);
+            for (cn, cc) in &city_coords {
+                if pt_seg_d2((e.x_pau as i64, e.y_pau as i64), *cc, *cc) <= m2d2(3000.0) {
+                    add(s, &Some(cn.to_string()), &mut oseen);
+                }
+            }
+        }
+    }
     let (naddr, street_cell) = if no_genattr {
         (0, Default::default())
     } else {
@@ -553,6 +581,7 @@ fn main() {
             &addr_hits,
             &segs,
             &streets,
+            &street_owners,
             id_lo,
             nst,
             region_id,
@@ -1890,9 +1919,11 @@ fn pt_seg_d2(p: (i64, i64), a: (i64, i64), b: (i64, i64)) -> i128 {
 /// `enDecodeCells 00e0c584`): the block table row = one RNW **onecell segment** (0x004 = the RNW
 /// cluster id a same-source `osm2rnw` build writes — verified equal segment/cluster counts on a
 /// shared extract), records = one per (segment, parity) with `0xc01..0xc02` min..max and parity
-/// bits `0xc09/0xc0a` (mirrored into `0xc0b/0xc0c`), `0xc11` = per-record row ordinal (both
-/// parities of a segment cite the same row — the stock GRÓJECKA shape), and `0x001` = a unique
-/// per-record author id. Addresses are assigned to the nearest segment of their street; streets
+/// bits `0xc09/0xc0a` (mirrored into `0xc0b/0xc0c`), `0x001` = per-street owning-city id list and
+/// `0xc11` = per-record owning STREET element id (stock card RE: `bHasValidOwner 00ce5cf4` drops every record
+/// whose owner is neither 0xffffffff nor an id in the selected-city context — streets without
+/// these columns are invisible in the device's city→street list). Addresses
+/// are assigned to the nearest segment of their street; streets
 /// whose ways never passed the routable filter get one synthetic row (their own cluster id) so
 /// their numbers are still shipped. [OPEN] stock hnr cluster ids are an author-side registry
 /// numbering, not raw RNW ids — pairing our own osm2rnw + osm2lid output is self-consistent but
@@ -1902,6 +1933,7 @@ fn write_gen_attr(
     hits: &[AddrHit],
     segs: &[OneCell],
     streets: &SidMap,
+    street_owners: &BTreeMap<u32, Vec<u32>>,
     id_lo: u32,
     n: usize,
     region: u16,
@@ -1977,7 +2009,6 @@ fn write_gen_attr(
     // sid -> (lowest numeric record, its 0xc11 table row): the PA/destination cell for the street
     // (bGetPACellIDs 00b898dc feeds its cell ids straight into the street block's enGetCells).
     let mut street_cell: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
-    let mut gid = 0u32; // author-space id for column 0x001: unique per record, ever-increasing
     for lo in ((id_lo as usize)..(id_lo as usize + n)).step_by(w) {
         let hi = (lo + w).min(id_lo as usize + n);
         let width = (hi - lo) as u32;
@@ -1988,7 +2019,11 @@ fn write_gen_attr(
         let mut ev: Vec<bool> = Vec::new();
         let mut od: Vec<bool> = Vec::new();
         let mut rec_row: Vec<u32> = Vec::new(); // 0xc11 per-record table row (both sides share one)
-        let mut rec_id: Vec<u32> = Vec::new(); // 0x001 per-record author id
+        let mut rec_owner: Vec<u32> = Vec::new(); // 0xc11 per-record OWNING STREET element id
+        let mut seg_row: HashMap<usize, u32> = HashMap::new(); // block cell-table row per segment
+        let mut own_exists = vec![false; width as usize]; // 0x001 exists: street has city owners
+        let mut own_offs: Vec<u32> = Vec::new(); // 0x001 value-list starts
+        let mut own_ids: Vec<u32> = Vec::new(); // 0x001 per-street owning-city ids (bHasValidOwner ctx)
         let mut row_cluster: Vec<u32> = Vec::new(); // table row -> RNW cluster id (0x004)
         for &sid in owned.range(lo as u32..hi as u32) {
             // rows for this street: its segments that actually carry numbers, else the synthetic
@@ -2008,9 +2043,22 @@ fn write_gen_attr(
             }
             exists[(sid - lo as u32) as usize] = true;
             offs.push(nums.len() as u32);
+            let owners: Vec<u32> = street_owners.get(&sid).cloned().unwrap_or_default();
+            if !owners.is_empty() {
+                own_exists[(sid - lo as u32) as usize] = true;
+                own_offs.push(own_ids.len() as u32);
+                own_ids.extend(owners.iter().copied());
+            }
             for &(seg, cl) in &street_rows {
-                let base = row_cluster.len() as u32;
-                row_cluster.push(cl);
+                let base = match seg_row.get(&seg) {
+                    Some(b) => *b,
+                    None => {
+                        let b = row_cluster.len() as u32;
+                        row_cluster.push(cl);
+                        seg_row.insert(seg, b);
+                        b
+                    }
+                };
                 let Some(list) = seg_recs.get(&seg) else {
                     continue;
                 };
@@ -2024,8 +2072,12 @@ fn write_gen_attr(
                     ev.push(hn.even);
                     od.push(hn.odd);
                     rec_row.push(base);
-                    gid += 1;
-                    rec_id.push(gid);
+                    // 0xc11 = the OWNING STREET element id (stock block-8 values, e.g. 957 =
+                    // '16 PULKU ULANOW WIELKOPOL., ULICA' in the street list, 20021..20029 =
+                    // consecutive 'BARTOSZA GLOWACKIEGO' copies). bHasValidOwner takes it as a
+                    // street-set key: the record lives in a city's HNR list iff col 0x001 of that
+                    // street carries the city the user selected.
+                    rec_owner.push(sid);
                     match street_cell.get(&sid) {
                         Some(&(mn0, _)) if mn0 <= hn.from => {}
                         _ => {
@@ -2073,16 +2125,16 @@ fn write_gen_attr(
             code_0000: code,
             range_from_to: None,
         };
-        // 0xc11: per-record ROW ordinal(s) — the device ValueList allows 1..N values per record
-        // (`enGetHnrCellIndices` 00e0c8bc); we follow the stock shape: one flat value per record,
-        // both parities of a segment citing the same row.
+        // 0xc11: per-record OWNING STREET element id (stock block-8: 957, 20021..20029 are
+        // street-list ids). `bHasValidOwner 00ce5cf4` keys the selected city's street set with it
+        // (set built from col 0x001 city lists) — records of unlinked streets never list.
         let c11 = ColData {
             selector: 0xc11,
             kind: ColKind::ValueList,
             domain: nrec as u32,
             exists: vec![true; nrec],
             counts: (0..nrec as u32).collect(),
-            values: rec_row,
+            values: rec_owner,
             bits: vec![],
             code_8000: 0x16,
             code_0000: 0x14,
@@ -2094,13 +2146,15 @@ fn write_gen_attr(
         let one_per_row: Vec<u32> = vec![1; nrow];
         let row_ord: Vec<u32> = (0..nrow as u32).collect();
         let mut cols = vec![
+            // 0x001: per-street owning-city id list (stock: block-8 col 0x001 VL values are the
+            // LID20001 city ids that "own" the street — the city→street list source).
             ColData {
                 selector: 0x0001,
                 kind: ColKind::ValueList,
                 domain: width,
-                exists: exists.clone(),
-                counts: offs.clone(),
-                values: rec_id,
+                exists: own_exists,
+                counts: own_offs,
+                values: own_ids,
                 bits: vec![],
                 code_8000: 0x16,
                 code_0000: 0x14,
