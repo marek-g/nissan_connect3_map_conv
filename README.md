@@ -36,7 +36,7 @@ This project is an independent research initiative created for personal interope
 
 This project would not be possible if not a hard work of other people:
 
-- https://richard.burtons.org/2021/04/26/allowing-map-modifications-on-nissan-connect/, https://github.com/sapphire-bt/lcn2kai-decompress
+- https://richard.burtons.org/2021/04/26/allowing-map-modifications-on-nissan-connect/, https://github.com/sapphire-bt/lcn2kai-decompress, https://github.com/raburton/lcn-patcher
 - forums: https://www.qashqaiforums.co.uk/, https://www.navitotal.com/
 
 
