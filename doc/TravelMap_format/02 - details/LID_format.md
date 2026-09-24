@@ -611,9 +611,10 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
 
 ### 11.4d Merge-into-stock workflow + city-id mapping (**[CONFIRMED 2026-09-21, card-validated merge]**)
 
-(Card-check 2026-09-22l: the card validated the merged FILE loading + stock listings intact (outK);
-it did NOT validate that our appended streets list under cities - that required the GenAttr owner
-columns of §11.6 `0x001`/`0xc11`, see TODO 22l.)
+(Card-check 2026-09-22l/m: the card validated the merged FILE loading + stock listings intact (outK);
+it did NOT validate that our appended streets list under cities. The GenAttr owner columns of §11.6
+`0x001`/`0xc11` were shipped in outL and changed NOTHING on the card - that hypothesis is void, the
+city→street list source is still [OPEN]. See TODO 22l/22m.)
 
 Regenerating a full name-list for a region and shipping it standalone FAILS on the card even when
 locally valid; splicing ours INTO the stock file works. `osm2lid --merge-stock DIR` does:
@@ -818,7 +819,7 @@ table — device-side the rows are `NLCellID`s joined to the RNW one-cell id typ
 
 | selector | slot (device member) | content |
 |---|---:|---|
-| `0x001` | +0x4dc (`NLValueListAttrVector`) | **per-street OWNING-CITY list** (CORRECTED 2026-09-22, was misread as write-only author ids): keyed by the block's street/owner ordinal; values = LID20001 city element ids that own the street (Kraków block 8 ord 415 → `[109626='32 065 KRZESZOWICE', 209546]`, ord 1004 → 6 cities). This is the device's city→street linkage: the selected-city street set (`vGetCityIDs`/ExtendLoc context ∩ this column) gates every HNR record via `bHasValidOwner 00ce5cf4` — a street without a city entry here never appears in the address street list of ANY city (our outH–outK failure root cause). Read by `enGetOwner 00e0bdd0` (+0x4dc) and the `bSetUpStreetIndices 00be0eac` → `bSetUpStreetIndcesByHnr 00be0b80` path. |
+| `0x001` | +0x4dc (`NLValueListAttrVector`) | **per-street OWNING-CITY list** (CORRECTED 2026-09-22, was misread as write-only author ids): keyed by the block's street/owner ordinal; values = LID20001 city element ids that own the street (Kraków block 8 ord 415 → `[109626='32 065 KRZESZOWICE', 209546]`, ord 1004 → 6 cities). It gates HNR-record enumeration via `bHasValidOwner 00ce5cf4` (record lists iff its owner street is in the selected-city street set). It is NOT the gate of the address street list itself (card-disproved 2026-09-22m: our outL carried correct owners here yet stayed hidden, and stock POLACZKA 395354..395358 / POLNA 399184-91 are displayed without any row in this column). Read by `enGetOwner 00e0bdd0` (+0x4dc) and the `bSetUpStreetIndices 00be0eac` → `bSetUpStreetIndcesByHnr 00be0b80` path. |
 | `0x002/0x003/0x004/0x005` (+ `0x8003`/`0x8004` variants) | +0x530 (`NLCellIdAttrVector`) | the cell table itself: local id list (+0x00 u16), global-recdesc search starts (+0x20, +0x60) over `NLRecordDescriptionAttrVector` +0x40, per-row extra list +0x80, row count +0x88, existence bit +0xa0 — assembled into `NLCellID{u16, u16, u32, bool}` by `enGetCells` |
 | `0xc11` | +0x380 (`NLValueListAttrVector`) | **per-HNR-record OWNING STREET id** (CORRECTED 2026-09-22, was misread as a cell-row ordinal): values are street-list element ids — Kraków block 8 records carry 957 = '16 PULKU ULANOW WIELKOPOL., ULICA' and 20021..20029 = consecutive 'BARTOSZA GLOWACKIEGO' copies (the id spaces collide across lists, which caused the earlier "city id" misinterpretation). One value per record (VL existence bits over the full record domain, `0x8000` starts stream empty). `bHasValidOwner 00ce5cf4`: owner == 0xffffffff passes, else the record lists only if its owner street is in the selected city's street set (col `0x001` link). The cell-row ordinal actually used by `enGetCells` is NOT this column ([OPEN] which column binds record→cell row). (In `lid2dump`'s `cellmap` the `0xc11` rows are grouped per OWNER element with `k` = record index — a flattened export view, not a device domain.) |
 | `0xc12` | +0x3d4 (`NLValueListAttrVector`) | **per-entry (name-list element: street/city) list of cell-row ordinals** — consumed by `bGetElementCellIDs` for element→cell lookup |
@@ -1098,7 +1099,9 @@ the sub-header (`hdr+0x0c` bit `0x0008_0000` = present, `hdr+0x10/0x14` = `X,Y`;
 region's SW corner ≈ 14.12°,49.10°; `LID20000` sets the bit but stores `-1/-1` = "no positions"). It is the
 anchor used by flows **without** a city context (e.g. the settlement gazetteer), so the **writer contract** is:
 one city per block, elements stored as `pos − that_city_position` (the coordinate the device resolves for the
-city), file header = region corner. The low bits of `hdr+0x0c` are per-file *flavor* hints (`0x000001`,
+city), file header = region corner. (Card-proven 2026-09-22n: our merged blocks had stored this as
+`pos − file_corner` and the streets were invisible under EVERY city; rebasing to the city anchor is the
+fix. Stock deltas are tiny — `POLACZKA` 259449 ≈ 220 m — use magnitude as the sanity check.) The low bits of `hdr+0x0c` are per-file *flavor* hints (`0x000001`,
 `0x000002`, `0x000013`, `0x00001d` across `POL/LID20000..5`); only bit `0x0008_0000` governs whether the
 coordinate fields are honored, and `LID20000` (gazetteer) is the "no coordinates" flavor.
 

@@ -409,6 +409,7 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
 #[derive(Debug, Clone)]
 pub struct Element {
     pub block: usize, // 0-based NLAsfBlock index this element belongs to
+    pub node: usize,  // trie node (leaf) of this element inside its block
     pub category: u16,
     pub name: String,
     /// Full raw device string of this element's trie path **before** the display cut (line 1 =
@@ -880,6 +881,28 @@ fn lab_loc<'a>(blob: &'a [u8], loff: &[u32], e: usize) -> &'a [u8] {
 }
 
 pub fn read(b_in: &[u8]) -> Result<NameList, String> {
+    read_full(b_in).map(|x| x.0)
+}
+
+/// Same as [`read`] but also returns, per block, the node->(target block, target node) block-link map
+/// decoded from the 0x402 columns (`NLBlockLinkAttrVector::Decode`).
+pub fn read_links(
+    b_in: &[u8],
+) -> Result<Vec<std::collections::HashMap<usize, (usize, usize)>>, String> {
+    read_full(b_in).map(|x| x.1.into_iter().map(|i| i.links).collect())
+}
+
+/// Per-block topology summary: block-link map, node count, leaf (outDegree==0) count.
+pub struct BlockLinkInfo {
+    pub links: std::collections::HashMap<usize, (usize, usize)>,
+    pub node_count: usize,
+    pub leaf_count: usize,
+}
+pub fn read_link_infos(b_in: &[u8]) -> Result<Vec<BlockLinkInfo>, String> {
+    read_full(b_in).map(|x| x.1)
+}
+
+fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
     let b = b_in;
     let n = b.len();
     let hdr = u32(b, 0x10) as usize;
@@ -1226,6 +1249,15 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
         }
     }
 
+    let link_maps: Vec<BlockLinkInfo> = bp
+        .iter()
+        .map(|x| BlockLinkInfo {
+            links: x.links.clone(),
+            node_count: x.node_count,
+            leaf_count: x.od.iter().filter(|&&d| d == 0).count(),
+        })
+        .collect();
+
     let mut elements: Vec<Element> = Vec::new();
     for (bi, blk) in bp.iter().enumerate() {
         let mut pos_rank = 0usize;
@@ -1264,6 +1296,7 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
             }
             elements.push(Element {
                 block: bi,
+                node: blk.term_nodes[ei],
                 category: 0,
                 name,
                 sort_name: {
@@ -1301,12 +1334,365 @@ pub fn read(b_in: &[u8]) -> Result<NameList, String> {
     } else {
         None
     };
-    Ok(NameList {
-        element_count: elem_count,
-        block_count: block_off.len(),
-        elements,
-        origin,
-    })
+    Ok((
+        NameList {
+            element_count: elem_count,
+            block_count: block_off.len(),
+            elements,
+            origin,
+        },
+        link_maps,
+    ))
+}
+
+/// Report of a successful [`graft_city_probe`].
+pub struct GraftReport {
+    pub host_block: usize,
+    pub host_node: usize,
+    /// Element whose terminator edge was converted to a link sink (it stops being an element).
+    pub lost_element: usize,
+    pub lost_name: String,
+    /// Raw device string of the probe (sink string + suffix).
+    pub probe_raw: String,
+}
+
+/// Graft a probe element into a city gazette file using the STOCK block-link mechanism, keeping
+/// the global element numbering intact. The host block (last) loses ONE element X (its leaf node
+/// gains a block-link, which by the device's TEIC rule stops it from being an element) and the
+/// link points to a NEW block index (= current block count) whose trie spells `suffix`; after
+/// [`merge_city_list`] appends that block, the new element's raw device name is
+/// `X_raw + suffix` (one element lost, one gained, same total). A stock leaf is a terminal by
+/// out-degree alone (labels are NOT `0x00`-terminated), and a link node is exactly the stock-style
+/// prefix-sink `bStepDown` re-homes into, so the graft is byte-faithful to stock semantics.
+/// Requires: stock file with a tail record region (city gazette layout), host block with the
+/// 0x402 link columns present (they exist even when empty) and a candidate leaf with exactly one
+/// incoming edge which is not a re-home target.
+pub fn graft_city_probe(
+    stock: &[u8],
+    suffix: &str,
+    pick_prefix: &str,
+) -> Result<(Vec<u8>, GraftReport), String> {
+    let n = stock.len();
+    let hdr = u32(stock, 0x10) as usize;
+    let nb = u16(stock, hdr + 4) as usize;
+    let nrec = u16(stock, hdr + 6) as usize;
+    let secoff = |i: usize| u32(stock, hdr + 24 + i * 5 + 1) as usize;
+    let boff: Vec<usize> = (0..nb)
+        .map(|i| u32(stock, secoff(1) + 4 * i) as usize)
+        .collect();
+    let tail0 = (0..nrec)
+        .map(|i| u32(stock, secoff(3) + 4 * i) as usize)
+        .min()
+        .ok_or("graft: no tail records")?;
+    let host = nb - 1;
+    let bs = boff[host];
+    let be = tail0;
+    // ---- parse host block (same rules as read_full, minimal column set) ----
+    let node_count = u16(stock, bs) as usize;
+    let num_desc = u16(stock, bs + 6) as usize;
+    let mut descs: Vec<Desc> = Vec::new();
+    for i in 0..num_desc {
+        let p = bs + 8 + i * 12;
+        let k = u16(stock, p);
+        descs.push(Desc {
+            kind: (k & 0xfff) as u32,
+            flags: (k & 0xf000) as u32,
+            code: u16(stock, p + 2) as u32,
+            off: u32(stock, p + 4),
+            param: u32(stock, p + 8),
+        });
+    }
+    let span_end = |i: usize| -> usize {
+        if i + 1 < descs.len() {
+            (bs + descs[i + 1].off as usize).max(bs + descs[i].off as usize)
+        } else {
+            be
+        }
+    };
+    let find = |kind: u32, flags: u32| -> Option<usize> {
+        descs
+            .iter()
+            .position(|d| d.kind == kind && d.flags == flags)
+    };
+    let odi = find(0x401, 0).ok_or("graft: host has no 0x401 column")?;
+    let d = &descs[odi];
+    let mut od = decode_u16(
+        stock,
+        d.code,
+        bs + d.off as usize,
+        span_end(odi),
+        d.param as usize,
+    );
+    od.resize(node_count, 0);
+    // cs/fe: device `CalculateFirstEdgeIndex` pure-DFS overwrite semantics.
+    let mut cs = vec![0usize; node_count];
+    let mut fe = vec![usize::MAX; node_count];
+    {
+        let mut ec = 0usize;
+        let mut root = 0usize;
+        let mut base = 1usize;
+        while root < node_count {
+            let mut stack = vec![root];
+            let mut visits = 0usize;
+            while let Some(x) = stack.pop() {
+                fe[x] = ec;
+                cs[x] = base + ec;
+                ec += od[x] as usize;
+                visits += 1;
+                let c0 = cs[x];
+                for i in (0..od[x] as usize).rev() {
+                    let c = c0 + i;
+                    if c < node_count {
+                        stack.push(c);
+                    }
+                }
+            }
+            root += visits;
+            base += 1;
+        }
+    }
+    // edge labels (0x403): blob + offset list
+    let mut blob_abs = 0usize;
+    let mut blob_len = 0usize;
+    let mut loff: Vec<u32> = Vec::new();
+    {
+        let c403: Vec<usize> = descs
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.kind == 0x403)
+            .map(|(i, _)| i)
+            .collect();
+        let bd = c403
+            .iter()
+            .copied()
+            .find(|&i| descs[i].code == 0x11)
+            .or_else(|| c403.first().copied())
+            .ok_or("graft: host has no 0x403 blob")?;
+        blob_abs = bs + descs[bd].off as usize;
+        blob_len = descs[bd].param as usize;
+        if let Some(&oi) = c403.iter().find(|&&i| i != bd) {
+            loff = decode_u32(
+                stock,
+                descs[oi].code,
+                bs + descs[oi].off as usize,
+                span_end(oi),
+                descs[oi].param as usize,
+            );
+        }
+    }
+    let lab = |e: usize| -> Vec<u8> {
+        let a = *loff.get(e).unwrap_or(&(blob_len as u32)) as usize;
+        let b2 = *loff.get(e + 1).unwrap_or(&(blob_len as u32)) as usize;
+        let a = a.min(blob_len);
+        let b2 = b2.max(a).min(blob_len);
+        stock[blob_abs + a..blob_abs + b2].to_vec()
+    };
+    // link columns (0x402): bitmap + pair streams
+    let bi_row = find(0x402, 0x4000).ok_or("graft: host has no link bitmap row")?;
+    let vp_row = find(0x402, 0).ok_or("graft: host has no link pair row")?;
+    if descs[bi_row].code != 0x02 {
+        return Err("graft: unsupported host bitmap code".into());
+    }
+    let nn = (descs[bi_row].param as usize).min(node_count);
+    let bits = bitfield(
+        stock,
+        descs[bi_row].code,
+        bs + descs[bi_row].off as usize,
+        span_end(bi_row),
+        nn,
+    );
+    let mut linked: Vec<usize> = (0..nn.min(bits.len())).filter(|&i| bits[i]).collect();
+    let old_pairs = decode_u32(
+        stock,
+        descs[vp_row].code,
+        bs + descs[vp_row].off as usize,
+        span_end(vp_row),
+        descs[vp_row].param as usize * 2,
+    );
+    // incoming-link targets INTO the host block (from any block): must not be relabelled.
+    let all_links = read_links(stock)?;
+    let mut targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (bi, m) in all_links.iter().enumerate() {
+        for &(tb, tn) in m.values() {
+            if tb == host {
+                let _ = bi;
+                targets.insert(tn);
+            }
+        }
+    }
+    // TEIC terminal order (device rule), candidates from the end (least collaterally damaged).
+    let blocklink: Vec<bool> = {
+        let mut v = vec![false; node_count];
+        for &x in &linked {
+            if x < node_count {
+                v[x] = true;
+            }
+        }
+        v
+    };
+    let mut terms: Vec<usize> = Vec::new();
+    collect_terms(&od, &cs, &blocklink, node_count, &mut terms);
+    let names = read(stock)?;
+    let mut chosen: Option<(usize, usize)> = None; // (term idx, node)
+    let mut dbg = [0usize; 4]; // [seen, multi-in, _, target]
+    'outer: for ti in (0..terms.len()).rev() {
+        let L = terms[ti];
+        dbg[0] += 1;
+        if L >= node_count || od[L] != 0 || targets.contains(&L) {
+            dbg[3] += 1;
+            continue;
+        }
+        let mut n_in = 0usize;
+        for p in 0..node_count {
+            let base = cs[p];
+            for i in 0..od[p] as usize {
+                if base + i == L {
+                    n_in += 1;
+                }
+            }
+        }
+        if n_in != 1 {
+            dbg[1] += 1;
+            continue;
+        }
+        if !pick_prefix.is_empty() {
+            match names
+                .elements
+                .iter()
+                .find(|x| x.block == host && x.node == L)
+            {
+                Some(x) if x.name.starts_with(pick_prefix) => {}
+                _ => {
+                    dbg[2] += 1;
+                    continue;
+                }
+            }
+        }
+        chosen = Some((ti, L));
+        break 'outer;
+    }
+    let (_ti, L) = match chosen {
+        Some(c) => c,
+        None => {
+            return Err(format!(
+            "graft: no graftable leaf (terms seen {} multi-in {} pick-miss {} target-skipped {})",
+            dbg[0], dbg[1], dbg[2], dbg[3]
+        )
+            .into())
+        }
+    };
+    let lost = names
+        .elements
+        .iter()
+        .find(|x| x.block == host && x.node == L)
+        .ok_or("graft: host leaf not an enumerated element")?;
+    let lost_name = lost.name.clone();
+    // ---- encode new link streams ----
+    linked.push(L);
+    linked.sort_unstable();
+    linked.dedup();
+    let mut bitmap: Vec<u8> = Vec::new();
+    let mut acc = 0u32;
+    for &x in &linked {
+        let dv = (x as u32) - acc;
+        bitmap.extend_from_slice(&vle_encode(dv));
+        acc = x as u32;
+    }
+    let mut pairs: Vec<u8> = Vec::new();
+    for v in old_pairs.iter().copied().chain([nb as u32, 0]) {
+        pairs.extend_from_slice(&vle_encode(v));
+    }
+    // ---- rebuild host block: table unchanged size, streams re-anchored ----
+    let data_base = 8 + 12 * num_desc;
+    let old_span = |i: usize| (descs[i].off as usize, span_end(i) - bs);
+    let mut new_data: Vec<u8> = Vec::new();
+    if num_desc > 0 && descs[0].off as usize > data_base {
+        new_data.extend_from_slice(&stock[bs + data_base..bs + descs[0].off as usize]);
+    }
+    let mut new_offs = vec![0u32; num_desc];
+    for i in 0..num_desc {
+        new_offs[i] = if i == 0 && num_desc > 0 {
+            descs[0].off
+        } else {
+            (data_base + new_data.len()) as u32
+        };
+        if i == bi_row {
+            new_data.extend_from_slice(&bitmap);
+        } else if i == vp_row {
+            new_data.extend_from_slice(&pairs);
+        } else {
+            let (a, b2) = old_span(i);
+            new_data.extend_from_slice(&stock[bs + a..bs + b2]);
+        }
+    }
+    let delta = new_data.len() as isize - (be - bs - data_base) as isize;
+    let mut newblock: Vec<u8> = Vec::new();
+    {
+        // block header, with the per-block element count (u16 @ bs+4) decremented: the grafted
+        // leaf stops being an element, and the device's per-block interval table
+        // [base, base+nbel) must match what the DFS actually enumerates (a lying nbel makes the
+        // list render "..." placeholders around the affected pages).
+        let mut hdr8 = [0u8; 8];
+        hdr8.copy_from_slice(&stock[bs..bs + 8]);
+        let nbel = u16::from_le_bytes([hdr8[4], hdr8[5]]);
+        hdr8[4..6].copy_from_slice(&(nbel - 1).to_le_bytes());
+        newblock.extend_from_slice(&hdr8);
+    }
+    for i in 0..num_desc {
+        let p = bs + 8 + i * 12;
+        newblock.extend_from_slice(&stock[p..p + 2]); // kind|flags
+        if i == vp_row {
+            newblock.extend_from_slice(&0x14u16.to_le_bytes()); // code -> VLE
+            newblock.extend_from_slice(&new_offs[i].to_le_bytes());
+            newblock.extend_from_slice(&((old_pairs.len() / 2 + 1) as u32).to_le_bytes());
+        } else {
+            newblock.extend_from_slice(&stock[p + 2..p + 4]); // code
+            newblock.extend_from_slice(&new_offs[i].to_le_bytes());
+            newblock.extend_from_slice(&stock[p + 8..p + 12]); // param
+        }
+    }
+    newblock.extend_from_slice(&new_data);
+    // ---- splice into the file ----
+    let mut out: Vec<u8> = Vec::with_capacity(n + delta as usize);
+    out.extend_from_slice(&stock[..bs]);
+    out.extend_from_slice(&newblock);
+    out.extend_from_slice(&stock[be..]);
+    // shift tail records (absolute offsets) by delta
+    for i in 0..nrec {
+        let p = secoff(3) + 4 * i;
+        let v = u32(&out, p) as isize + delta;
+        out[p..p + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    }
+    // rebuild sec0 (VLE per-block sizes) with the host size changed; length must stay stable
+    let sizes: Vec<u32> = (0..nb)
+        .map(|i| {
+            let sz = if i + 1 < nb { boff[i + 1] } else { tail0 } - boff[i]
+                + if i == host { delta as usize } else { 0 };
+            sz as u32
+        })
+        .collect();
+    let mut new_sec0: Vec<u8> = Vec::new();
+    for s in &sizes {
+        new_sec0.extend_from_slice(&vle_encode(*s));
+    }
+    if new_sec0.len() != secoff(1) - secoff(0) {
+        return Err("graft: sec0 length changed (probe too large?)".into());
+    }
+    out[secoff(0)..secoff(0) + new_sec0.len()].copy_from_slice(&new_sec0);
+    // header element count: one lost now, +1 will come from merge_city_list
+    let elem = u32(stock, hdr);
+    out[hdr..hdr + 4].copy_from_slice(&(elem - 1).to_le_bytes());
+    let probe_raw = format!("{lost_name}{suffix}");
+    Ok((
+        out,
+        GraftReport {
+            host_block: host,
+            host_node: L,
+            lost_element: _ti,
+            lost_name,
+            probe_raw,
+        },
+    ))
 }
 
 /// Element order exactly mirroring `NLAsfBlock::CalculateTerminatingElementIndex` +
@@ -1601,8 +1987,12 @@ pub fn merge_name_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, 
     let extra = u32at(stock, 0x14) as usize;
     let elem = u32at(stock, hdr);
     let a = u16at(stock, hdr + 4) as usize;
-    let corner = (u32at(stock, hdr + 0x10) as i32, u32at(stock, hdr + 0x14) as i32);
-    let sec = |i: usize| (stock[hdr + 24 + 5 * i], u32at(stock, hdr + 25 + 5 * i) as usize);
+    let sec = |i: usize| {
+        (
+            stock[hdr + 24 + 5 * i],
+            u32at(stock, hdr + 25 + 5 * i) as usize,
+        )
+    };
     let (c0, o0) = sec(0);
     let (c1, o1) = sec(1);
     let o5 = sec(5).1;
@@ -1617,7 +2007,7 @@ pub fn merge_name_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, 
 
     let blocks: Vec<(Vec<u8>, usize)> = chunk_entries(entries)
         .iter()
-        .map(|(_, c)| build_block(Some(corner), c))
+        .map(|(anchor, c)| build_block(*anchor, c))
         .collect();
     let k: u32 = blocks.iter().map(|(_, e)| *e as u32).sum();
 
@@ -1650,7 +2040,11 @@ pub fn merge_name_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, 
     }
     f.extend_from_slice(&sec0);
     let mut p = nblocks0;
-    for sz in sizes.iter().map(|&x| x as usize).chain(blocks.iter().map(|(b, _)| b.len())) {
+    for sz in sizes
+        .iter()
+        .map(|&x| x as usize)
+        .chain(blocks.iter().map(|(b, _)| b.len()))
+    {
         f.extend_from_slice(&(p as u32).to_le_bytes());
         p += sz;
     }
@@ -1669,10 +2063,190 @@ pub fn merge_name_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, 
     Ok((f, elem))
 }
 
+/// Merge entries into a stock CITY list (`LID20001` flavor). Sub-header layout (RE of the card's
+/// stock LID20001): `sec0` = VLE per-block sizes; `sec1` = raw u32 per-block offsets; `sec2` = VLE
+/// stream of link-record sizes, FOUR per block (all 35); `sec3` = raw u32 stream of FOUR absolute
+/// link-record offsets per block, pointing into a TAIL REGION right after the last block;
+/// `sec4/5/6` = small global streams, copied verbatim. The tail region is the 4-record group
+/// (`[35, this-list elems, street-list elems, REL elems, ..]` payload per record) repeated once per
+/// block. Appending N blocks therefore appends: 1 size + 1 block offset + 4 record sizes + 4 record
+/// offsets + one copy of the template group (first record's elem field = new total; every record's
+/// per-block edge field (@+8) = the appended block's tree-edge count; the three other global stat
+/// fields are left at the template values - their identity is unknown and NO consumer exists:
+/// NLNameList::LoadHeader fills the sec3 vector and nothing in DAPIAPP ever reads it).
+/// total). All block/tail offsets are rebuilt for the shifted geometry.
+pub fn merge_city_list(stock: &[u8], entries: &[NameEntry]) -> Result<(Vec<u8>, u32), String> {
+    if u32at(stock, 0x10) != crate::header::NL_HEADER_LEN as u32 {
+        return Err("merge: stock file does not split at 0x77".into());
+    }
+    let hdr = crate::header::NL_HEADER_LEN;
+    let extra = u32at(stock, 0x14) as usize;
+    let elem = u32at(stock, hdr);
+    let a = u16at(stock, hdr + 4) as usize;
+    let end = hdr + extra;
+    let secs: Vec<(u8, usize)> = (0..7)
+        .map(|i| {
+            (
+                stock[hdr + 24 + 5 * i],
+                u32at(stock, hdr + 25 + 5 * i) as usize,
+            )
+        })
+        .collect();
+    if (secs[0].0, secs[1].0, secs[2].0, secs[3].0) != (0x14, 0x11, 0x14, 0x11) {
+        return Err("merge: unexpected city list section codes".into());
+    }
+    let bounds: Vec<usize> = secs
+        .iter()
+        .map(|&(_, o)| o)
+        .chain(std::iter::once(end))
+        .collect();
+    let sec0_old = stock[bounds[0]..bounds[1]].to_vec();
+    let (sizes, _) = vle_at(&sec0_old, 0, a);
+    let sec2_old = stock[bounds[2]..bounds[3]].to_vec();
+    let (rsizes, _) = vle_at(&sec2_old, 0, 4 * a);
+    let rec = rsizes[0] as usize;
+    if rec == 0 || !rsizes.iter().all(|&r| r as usize == rec) || bounds[4] - bounds[3] != 16 * a {
+        return Err("merge: sec2/sec3 are not 4-per-block link-record tables".into());
+    }
+    let sec3_old: Vec<u32> = (0..4 * a)
+        .map(|i| u32at(stock, bounds[3] + 4 * i))
+        .collect();
+    if u16at(stock, hdr + 6) as usize != 4 * a {
+        return Err("merge: link-record count field disagrees with table size".into());
+    }
+    let sec4 = stock[bounds[4]..bounds[5]].to_vec();
+    let sec5 = stock[bounds[5]..bounds[6]].to_vec();
+    let sec6 = stock[bounds[6]..bounds[7]].to_vec();
+
+    let blocks: Vec<(Vec<u8>, usize)> = chunk_entries(entries)
+        .iter()
+        .map(|(anchor, c)| build_block(*anchor, c))
+        .collect();
+    let k: u32 = blocks.iter().map(|(_, e)| *e as u32).sum();
+    let nb = blocks.len();
+
+    // stock geometry: blocks contiguous from `end`, then the 4-per-block record tail.
+    let mut p = end;
+    let mut bofs = Vec::with_capacity(a);
+    for &s in &sizes {
+        bofs.push(p);
+        p += s as usize;
+    }
+    let tail0 = p;
+    let tail = &stock[tail0..];
+    if tail.len() != 4 * a * rec {
+        return Err("merge: tail region is not a complete record area".into());
+    }
+    let mut group = tail[..4 * rec].to_vec();
+    group[4..8].copy_from_slice(&(elem + k).to_le_bytes());
+
+    let mut sec2 = sec2_old.clone();
+    for _ in 0..4 * nb {
+        sec2.extend_from_slice(&vle_encode(rec as u32));
+    }
+    let mut sec0 = sec0_old.clone();
+    for (blk, _) in &blocks {
+        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
+    }
+    let na = a + nb;
+    let no1 = hdr + 59 + sec0.len();
+    let no2 = no1 + 4 * na;
+    let no3 = no2 + sec2.len();
+    let no4 = no3 + 16 * na;
+    let nextra = no4 - hdr + sec4.len() + sec5.len() + sec6.len();
+    let nblocks0 = hdr + nextra;
+    let ntail0 = nblocks0
+        + sizes.iter().map(|&s| s as usize).sum::<usize>()
+        + blocks.iter().map(|(b, _)| b.len()).sum::<usize>();
+
+    let mut f = stock[..hdr].to_vec();
+    f[0x14..0x18].copy_from_slice(&(nextra as u32).to_le_bytes());
+    f.extend_from_slice(&(elem + k).to_le_bytes());
+    f.extend_from_slice(&(na as u16).to_le_bytes());
+    f.extend_from_slice(&stock[hdr + 6..hdr + 24]); // B..F + corner
+                                                    // NLNameList::LoadHeader validates EVERY stream against its own header count
+                                                    // (@hdr+4 blocks, @hdr+6 link-records, @hdr+8/+0x0A/+0x0C sec4/5/6) and requires the decoder
+                                                    // cursor to land EXACTLY on each section boundary. The record count (@hdr+6) must grow with
+                                                    // the 4-per-block tail records we append.
+    let nrecs = (4 * na) as u16;
+    f[hdr + 6..hdr + 8].copy_from_slice(&nrecs.to_le_bytes());
+    for (code, o) in [
+        (secs[0].0, hdr + 59),
+        (secs[1].0, no1),
+        (secs[2].0, no2),
+        (secs[3].0, no3),
+        (secs[4].0, no4),
+        (secs[5].0, no4 + sec4.len()),
+        (secs[6].0, no4 + sec4.len() + sec5.len()),
+    ] {
+        f.push(code);
+        f.extend_from_slice(&(o as u32).to_le_bytes());
+    }
+    f.extend_from_slice(&sec0);
+    let mut q = nblocks0;
+    for sz in sizes
+        .iter()
+        .map(|&x| x as usize)
+        .chain(blocks.iter().map(|(b, _)| b.len()))
+    {
+        f.extend_from_slice(&(q as u32).to_le_bytes());
+        q += sz;
+    }
+    f.extend_from_slice(&sec2);
+    for j in 0..4 * a {
+        let shifted = (sec3_old[j] as usize) - tail0 + ntail0;
+        f.extend_from_slice(&(shifted as u32).to_le_bytes());
+    }
+    for m in 0..4 * nb {
+        let o = ntail0 + 4 * a * rec + m * rec;
+        f.extend_from_slice(&(o as u32).to_le_bytes());
+    }
+    f.extend_from_slice(&sec4);
+    f.extend_from_slice(&sec5);
+    f.extend_from_slice(&sec6);
+    if f.len() != nblocks0 {
+        return Err("merge: section bookkeeping mismatch".into());
+    }
+    for i in 0..a {
+        f.extend_from_slice(&stock[bofs[i]..bofs[i] + sizes[i] as usize]);
+    }
+    for (blk, _) in &blocks {
+        f.extend_from_slice(blk);
+    }
+    f.extend_from_slice(tail);
+    for (blk, _) in &blocks {
+        let mut g = group.clone();
+        let ed = block_tree_edges(blk);
+        for j in 0..4 {
+            let o = j * rec;
+            if o + 12 <= g.len() {
+                g[o + 8..o + 12].copy_from_slice(&ed.to_le_bytes());
+            }
+        }
+        f.extend_from_slice(&g);
+    }
+    Ok((f, elem))
+}
+
+/// Tree-edge count of a block = `param` of the `0x0403`/flag-0x8000 desc row; this is the value
+/// every tail record of that block carries at field offset +8 (verified on stock: block 0 = 8041,
+/// replicated in all four of its records).
+fn block_tree_edges(blk: &[u8]) -> u32 {
+    let nd = u16(blk, 6) as usize;
+    for r in 0..nd {
+        let p = 8 + r * 12;
+        let k = u16(blk, p);
+        if (k & 0x0f00) == 0x0400 && (k & 0x00ff) == 0x03 && (k & 0xf000) == 0x8000 {
+            return u32(blk, p + 8);
+        }
+    }
+    0
+}
+
 /// Build one block (a plain-trie name-list) for a chunk of entries. `anchor` = the city position the
 /// stored coordinates are relative to (`None` = no coordinates at all, gazetteer flavor). Returns
 /// (bytes, element_count).
-fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, usize) {
+pub fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, usize) {
     // --- build trie (byte edges; every name terminated with 0x00 so it is a leaf) ---
     let mut nodes: Vec<TrieNode> = vec![TrieNode { child: Vec::new() }];
     let mut leaf_of = vec![0usize; entries.len()];
@@ -1812,11 +2386,15 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
     //     (§11.4b, DAPIAPP enSetListDescriptions/enDecodeAttrLists) so the device's fixed column
     //     set gets a valid description for every always-decoded slot. Columns whose stock data we
     //     cannot synthesize yet are emitted with valid all-clear rows (empty span, param=count). ---
-    let (pos_wf, pos_code): (u16, u16) = if anchor.is_some() { (0x4407, 0x03) } else { (0x4407, 0x02) };
+    let (pos_wf, pos_code): (u16, u16) = if anchor.is_some() {
+        (0x4407, 0x03)
+    } else {
+        (0x4407, 0x02)
+    };
     let empty: &[u8] = &[];
     let descs: Vec<(u16, u16, &[u8], u32)> = vec![
-        (0x4402, 0x02, empty, nc as u32), // block-link bitmap: none
-        (0x0402, 0x14, empty, 0),         // block-link targets: none
+        (0x4402, 0x02, empty, nc as u32),     // block-link bitmap: none
+        (0x0402, 0x14, empty, 0),             // block-link targets: none
         (0x0401, 0x18, &od_bytes, nc as u32), // outDegree Simple9-u16
         (0x4404, 0x02, empty, edge_count as u32),
         (0x8404, 0x11, empty, 0),
@@ -1825,7 +2403,7 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
         (0x8405, 0x11, empty, 0),
         (0x0405, 0x11, empty, 0),
         (0x8403, 0x14, &loff_bytes, loff.len() as u32), // edge-label offsets (flags 0x8000)
-        (0x0403, 0x11, &blob, blob.len() as u32), // edge-label blob
+        (0x0403, 0x11, &blob, blob.len() as u32),       // edge-label blob
         (0x0406, 0x18, &targets_bytes, edge_count as u32), // child targets Simple9
         (0x0413, 0x02, empty, edge_count as u32),
         (pos_wf, pos_code, empty, elem_count as u32),
@@ -1833,7 +2411,11 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
             0x0407,
             0x11,
             &coords,
-            if anchor.is_some() { (elem_count * 2) as u32 } else { 0 },
+            if anchor.is_some() {
+                (elem_count * 2) as u32
+            } else {
+                0
+            },
         ),
         (0x440e, 0x02, empty, elem_count as u32),
         (0x040e, 0x11, empty, 0),
@@ -1846,10 +2428,20 @@ fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8>, u
         (0x040a, 0x11, empty, 0),
         (0x440b, 0x02, empty, elem_count as u32),
         (0x040b, 0x11, empty, 0),
-        (0x440c,
-         if anchor.is_some() && nbel > 0 { 0x01 } else { 0x02 },
-         if anchor.is_some() && nbel > 0 { &bel_bits } else { empty },
-         elem_count as u32), // belonging bitmap (LSB-first, stock row [26] code 0x01)
+        (
+            0x440c,
+            if anchor.is_some() && nbel > 0 {
+                0x01
+            } else {
+                0x02
+            },
+            if anchor.is_some() && nbel > 0 {
+                &bel_bits
+            } else {
+                empty
+            },
+            elem_count as u32,
+        ), // belonging bitmap (LSB-first, stock row [26] code 0x01)
         if anchor.is_some() && nbel > 0 {
             (0x040c, 0x14, &bel_vals, nbel) // belonging city-element ids (VLE, row [27])
         } else {
@@ -2273,15 +2865,28 @@ mod merge_test {
                 let y: i32 = it.next().unwrap().parse().unwrap();
                 let x: i32 = it.next().unwrap().parse().unwrap();
                 let label = it.next().unwrap().replace("\\t", "\t");
-                NameEntry { label, x_pau: x, y_pau: y, city: Some((0, 0)), belonging: None }
+                NameEntry {
+                    label,
+                    x_pau: x,
+                    y_pau: y,
+                    city: Some((0, 0)),
+                    belonging: None,
+                }
             })
             .collect();
         let (f, base) = merge_name_list(&stock, &entries).unwrap();
         std::fs::create_dir_all("/tmp/rnwwork/t27dbg/outG").unwrap();
         std::fs::write("/tmp/rnwwork/t27dbg/outG/LID20006.DAT", &f).unwrap();
         let nl = read(&f).expect("merged file must read back");
-        let our: Vec<&str> = nl.elements[base as usize..].iter().map(|e| e.name.as_str()).collect();
+        let our: Vec<&str> = nl.elements[base as usize..]
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
         assert_eq!(our.len(), entries.len());
-        println!("spliced base {base} + {} elems, size {:#x}", our.len(), f.len());
+        println!(
+            "spliced base {base} + {} elems, size {:#x}",
+            our.len(),
+            f.len()
+        );
     }
 }

@@ -30,7 +30,11 @@ fn pa_osm_roundtrip() {
     let nl =
         lid_format::read(&std::fs::read(out.join("LID20006.DAT")).unwrap()).expect("street LID");
     let idx = parse_pa(&raw).expect("PA parses");
-    assert_eq!(idx.domain as usize, nl.elements.len(), "domain = street elems");
+    assert_eq!(
+        idx.domain as usize,
+        nl.elements.len(),
+        "domain = street elems"
+    );
     let dl = idx.detail_list().expect("DETAIL list");
 
     // decode every element through the device walk (locate + decode, cached per block).
@@ -47,7 +51,9 @@ fn pa_osm_roundtrip() {
     }
     assert_eq!(entries.len(), nl.elements.len());
     assert!(
-        entries.iter().all(|e| e.cell == 0 && e.ratio == 100 && !e.left && !e.right),
+        entries
+            .iter()
+            .all(|e| e.cell == 0 && e.ratio == 100 && !e.left && !e.right),
         "neutral cell/side, ratio 100"
     );
 
@@ -57,9 +63,21 @@ fn pa_osm_roundtrip() {
     let p2 = |a: f64, b: f64| (p(a) + p(b)) / 2; // writer's centroid (int PAU, floor)
     for (name, ax, ay, hxr, hyr) in [
         // Marszalkowska centroid (100..101), addr 10 = node 1; anchor city Ceszin.
-        ("Marszalkowska", (21.0000, 21.0010), (52.0000, 52.0010), 21.0005, 52.0005),
+        (
+            "Marszalkowska",
+            (21.0000, 21.0010),
+            (52.0000, 52.0010),
+            21.0005,
+            52.0005,
+        ),
         // Nowogrodzka centroid (102..103), addr 5 = node 4 (addr:place join).
-        ("Nowogrodzka", (21.0100, 21.0110), (52.0100, 52.0110), 21.0105, 52.0105),
+        (
+            "Nowogrodzka",
+            (21.0100, 21.0110),
+            (52.0100, 52.0110),
+            21.0105,
+            52.0105,
+        ),
     ] {
         let (ei, ne) = nl
             .elements
@@ -73,7 +91,11 @@ fn pa_osm_roundtrip() {
         };
         // stored name-list delta + its city anchor = the street's absolute anchor.
         let anchor = (cx + i64::from(ne.x_pau), cy + i64::from(ne.y_pau));
-        assert_eq!(anchor, (p2(ax.0, ax.1), p2(ay.0, ay.1)), "{name} anchor math");
+        assert_eq!(
+            anchor,
+            (p2(ax.0, ax.1), p2(ay.0, ay.1)),
+            "{name} anchor math"
+        );
         let rel = entries[ei].pos.expect("PA pos");
         assert_eq!(
             (anchor.0 + i64::from(rel.0), anchor.1 + i64::from(rel.1)),

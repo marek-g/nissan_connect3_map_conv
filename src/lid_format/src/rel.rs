@@ -624,7 +624,12 @@ mod card_tests {
             let b = std::fs::read(&p2).unwrap();
             let idx = super::RelIndex::parse(&b).unwrap();
             let r = super::get_relations(&b, &idx, bs, id, id + 1).unwrap();
-            println!("{} by_src={} {id} -> {} rels", p2.split('/').next_back().unwrap(), bs, r.len());
+            println!(
+                "{} by_src={} {id} -> {} rels",
+                p2.split('/').next_back().unwrap(),
+                bs,
+                r.len()
+            );
         }
     }
 }
@@ -679,7 +684,10 @@ mod merge_rel_test {
         let all = super::get_relations(&b, &idx, true, 0, idx.d[2] + 1).unwrap();
         let mut rels: Vec<(u32, u32)> = all.iter().copied().filter(|&(_, t)| t != 109625).collect();
         let base = idx.d[2]; // 974871
-        let nk = std::fs::read_to_string("/tmp/rnwwork/t27dbg/krz.tsv").unwrap().lines().count() as u32;
+        let nk = std::fs::read_to_string("/tmp/rnwwork/t27dbg/krz.tsv")
+            .unwrap()
+            .lines()
+            .count() as u32;
         for i in 0..nk {
             rels.push((base + i, 109625));
         }
@@ -722,13 +730,19 @@ mod outH_verify {
             let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
             println!("city {city} -> {} streets", r.len());
             assert!(!r.is_empty());
-            assert!(r.iter().all(|&(_, s)| s >= 974871), "city {city}: stock ids leaked");
+            assert!(
+                r.iter().all(|&(_, s)| s >= 974871),
+                "city {city}: stock ids leaked"
+            );
         }
         for city in [160202u32, 7427] {
             let r = super::get_relations(&b, &idx, false, city, city + 1).unwrap();
             println!("control {city} -> {}", r.len());
             assert!(!r.is_empty());
-            assert!(r.iter().all(|&(_, s)| s < 974871), "control {city}: ours leaked");
+            assert!(
+                r.iter().all(|&(_, s)| s < 974871),
+                "control {city}: ours leaked"
+            );
         }
     }
 }

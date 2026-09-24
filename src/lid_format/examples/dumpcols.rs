@@ -18,7 +18,13 @@ fn main() {
         }
         println!("block {bi} range {}..{}", blk.elem_start, blk.elem_end);
         for s in &blk.streams {
-            print!("col {:#06x} flags {:#06x} vals={} bits={}", s.col, s.flags, s.values.len(), s.bits.len());
+            print!(
+                "col {:#06x} flags {:#06x} vals={} bits={}",
+                s.col,
+                s.flags,
+                s.values.len(),
+                s.bits.len()
+            );
             if !s.values.is_empty() {
                 print!(" head {:?}", &s.values[..s.values.len().min(8)]);
             }

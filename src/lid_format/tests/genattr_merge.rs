@@ -55,7 +55,14 @@ fn splice_appends_and_preserves() {
     assert_eq!(me, oe.max(se));
     assert_eq!(mtoc.len(), stoc.len() + otoc.len());
     assert_eq!(mtoc[0].1, 0);
-    assert_eq!(mtoc[1], (mtoc[0].0 + payload(&stock, stoc[0].0, stock.len()).len(), 8, 12));
+    assert_eq!(
+        mtoc[1],
+        (
+            mtoc[0].0 + payload(&stock, stoc[0].0, stock.len()).len(),
+            8,
+            12
+        )
+    );
     let s0 = payload(&stock, stoc[0].0, stock.len());
     assert_eq!(payload(&m, mtoc[0].0, mtoc[1].0), s0);
     let o0 = payload(&our, otoc[0].0, our.len());

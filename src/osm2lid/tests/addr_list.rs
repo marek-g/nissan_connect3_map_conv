@@ -24,11 +24,19 @@ fn addr_list_grammar_and_join() {
     // outer header: rIdxListID { u16 region; u16 listID; ... } — the device binds the file by these.
     assert_eq!(&bytes[0x00..0x02], &0x0402u16.to_le_bytes(), "regionIdent");
     assert_eq!(&bytes[0x02..0x04], &129u16.to_le_bytes(), "listID 129");
-    assert_eq!(&bytes[0x0c..0x10], &1u32.to_le_bytes(), "kind = raw name list");
+    assert_eq!(
+        &bytes[0x0c..0x10],
+        &1u32.to_le_bytes(),
+        "kind = raw name list"
+    );
 
     let nl = lid_format::read(&bytes).expect("decode LID20000");
     let rows: BTreeSet<&str> = nl.elements.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(rows.len(), nl.elements.len(), "stock: every 129 name is unique");
+    assert_eq!(
+        rows.len(),
+        nl.elements.len(),
+        "stock: every 129 name is unique"
+    );
 
     let city_nl = lid_format::read(&std::fs::read(out.join("LID20001.DAT")).unwrap()).unwrap();
     let cities: BTreeSet<&str> = city_nl.elements.iter().map(|e| e.name.as_str()).collect();
@@ -42,7 +50,10 @@ fn addr_list_grammar_and_join() {
             Some((c, r)) => (c, Some(r)),
             None => (*name, None),
         };
-        assert!(cities.contains(city), "city element missing for row {name:?}");
+        assert!(
+            cities.contains(city),
+            "city element missing for row {name:?}"
+        );
         if let Some(rest) = rest {
             let street = streets
                 .iter()

@@ -6,9 +6,26 @@ fn main() {
     let bi: usize = a[1].parse().unwrap();
     let ga = read_gen_attr(&buf).unwrap();
     let blk = ga.decode_block(&buf, bi).unwrap();
-    println!("block {bi} elems {}..{} streams:", blk.elem_start, blk.elem_end);
-    for s in &blk.streams { println!("  col {:x} flags {:x} bits {} vals {}", s.col, s.flags, s.bits.len(), s.values.len()); }
+    println!(
+        "block {bi} elems {}..{} streams:",
+        blk.elem_start, blk.elem_end
+    );
     for s in &blk.streams {
-        if s.col==1 { for n in &needles { if let Some(p)=s.values.iter().position(|&x|x==*n){ println!("NEEDLE {n} col {:x} fl {:x} at idx {p}", s.col, s.flags);} } }
+        println!(
+            "  col {:x} flags {:x} bits {} vals {}",
+            s.col,
+            s.flags,
+            s.bits.len(),
+            s.values.len()
+        );
+    }
+    for s in &blk.streams {
+        if s.col == 1 {
+            for n in &needles {
+                if let Some(p) = s.values.iter().position(|&x| x == *n) {
+                    println!("NEEDLE {n} col {:x} fl {:x} at idx {p}", s.col, s.flags);
+                }
+            }
+        }
     }
 }

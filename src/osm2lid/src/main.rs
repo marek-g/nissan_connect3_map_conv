@@ -132,7 +132,10 @@ fn main() {
             }
             "--city-radius" => {
                 i += 1;
-                city_radius = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(city_radius);
+                city_radius = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(city_radius);
             }
             "-h" | "--help" => {
                 usage();
@@ -212,8 +215,14 @@ fn main() {
     } else {
         write_db_city(&outdir.join("DB_CITY.DAT"), &data, region_id, bbox)
     };
-    let (ncit, city_idx, city_entries) =
-        write_cities(&outdir.join("LID20001.DAT"), &data, bbox, region_id, 2, !stock_cities);
+    let (ncit, city_idx, city_entries) = write_cities(
+        &outdir.join("LID20001.DAT"),
+        &data,
+        bbox,
+        region_id,
+        2,
+        !stock_cities,
+    );
     let city_ids: HashMap<String, Vec<u32>> = if auto_city {
         // Deterministic city mapping: fold(name) equality against the stock LID20001 element
         // names (author adds "NN NNN " postal prefixes to many entries - strip them). Towns the
@@ -328,32 +337,38 @@ fn main() {
         out
     } else {
         match &stock_city_map {
-        Some(p) => {
-            let mut m: HashMap<String, Vec<u32>> = HashMap::new();
-            let txt = fs::read_to_string(p).unwrap_or_else(|e| {
-                eprintln!("--stock-city-map {p}: {e}");
-                exit(1);
-            });
-            for line in txt.lines() {
-                if let Some((n, ids)) = line.split_once('\t') {
-                    let v: Vec<u32> = ids
-                        .split(',')
-                        .filter_map(|x| x.trim().parse().ok())
-                        .collect();
-                    if !v.is_empty() {
-                        m.insert(n.trim().to_string(), v);
+            Some(p) => {
+                let mut m: HashMap<String, Vec<u32>> = HashMap::new();
+                let txt = fs::read_to_string(p).unwrap_or_else(|e| {
+                    eprintln!("--stock-city-map {p}: {e}");
+                    exit(1);
+                });
+                for line in txt.lines() {
+                    if let Some((n, ids)) = line.split_once('\t') {
+                        let v: Vec<u32> = ids
+                            .split(',')
+                            .filter_map(|x| x.trim().parse().ok())
+                            .collect();
+                        if !v.is_empty() {
+                            m.insert(n.trim().to_string(), v);
+                        }
                     }
                 }
-            }
-            let miss: Vec<&String> = city_idx.keys().filter(|k| !m.contains_key(k.as_str())).collect();
-            eprintln!(
+                let miss: Vec<&String> = city_idx
+                    .keys()
+                    .filter(|k| !m.contains_key(k.as_str()))
+                    .collect();
+                eprintln!(
                 "stock-city-map: {}/{} towns mapped to stock city ids; no map (city omitted from REL): {miss:?}",
                 city_idx.len() - miss.len(),
                 city_idx.len()
             );
-            m
-        }
-        None => city_idx.iter().map(|(k, v)| (k.clone(), vec![*v])).collect(),
+                m
+            }
+            None => city_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), vec![*v]))
+                .collect(),
         }
     };
     let segs = build_onecells(&data, bbox);
@@ -403,7 +418,10 @@ fn main() {
             }
         }
         for (e, town) in st_entries.iter_mut().zip(city_of.iter_mut()) {
-            if town.as_ref().is_some_and(|t| city_ids.contains_key(t.as_str())) {
+            if town
+                .as_ref()
+                .is_some_and(|t| city_ids.contains_key(t.as_str()))
+            {
                 continue;
             }
             let mut best: Option<(i64, &String, (i64, i64))> = None;
@@ -422,7 +440,11 @@ fn main() {
     // street -> owning city element id (column 0x40c): the device lists a city's streets through
     // this in-file column, same ids REL00001 uses as targets (ambiguous names: first stock id).
     for (e, town) in st_entries.iter_mut().zip(city_of.iter()) {
-        e.belonging = town.as_ref().and_then(|t| city_ids.get(t)).and_then(|v| v.first()).copied();
+        e.belonging = town
+            .as_ref()
+            .and_then(|t| city_ids.get(t))
+            .and_then(|v| v.first())
+            .copied();
     }
     // Device typeahead is BYTE-EXACT over the stored name: `LISA_tclHnrTree::bGetList` converts the
     // typed string to unicode values and walks trie edges with exact-code `bFind`, then confirms with
@@ -445,7 +467,9 @@ fn main() {
         let mut pairs: Vec<(lid_format::NameEntry, Option<String>)> =
             st_entries.drain(..).zip(city_of.drain(..)).collect();
         pairs.sort_by(|a, b| {
-            rank[&a.0.city].cmp(&rank[&b.0.city]).then_with(|| a.0.label.cmp(&b.0.label))
+            rank[&a.0.city]
+                .cmp(&rank[&b.0.city])
+                .then_with(|| a.0.label.cmp(&b.0.label))
         });
         (st_entries, city_of) = pairs.into_iter().unzip();
     }
@@ -482,7 +506,9 @@ fn main() {
             if b.len() < 12 || &b[4..10] != b"CPRNAV" {
                 b
             } else {
-                eprintln!("merge-stock: {what} is CPRNAV-compressed; decompress the stock copy first");
+                eprintln!(
+                    "merge-stock: {what} is CPRNAV-compressed; decompress the stock copy first"
+                );
                 exit(1);
             }
         };
@@ -552,7 +578,11 @@ fn main() {
     let mut street_owners: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     if !city_ids.is_empty() {
         let mut oseen: HashSet<(u32, u32)> = HashSet::new();
-        for ((e, city), &s) in st_entries.iter().zip(&city_of).zip(streets.sid_of_entry.iter()) {
+        for ((e, city), &s) in st_entries
+            .iter()
+            .zip(&city_of)
+            .zip(streets.sid_of_entry.iter())
+        {
             if s == u32::MAX {
                 continue;
             }
@@ -590,10 +620,7 @@ fn main() {
     // splice our rebased GenAttr blocks onto the stock HNR file (keep stock house numbers intact)
     if let (Some(dir), false) = (merge_stock.as_deref(), no_genattr) {
         let p4 = outdir.join("LID40006.DAT");
-        match (
-            fs::read(Path::new(dir).join("LID40006.DAT")),
-            fs::read(&p4),
-        ) {
+        match (fs::read(Path::new(dir).join("LID40006.DAT")), fs::read(&p4)) {
             (Ok(stock4), Ok(our4)) => match lid_format::write::merge_gen_attr(&stock4, &our4) {
                 Ok(merged) => {
                     eprintln!(
@@ -1189,7 +1216,9 @@ fn write_name_list_idx(
     for (i, e) in entries.iter().enumerate() {
         let rank = city_rank[&e.city];
         let s = seq_cnt.entry((e.label.as_str(), e.city)).or_default();
-        occ.entry(disp(e.label.as_str())).or_default().push((rank, *s, i));
+        occ.entry(disp(e.label.as_str()))
+            .or_default()
+            .push((rank, *s, i));
         *s += 1;
     }
     let mut by_label: BTreeMap<String, Vec<(u32, (i64, i64))>> = BTreeMap::new();
@@ -1620,7 +1649,10 @@ fn write_addr_list(
         let Some(city) = city else { continue };
         cities.insert(city);
         // join keys are display strings (AddrHit labels carry the OSM display name, no type-in line)
-        let d = e.label.split_once('\t').map_or(e.label.as_str(), |(_, d)| d);
+        let d = e
+            .label
+            .split_once('\t')
+            .map_or(e.label.as_str(), |(_, d)| d);
         names.insert(format!("{city}, {d}"));
     }
     for hit in hits {
@@ -2459,7 +2491,13 @@ fn write_street_city_rel(
         .map_or(0, |&m| m as u64 + 1);
     let mut rels: Vec<(u32, u32)> = Vec::new();
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-    fn add_pairs(s: u32, cn: &Option<String>, m: &HashMap<String, Vec<u32>>, seen: &mut std::collections::HashSet<(u32, u32)>, rels: &mut Vec<(u32, u32)>) {
+    fn add_pairs(
+        s: u32,
+        cn: &Option<String>,
+        m: &HashMap<String, Vec<u32>>,
+        seen: &mut std::collections::HashSet<(u32, u32)>,
+        rels: &mut Vec<(u32, u32)>,
+    ) {
         if let Some(ids) = cn.as_ref().and_then(|c| m.get(c.as_str())) {
             for &t in ids {
                 if seen.insert((s, t)) {
@@ -2582,7 +2620,8 @@ fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {
 }
 
 /// ASCII-fold a name for the FTS NAMENORM column: uppercase, strip accents, keep [A-Z0-9-. ]
-fn fold(s: &str) -> String {    s.to_uppercase()
+fn fold(s: &str) -> String {
+    s.to_uppercase()
         .chars()
         .map(|c| match c {
             'Ą' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',

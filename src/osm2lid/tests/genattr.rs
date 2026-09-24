@@ -120,7 +120,11 @@ fn genattr_osm_roundtrip() {
             "enGetHnr gate = record count"
         );
         assert_eq!(stream(0xc09, 0).bits.len(), vals.len(), "parity per record");
-        assert_eq!(stream(0xc02, 0).values.len(), vals.len(), "to bound per record");
+        assert_eq!(
+            stream(0xc02, 0).values.len(),
+            vals.len(),
+            "to bound per record"
+        );
         assert_eq!(stream(0xc03, 0x4000).param as usize, vals.len());
         assert!(stream(0xc03, 0x4000).bits.iter().all(|&b| !b));
         tos.extend(stream(0xc02, 0).values.iter().copied());
@@ -148,7 +152,11 @@ fn genattr_osm_roundtrip() {
     }
     // 0x001: per-street OWNER city id lists (both fixture cities own each street; the reported
     // city leads, the 3 km neighbor follows — city id order = city_ids insertion per street).
-    assert_eq!(ids, vec![0u32, 1, 1, 0], "0x001 = per-street owner city ids");
+    assert_eq!(
+        ids,
+        vec![0u32, 1, 1, 0],
+        "0x001 = per-street owner city ids"
+    );
     assert_eq!(street_nums.len(), 2, "two address-bearing streets");
     let nums_of = |sid: u32| {
         street_nums
@@ -202,7 +210,10 @@ fn genattr_osm_roundtrip() {
         }
     }
     want.sort_unstable();
-    assert_eq!(pairs, want, "street->city pairs = every city within 3 km (stock shape)");
+    assert_eq!(
+        pairs, want,
+        "street->city pairs = every city within 3 km (stock shape)"
+    );
     assert!(pairs.iter().all(|&(_, t)| t < 2), "city elems in range");
 
     std::fs::remove_dir_all(&out).ok();

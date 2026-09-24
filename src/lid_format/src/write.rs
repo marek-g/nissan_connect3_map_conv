@@ -471,7 +471,10 @@ pub fn merge_gen_attr(stock: &[u8], our: &[u8]) -> Result<Vec<u8>, String> {
         .first()
         .map(|&(_, s, _)| s)
         .ok_or("genattr: empty stock TOC")?;
-    if o_toc.iter().any(|&(_, s, _)| s < s_elem && s != first_start) {
+    if o_toc
+        .iter()
+        .any(|&(_, s, _)| s < s_elem && s != first_start)
+    {
         return Err("genattr: our ranges overlap the stock id space".into());
     }
     // block payloads by TOC order (size = next offset, last runs to EOF)
@@ -506,7 +509,10 @@ pub fn merge_gen_attr(stock: &[u8], our: &[u8]) -> Result<Vec<u8>, String> {
     out[0x14..0x18].copy_from_slice(&((hdr + toc_size) as u32).to_le_bytes());
     let mut bo = blocks_off;
     let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(total);
-    for (blk, &(_, s, e)) in s_blocks.iter().zip(s_toc.iter()).chain(o_blocks.iter().zip(o_toc.iter()))
+    for (blk, &(_, s, e)) in s_blocks
+        .iter()
+        .zip(s_toc.iter())
+        .chain(o_blocks.iter().zip(o_toc.iter()))
     {
         entries.push((bo as u32, s, e));
         bo += blk.len();
