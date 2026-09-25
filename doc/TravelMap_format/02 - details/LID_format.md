@@ -729,6 +729,24 @@ city at a time.
   New files (records, nrec=4): `zzcity10.DAT` 1167 B raw md5 `a99eedfd8fc5f1868dcf11e398fd0afc`,
   compressed `zzcity10C.DAT` md5 `2f6b0c1d75b249ec60171836921c4171`; `zzmin1.DAT` 848 B md5
   `07c673078239e9ddef6a9eb8d7014542`, compressed `187ecdfdd531ba6e12d7d20ebb55124c`. **Card test pending.**
+  **Follow-up 2 (2026-09-25 evening, card-verified + root cause found):** flashing the records build fixed
+  the RESET ("nie ma crasha") but the list stayed **empty**. Root cause (Ghidra `vPopulateCityIndices`
+  `00c73b68` + `bSendListUpdate` `00c74fc8` + offline probes `src/lid_format/tests/rel_city_probe.rs`):
+  the city browser's candidate set is **REL-driven** — `LISA_tclRelationMap` ranges fed by `REL00003`
+  (district→city), `REL00006` (region→city), `REL00000` (city↔urban-part self-rel, FLI row query) and
+  `REL00001` (street→city owner). Stock matrices answer with stock city ids that don't exist in a
+  10-element file ⇒ `bGoToElemet` fails for every candidate ⇒ structurally empty. Stock also showed
+  homonym traps (two "SZCZECIN" near Radom, a "POZNAŃ" near Kraków) — name-only matching is invalid;
+  element ids are the flat TEIC index and positions (§12.5 `origin + pool<<shift`) disambiguate.
+  Fix = ship the consistent **city family**: `city::build_city_relations` (name+≤15 km matcher,
+  `REL00003/6` stock-side ids kept, `REL00000` = guaranteed (i,i) self-pairs, `REL00001` = every stock
+  street re-owned to nearest new city) + records partner[0] = own element count (`[10, 974871, 714, 38]`)
+  + §12.5 position quantization fix. Generated (id table 0..9 = BYDGOSZCZ,GDAŃSK,KRAKÓW,LUBLIN,POZNAŃ,
+  RADOM,SZCZECIN,WARSZAWA,WROCŁAW,ŁÓDŹ): `zzcity10C.DAT` 692 B md5 `4870a161a6482f8cede2c512bc84ac27`,
+  `REL00000C.DAT` 168 B md5 `53d3ef2c1b7f0d096f8a0bfb35667e21`, `REL00001C.DAT` 1 549 008 B md5
+  `9732e2efcf939a7248562122075b50f2`, `REL00003C.DAT` 200 B md5 `5cda735f95570a4c63a83dd3763e14e3`,
+  `REL00006C.DAT` 220 B md5 `3d11fa4f2e06a9de558c2d0feb222676` (all in `/tmp/opencode/`). Test
+  `src/lid_format/tests/city_family.rs` asserts the browser queries answer with the NEW ids.
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
@@ -1014,6 +1032,13 @@ decodes all of this into `block_cells` (table rows; `cell_ord` = the `0xc11`/PA 
   stock POL additionally uses POI-domain ids 9, 10, 12 and 129=`0x81` — the latter's domain is [OPEN]).
   A name-list file can also carry its related meta-relidx vector in its ASF sub-header (`RAM +0x64..+0x68`,
   `bGetListSpecRelIdxFromMetaDataRelIdx` `00cec9e8` maps meta idx ⇒ list-local idx).
+  **City-family consequence (2026-09-25):** replacing `LID20001` with fewer elements requires shipping
+  regenerated `REL00000/1/3/6` (target side = `d3` = new element count, sources = stock ids kept); the
+  device's city candidate flow keys off those matrices, stock files otherwise return dead stock ids
+  (§11.4f follow-up 2). `city::build_city_relations` in `src/lid_format/src/city.rs` does the remap
+  (name+≤15 km position matcher kills homonyms; `REL00001` targets fall back to the nearest new city so
+  no street loses its owner; `REL00000` carries guaranteed (i,i) self-pairs because stock urban-part
+  partners live under different names).
   **Consequence for `osm2lid`:** the stock `META0000.DAT` is shipped unchanged; its relation entry #1 is
   (2↔3), so `osm2lid` writes exactly `REL00001.DAT` (street→city) with stock-faithful headers — any *additional*
   relation would require rewriting the META table (offset/count live at `+0x10/+0x14`; append-at-EOF relocation
@@ -1192,7 +1217,15 @@ descriptor per sub-stream. CONFIRMED mapping in the `SetDescription` bodies (`00
 which elements have a position; `flags=0` sub-stream = **COMPRESSED interleaved `X,Y` `u32`** — only `2·popcount`
 values, and element `i` (bit set) maps to `coords[2·rank]`,`coords[2·rank+1]` where `rank` = set bits before `i`
 (`Decode` stores an index vector `= rank<<1` at `+0x20`, `+0x40`=`popcount`). Element position =
-**block origin + (X, Y)**. Verified: values ≈ PAU deltas from origin (first block0 entry `X=233844` ≈ +0.0196°).
+**anchor + (X, Y) `<< SHIFT`** — CONFIRMED 2026-09-25: `NLPositionAttrVector::operator[]` `00cdbbc8`
+applies `origin + (pool << this+0x44)`; `SHIFT` = **file constant `u16 @ hdr+0x0e`** (all stock `POL`
+name-lists carry `8`; `NLProcessor::enAddNewAsfBlock` `00ceca4c` passes it from `GetAsfSubHeader+0x14`),
+so the stored pool values are **quantized** to 2^8 PAU ≈ 24 m (stock first block-38 pair `259981,270214`,
+BYDGOSZCZ stored `179918,187059` → `origin + (v<<8)` = 18.008°E/53.119°N exactly; probe
+`src/lid_format/tests/pos_chain_probe.rs`). City-list browse has NO city context, so the city file's
+coordinates are absolute vs the **file** sub-header origin — a city writer must quantize
+(`city::qdelta` = `round((abs − origin) >> SHIFT)`); the pre-fix unquantized deltas were 2^8× off
+(card-invisible while the list was empty). Verified: values ≈ PAU deltas from origin (first block0 entry `X=233844` ≈ +0.0196°).
 **RESOLVED (2026-09 — anchor fit on stock `POL/LID20004` + `LID20006`):** the per-block `tNLHPosition` is **NOT
 in the file** — it is the position of the **city being searched**, passed by the address-search client when it
 loads the block (`NLProcessor::enAddNewAsfBlock` `00ceca4c` → `enReadAsfBlock` `00cf4f70` →

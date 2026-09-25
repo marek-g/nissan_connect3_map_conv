@@ -418,11 +418,19 @@ pub struct Element {
     /// diacritic/original form). `name` is the post-first-TAB display line (empty when line 1 had
     /// no content), per `vCollectNamesOfCat`. Kept latin-1-decoded for invalid UTF-8 fidelity.
     pub sort_name: String,
-    pub x_pau: i32, // stored delta: absolute = queried-city (or file `origin`) + (x_pau, y_pau) (§12.5)
+    pub x_pau: i32, // stored pool value: absolute = `origin` + (x_pau << pos_shift) (§12.5, NLPositionAttrVector::operator[] @00cdbbc8)
     pub y_pau: i32,
     pub has_pos: bool,
     pub belonging: u32, // parent-city element id *within the same block* (device id space); 0xffffffff = none.
                         // Stock POL name-lists set it nowhere (probe `belonging_probe`); kept for fidelity.
+}
+
+/// Position quantization shift stored in the file sub-header (u16 at `hdr+0x0e`, where `hdr` is
+/// the u32 at file offset 0x10). Device applies `abs = origin + (stored << shift)`
+/// (`NLPositionAttrVector::operator[]` 00cdbbc8 / `Decode` 00cdd7dc; origin/shift are file-global,
+/// read from `NLAsfSubHeader` in `NLProcessor::enAddNewAsfBlock` 00ceca4c).
+pub fn pos_shift(b: &[u8]) -> u16 {
+    u16::from_le_bytes(b[0x0e + u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) as usize..][..2].try_into().unwrap())
 }
 
 /// The whole decoded name-list of a `LID*.DAT` block-container.

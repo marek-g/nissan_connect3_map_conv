@@ -13,6 +13,16 @@ use crate::read;
 use crate::simple9_encode;
 use crate::vle_encode;
 
+/// Position quantization shift written into the city sub-header (u16@+0x0e) and used by the
+/// position encoder; stock POL city files carry 8. Device: `abs = origin + (stored << shift)`.
+pub const CITY_POS_SHIFT: u16 = 8;
+
+/// Encode one quantized position delta for `CITY_POS_SHIFT` (round-to-nearest).
+pub fn qdelta(d: i64) -> i64 {
+    let q = 1i64 << (CITY_POS_SHIFT - 1);
+    (d + if d >= 0 { q } else { -q }) >> CITY_POS_SHIFT
+}
+
 /// One city element: stored name (uppercase UTF-8, as stock carries it) + WGS84 position in PAU
 /// (1/11930464.0 deg = 2^31/180).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,11 +243,14 @@ pub fn build_city_block(cities: &[CityEntry], origin: (i32, i32)) -> (Vec<u8>, u
     let ne = claims.len();
     let nbel = sorted.len();
 
-    // ---- positions: VLE deltas vs file origin (stock city-file shape) ----
+    // ---- positions: VLE quantized deltas vs file origin (stock city-file shape) ----
+    // Device model (NLPositionAttrVector, CONFIRMED 2026-09-25): abs = origin + (stored << shift)
+    // with shift/origin as file-global constants (sub-header u16@+0x0e, i32@+0x10/+0x14).
+    // Stock POL city file uses shift=8, so stored = round((abs - origin) / 2^shift).
     let mut pos_bytes = Vec::new();
     for c in sorted.iter() {
-        pos_bytes.extend_from_slice(&vle_encode((c.lon_pau as i64 - origin.0 as i64) as u32));
-        pos_bytes.extend_from_slice(&vle_encode((c.lat_pau as i64 - origin.1 as i64) as u32));
+        pos_bytes.extend_from_slice(&vle_encode(qdelta(c.lon_pau as i64 - origin.0 as i64) as u32));
+        pos_bytes.extend_from_slice(&vle_encode(qdelta(c.lat_pau as i64 - origin.1 as i64) as u32));
     }
     let od_bytes: Vec<u8> = od.iter().flat_map(|&d| vle_encode(d)).collect();
     let claim_bytes: Vec<u8> = claims.iter().flat_map(|&c| vle_encode(c)).collect();
@@ -291,6 +304,166 @@ pub fn build_city_file(cities: &[CityEntry], stock: &[u8]) -> Vec<u8> {
     build_city_container(cities.len() as u32, &[block], stock, hdr)
 }
 
+/// Regenerated `REL00000/1/3/6` matrices for a from-scratch city list (all four target the new
+/// file's list-2 element ids `0..cities.len()`). The device derives city candidates from these
+/// matrices (`vPopulateCityIndices` reads `LISA_tclRelationMap` ranges), so shipping a new
+/// `LID20001` without them leaves the city browser structurally empty (card-verified 2026-09-25).
+#[derive(Debug)]
+pub struct CityRelations {
+    pub rel0: Vec<u8>,
+    pub rel1: Vec<u8>,
+    pub rel3: Vec<u8>,
+    pub rel6: Vec<u8>,
+}
+
+/// Map a stock name-list element position+name to one of `cities` (element index), requiring an
+/// ASCII-folded name match AND a <= 15 km distance (kills homonym villages).
+fn city_match(cities: &[CityEntry], ax: i32, ay: i32, name: &str) -> Option<usize> {
+    let deg = 2f64.powi(31) / 180.0;
+    let lon = f64::from(ax) / deg;
+    let lat = f64::from(ay) / deg;
+    let folded = fold_polish(&name.to_uppercase());
+    let mut best: Option<(f64, usize)> = None;
+    for (i, c) in cities.iter().enumerate() {
+        if fold_polish(&c.name.to_uppercase()) != folded {
+            continue;
+        }
+        let (clon, clat) = (c.lon_pau as f64 / deg, c.lat_pau as f64 / deg);
+        let dx = (lon - clon) * lat.to_radians().cos();
+        let dy = lat - clat;
+        let km = (dx * dx + dy * dy).sqrt() * 111.194_926_644_558_73;
+        if best.is_none_or(|(b, _)| km < b) {
+            best = Some((km, i));
+        }
+    }
+    best.filter(|(km, _)| *km <= 15.0).map(|(_, i)| i)
+}
+
+/// ASCII-fold the Polish diacritic set (uppercase input).
+fn fold_polish(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'Ą' => 'A',
+            'Ć' => 'C',
+            'Ę' => 'E',
+            'Ł' => 'L',
+            'Ń' => 'N',
+            'Ó' => 'O',
+            'Ś' => 'S',
+            'Ź' => 'Z',
+            'Ż' => 'Z',
+            other => other,
+        })
+        .collect()
+}
+
+/// Full-scan every pair of a stock REL file (column query over the whole source range).
+fn all_pairs(b: &[u8]) -> Result<Vec<(u32, u32)>, String> {
+    let idx = crate::rel::RelIndex::parse(b)?;
+    crate::rel::get_relations(b, &idx, true, 0, idx.d[2])
+}
+
+/// Build the four device REL matrices (`REL00000` self, `REL00001` street->city, `REL00003`
+/// district->city, `REL00006` region->city) consistent with a new city file of `cities.len()`
+/// elements. Stock matrices are re-mapped: a stock endpoint that matches one of `cities`
+/// (ASCII-folded name within 15 km) is replaced by that city's new element id; `REL00001`
+/// targets (street owners) additionally fall back to the geographically nearest new city so
+/// every street keeps an owner. Stock source-side ids (districts/regions/streets) are kept.
+pub fn build_city_relations(
+    stock_lid: &[u8],
+    stock_rel0: &[u8],
+    stock_rel1: &[u8],
+    stock_rel3: &[u8],
+    stock_rel6: &[u8],
+    cities: &[CityEntry],
+) -> Result<CityRelations, String> {
+    use crate::rel::write_rel;
+    let nl = read(stock_lid).map_err(|e| format!("city-rel: stock lid: {e}"))?;
+    let (ox, oy) = nl.origin.ok_or("city-rel: stock lid has no origin")?;
+    let sh = crate::pos_shift(stock_lid) as u32;
+    let n_new = cities.len() as u64;
+    let deg = 2f64.powi(31) / 180.0;
+    // nearest city (unbounded) per stock element, for REL00001 target owners.
+    let nearest_city = |ax: i64, ay: i64| -> u32 {
+        let lon = ax as f64 / deg;
+        let lat = ay as f64 / deg;
+        let mut best = (0usize, f64::MAX);
+        for (i, c) in cities.iter().enumerate() {
+            let dx = (lon - c.lon_pau as f64 / deg) * lat.to_radians().cos();
+            let dy = lat - c.lat_pau as f64 / deg;
+            let d = dx * dx + dy * dy;
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        best.0 as u32
+    };
+    let abs = |e: &crate::Element| (ox as i64 + ((e.x_pau as i64) << sh), oy as i64 + ((e.y_pau as i64) << sh));
+    let mapped: Vec<Option<usize>> = nl
+        .elements
+        .iter()
+        .map(|e| {
+            let (ax, ay) = abs(e);
+            city_match(cities, ax as i32, ay as i32, &e.name)
+        })
+        .collect();
+    let tgt = |id: u32, fallback: bool| -> Option<u32> {
+        match mapped.get(id as usize).copied().flatten() {
+            Some(i) => Some(i as u32),
+            None if fallback => {
+                let e = &nl.elements[id as usize];
+                let (ax, ay) = abs(e);
+                Some(nearest_city(ax, ay))
+            }
+            None => None,
+        }
+    };
+    let dedup = |v: &mut Vec<(u32, u32)>| {
+        v.sort_unstable();
+        v.dedup();
+    };
+    // REL00000 (city<->city urban parts): keep stock pairs whose both ends belong to the same
+    // new city, and guarantee a self-pair per city (stock links cities to their urban-part
+    // elements, whose names differ; a new list has none, so only (i,i) is meaningful — the FLI
+    // row query then simply returns the matched city itself).
+    let mut p0: Vec<(u32, u32)> = (0..cities.len() as u32).map(|i| (i, i)).collect();
+    for (s, t) in all_pairs(stock_rel0)? {
+        if let (Some(i), Some(j)) = (tgt(s, false), tgt(t, false)) {
+            if i == j {
+                p0.push((i, j));
+            }
+        }
+    }
+    dedup(&mut p0);
+    // REL00001 (street->city): re-own every stock street to its (fallback nearest) new city.
+    let r1 = crate::rel::RelIndex::parse(stock_rel1)?;
+    let mut p1: Vec<(u32, u32)> = all_pairs(stock_rel1)?
+        .into_iter()
+        .filter_map(|(s, t)| tgt(t, true).map(|k| (s, k)))
+        .collect();
+    dedup(&mut p1);
+    // REL00003 (district->city) / REL00006 (region->city): keep matched cities.
+    let remap_side = |stock: &[u8]| -> Result<Vec<(u32, u32)>, String> {
+        let mut v: Vec<(u32, u32)> = all_pairs(stock)?
+            .into_iter()
+            .filter_map(|(s, t)| tgt(t, false).map(|k| (s, k)))
+            .collect();
+        dedup(&mut v);
+        Ok(v)
+    };
+    let p3 = remap_side(stock_rel3)?;
+    let p6 = remap_side(stock_rel6)?;
+    let n1 = u64::from(r1.d[2]);
+    let n3 = u64::from(crate::rel::RelIndex::parse(stock_rel3)?.d[2]);
+    let n6 = u64::from(crate::rel::RelIndex::parse(stock_rel6)?.d[2]);
+    Ok(CityRelations {
+        rel0: write_rel(n_new, n_new, 2, 2, &p0)?,
+        rel1: write_rel(n1, n_new, 3, 2, &p1)?,
+        rel3: write_rel(n3, n_new, 10, 2, &p3)?,
+        rel6: write_rel(n6, n_new, 9, 2, &p6)?,
+    })
+}
+
 // two-pass container: region1 + sub-header + section table + streams + blocks + record blob
 fn build_city_container(
     elem_count: u32,
@@ -319,13 +492,15 @@ fn build_city_container(
     let rec_stride = u32::from_le_bytes(stock[sec3_off + 4..sec3_off + 8].try_into().unwrap()) as usize - rec0;
     assert_eq!(rec_stride, 35, "unexpected stock record size");
     let mut partners = Vec::with_capacity(nrel);
+    let stock_elems = u32::from_le_bytes(stock[hdr..hdr + 4].try_into().unwrap());
     for r in 0..nrel {
         let f1 = u32::from_le_bytes(
             stock[rec0 + r * rec_stride + 4..rec0 + r * rec_stride + 8]
                 .try_into()
                 .unwrap(),
         );
-        partners.push(f1);
+        // the self-relation record names OUR own element count as partner, not the stock's.
+        partners.push(if f1 == stock_elems { elem_count } else { f1 });
     }
     let rec_tail = stock[rec0 + 32..rec0 + 35].to_vec();
     let nrec = nrel * nb;
@@ -396,7 +571,7 @@ fn build_city_container(
     s.extend_from_slice(&u16b(4));
     s.extend_from_slice(&u16b(3));
     s.extend_from_slice(&u16b(29));
-    s.extend_from_slice(&u16b(8));
+    s.extend_from_slice(&u16b(CITY_POS_SHIFT));
     s.extend_from_slice(&stock[hdr + 16..hdr + 24]); // file-spec constants / position origin
     assert_eq!(s.len(), tbl_at);
     let codes: [u8; 7] = [0x14, 0x11, 0x14, 0x11, 0x14, 0x14, 0x18];
@@ -444,18 +619,17 @@ pub fn selfcheck(data: &[u8], stock: &[u8], cities: &[CityEntry]) -> Result<(), 
     }
     let ox = i32::from_le_bytes(stock[119 + 16..119 + 20].try_into().unwrap()) as i64;
     let oy = i32::from_le_bytes(stock[119 + 20..119 + 24].try_into().unwrap()) as i64;
+    let q = 1i64 << CITY_POS_SHIFT;
     for (e, w) in nl.elements.iter().zip(want.iter()) {
         if e.name != w.name {
             return Err(format!("name {} != expected {}", e.name, w.name));
         }
-        if (e.x_pau as i64 + ox) as i32 != w.lon_pau || (e.y_pau as i64 + oy) as i32 != w.lat_pau {
+        let ax = ox + ((e.x_pau as i64) << CITY_POS_SHIFT);
+        let ay = oy + ((e.y_pau as i64) << CITY_POS_SHIFT);
+        if (ax - w.lon_pau as i64).abs() > q || (ay - w.lat_pau as i64).abs() > q {
             return Err(format!(
-                "position mismatch for {}: ({},{}) != ({},{})",
-                w.name,
-                e.x_pau as i64 + ox,
-                e.y_pau as i64 + oy,
-                w.lon_pau,
-                w.lat_pau
+                "position mismatch for {}: ({ax},{ay}) != ({},{})",
+                w.name, w.lon_pau, w.lat_pau
             ));
         }
     }

@@ -53,4 +53,40 @@ fn main() {
     println!("wrote {} bytes to {}", data.len(), out_path);
     selfcheck(&data, &stock, &cities).expect("selfcheck");
     println!("OK: {} cities verified", cities.len());
+    for (i, c) in sorted.iter().enumerate() {
+        println!("  id {i:>3} = {}", c.name);
+    }
+
+    // ---- consistent REL family (the device city browser is REL-driven) ----
+    let pol = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/\
+               CRYPTNAV/DATA/DATA/LID/CCP/POL/";
+    let rd = |n: &str| std::fs::read(format!("{pol}{n}")).expect("read stock rel");
+    let fam = lid_format::city::build_city_relations(
+        &stock,
+        &rd("REL00000.DAT"),
+        &rd("REL00001.DAT"),
+        &rd("REL00003.DAT"),
+        &rd("REL00006.DAT"),
+        &cities,
+    )
+    .expect("build city relations");
+    let dir = std::path::Path::new(&out_path).parent().unwrap().to_path_buf();
+    for (name, bytes) in [
+        ("REL00000.DAT", &fam.rel0),
+        ("REL00001.DAT", &fam.rel1),
+        ("REL00003.DAT", &fam.rel3),
+        ("REL00006.DAT", &fam.rel6),
+    ] {
+        let i = lid_format::rel::RelIndex::parse(bytes).expect("rel parse");
+        std::fs::write(dir.join(name), bytes).expect("write rel");
+        println!(
+            "{}: {} bytes d0={} d1={} src={} tgt={}",
+            name,
+            bytes.len(),
+            i.d[0],
+            i.d[1],
+            i.d[2],
+            i.d[3]
+        );
+    }
 }
