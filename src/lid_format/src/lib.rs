@@ -1367,10 +1367,14 @@ pub struct GraftReport {
 /// Requires: stock file with a tail record region (city gazette layout), host block with the
 /// 0x402 link columns present (they exist even when empty) and a candidate leaf with exactly one
 /// incoming edge which is not a re-home target.
+/// `reserved_blocks` = how many trailing block indices were already reserved by EARLIER graft
+/// calls on this same file (the header block count does not see reservations until merge_city_list
+/// materializes them; chaining grafts must count them manually so each link targets its own block).
 pub fn graft_city_probe(
     stock: &[u8],
     suffix: &str,
     pick_prefix: &str,
+    reserved_blocks: usize,
 ) -> Result<(Vec<u8>, GraftReport), String> {
     let n = stock.len();
     let hdr = u32(stock, 0x10) as usize;
@@ -1591,6 +1595,10 @@ pub fn graft_city_probe(
     linked.push(L);
     linked.sort_unstable();
     linked.dedup();
+    if linked.last() != Some(&L) {
+        return Err("graft: host node is not the highest link id (appended pair would desync \
+                    from the ascending bitmap order the device relies on)".into());
+    }
     let mut bitmap: Vec<u8> = Vec::new();
     let mut acc = 0u32;
     for &x in &linked {
@@ -1599,8 +1607,115 @@ pub fn graft_city_probe(
         acc = x as u32;
     }
     let mut pairs: Vec<u8> = Vec::new();
-    for v in old_pairs.iter().copied().chain([nb as u32, 0]) {
+    for v in old_pairs.iter().copied().chain([(nb + reserved_blocks) as u32, 0]) {
         pairs.extend_from_slice(&vle_encode(v));
+    }
+    // ---- per-element column repair ----
+    // The grafted leaf stops being element #t of this block. EVERY per-element-domain stream
+    // shifts by one slot from t onward (existence bitmaps are delta/raw position lists and
+    // value streams are rank-ordered). Leaving them stale makes the device decode bitmap
+    // positions >= nbel (writes past the element vector) and mis-rank every following value:
+    // that was the v6-v9 corruption signature ("..." rows, list regions vanishing, typeahead
+    // resetting inside the grafted subtree). Repair = drop slot t, shift, re-encode.
+    // Edges-domain kinds (0x401/0x403/0x404/0x405/0x406/0x413) and node-domain 0x402 untouched.
+    let old_nbel = u16(stock, bs + 4) as usize;
+    let new_nbel = old_nbel - 1;
+    let t = _ti;
+    #[derive(Clone)]
+    struct Ov {
+        code: u32,
+        param: u32,
+        bytes: Option<Vec<u8>>,
+    }
+    let mut ovs: Vec<Option<Ov>> = vec![None; num_desc];
+    for kd in [0x407u32, 0x408, 0x409, 0x40a, 0x40b, 0x40c, 0x40d, 0x40e, 0x40f, 0x410, 0x411, 0x412, 0x414, 0x415] {
+        let rows_i: Vec<usize> = descs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == kd)
+            .map(|(i, _)| i)
+            .collect();
+        if rows_i.is_empty() {
+            continue;
+        }
+        // the nbel-domain bitmap row of this kind (raw/delta/inverted position list).
+        let bm = rows_i.iter().copied().find(|&i| {
+            matches!(descs[i].code, 0x01 | 0x02 | 0x03) && descs[i].param as usize == old_nbel
+        });
+        let old_bits = match bm {
+            Some(i) => {
+                let d = &descs[i];
+                let bits = bitfield(stock, d.code, bs + d.off as usize, span_end(i), old_nbel);
+                if t >= old_nbel {
+                    return Err("graft: element index beyond nbel".into());
+                }
+                let mut nb = bits[..t].to_vec();
+                nb.extend_from_slice(&bits[t + 1..]);
+                let bb = crate::rebuild::encode_row(&[], &nb, d.code)
+                    .ok_or("graft: bitmap re-encode: unpinned code")?;
+                ovs[i] = Some(Ov { code: d.code, param: new_nbel as u32, bytes: Some(bb) });
+                bits
+            }
+            None => Vec::new(),
+        };
+        let popc_old = old_bits.iter().filter(|&&x| x).count();
+        for &i in &rows_i {
+            let d = &descs[i];
+            if ovs[i].is_some() {
+                continue;
+            }
+            let span0 = span_end(i).saturating_sub(bs + d.off as usize);
+            if matches!(d.code, 0x01 | 0x02 | 0x03) || span0 == 0 {
+                // placeholder (secondary all-clear/set or empty span): domain param only.
+                if d.param as usize == old_nbel {
+                    ovs[i] = Some(Ov { code: d.code, param: new_nbel as u32, bytes: None });
+                }
+                continue;
+            }
+            // real data stream: decode to region exhaustion (the author wrote exactly the values).
+            let vals = decode_u32(stock, d.code, bs + d.off as usize, span_end(i), 64_000_000);
+            if vals.iter().all(|&v| v == 0) && popc_old == 0 {
+                // empty-content numeric (all-clear BinList): keep zero bytes, retarget domain.
+                let p = if d.param as usize == old_nbel { new_nbel as u32 } else { d.param };
+                ovs[i] = Some(Ov { code: d.code, param: p, bytes: None });
+                continue;
+            }
+            if old_bits.is_empty() {
+                return Err(format!("graft: kind {kd:04x} value stream without domain bitmap"));
+            }
+            if d.code != 0x14 && d.code != 0x18 {
+                return Err(format!(
+                    "graft: unsupported per-element value code {:02x} (kind {:04x})",
+                    d.code, kd
+                ));
+            }
+            // values-per-flagged-element: 2 (coordinate pairs) or 1.
+            let v_per = if vals.len() == popc_old * 2 {
+                2
+            } else if vals.len() == popc_old {
+                1
+            } else {
+                return Err(format!(
+                    "graft: kind {kd:04x} value stream length {} inconsistent with popcount {popc_old}",
+                    vals.len()
+                ));
+            };
+            let mut nv = vals.clone();
+            if old_bits[t] {
+                let rank = old_bits[..t].iter().filter(|&&x| x).count();
+                nv.drain(rank * v_per..(rank + 1) * v_per);
+            }
+            let bytes = crate::rebuild::encode_row(&nv, &[], d.code)
+                .ok_or("graft: value re-encode: unpinned code")?;
+            let p = if d.param as usize == old_nbel {
+                new_nbel as u32
+            } else if d.param as usize == vals.len() {
+                nv.len() as u32
+            } else {
+                d.param
+            };
+            ovs[i] = Some(Ov { code: d.code, param: p, bytes: Some(bytes) });
+        }
     }
     // ---- rebuild host block: table unchanged size, streams re-anchored ----
     let data_base = 8 + 12 * num_desc;
@@ -1620,6 +1735,14 @@ pub fn graft_city_probe(
             new_data.extend_from_slice(&bitmap);
         } else if i == vp_row {
             new_data.extend_from_slice(&pairs);
+        } else if let Some(Some(o)) = ovs.get(i).map(|x| x.as_ref()) {
+            match &o.bytes {
+                Some(bb) => new_data.extend_from_slice(bb),
+                None => {
+                    let (a, b2) = old_span(i);
+                    new_data.extend_from_slice(&stock[bs + a..bs + b2]);
+                }
+            }
         } else {
             let (a, b2) = old_span(i);
             new_data.extend_from_slice(&stock[bs + a..bs + b2]);
@@ -1646,14 +1769,23 @@ pub fn graft_city_probe(
             newblock.extend_from_slice(&new_offs[i].to_le_bytes());
             newblock.extend_from_slice(&((old_pairs.len() / 2 + 1) as u32).to_le_bytes());
         } else {
-            newblock.extend_from_slice(&stock[p + 2..p + 4]); // code
-            newblock.extend_from_slice(&new_offs[i].to_le_bytes());
-            newblock.extend_from_slice(&stock[p + 8..p + 12]); // param
+            match ovs[i].as_ref() {
+                Some(o) => {
+                    newblock.extend_from_slice(&(o.code as u16).to_le_bytes());
+                    newblock.extend_from_slice(&new_offs[i].to_le_bytes());
+                    newblock.extend_from_slice(&o.param.to_le_bytes());
+                }
+                None => {
+                    newblock.extend_from_slice(&stock[p + 2..p + 4]); // code
+                    newblock.extend_from_slice(&new_offs[i].to_le_bytes());
+                    newblock.extend_from_slice(&stock[p + 8..p + 12]); // param
+                }
+            }
         }
     }
     newblock.extend_from_slice(&new_data);
     // ---- splice into the file ----
-    let mut out: Vec<u8> = Vec::with_capacity(n + delta as usize);
+    let mut out: Vec<u8> = Vec::with_capacity((n as isize + delta) as usize);
     out.extend_from_slice(&stock[..bs]);
     out.extend_from_slice(&newblock);
     out.extend_from_slice(&stock[be..]);
@@ -1666,9 +1798,8 @@ pub fn graft_city_probe(
     // rebuild sec0 (VLE per-block sizes) with the host size changed; length must stay stable
     let sizes: Vec<u32> = (0..nb)
         .map(|i| {
-            let sz = if i + 1 < nb { boff[i + 1] } else { tail0 } - boff[i]
-                + if i == host { delta as usize } else { 0 };
-            sz as u32
+            let sz = if i + 1 < nb { boff[i + 1] } else { tail0 } - boff[i];
+            ((sz as isize) + if i == host { delta } else { 0 }) as u32
         })
         .collect();
     let mut new_sec0: Vec<u8> = Vec::new();
@@ -2374,10 +2505,42 @@ pub fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8
         a.extend_from_slice(&vle_encode(o));
         a
     });
-    // edge -> child-target array (col 0x406, the device's PSF walk source of truth §11.4b).
-    // In this plain-trie DFS layout edge #e always lands on node e+1.
+    // Col 0x406 (verified device semantics by audit @00cdbe58 usage + stock byte-for-byte match):
+    // per edge in storage (fe) order, the number of terminal elements in the subtree of that
+    // edge's CHILD node. At a link edge stock counts the continuation block's subtree instead.
+    // (An edge-index column here makes the device's interval/page arithmetic read phantom element
+    // ids = empty "..." rows: the historic v6/v7 gazetteer corruption.)
     let edge_count = nc.saturating_sub(1);
-    let targets: Vec<u32> = (1..=edge_count as u32).collect();
+    let mut sub_cnt = vec![0u32; nc];
+    for id in (0..nc).rev() {
+        sub_cnt[id] = if outdeg[id] == 0 {
+            1
+        } else {
+            (cs[id]..cs[id] + outdeg[id] as usize).map(|c| sub_cnt[c]).sum()
+        };
+    }
+    let mut fe = vec![0usize; nc];
+    {
+        let mut ec2 = 0usize;
+        let mut stack = vec![0usize];
+        while let Some(h) = stack.pop() {
+            let out = id_of[h];
+            fe[out] = ec2;
+            ec2 += outdeg[out] as usize;
+            for &(_, child) in nodes[h].child.iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    let mut targets: Vec<u32> = vec![0; edge_count];
+    for id in 0..nc {
+        for j in 0..outdeg[id] as usize {
+            let e = fe[id] + j;
+            if e < edge_count {
+                targets[e] = sub_cnt[cs[id] + j];
+            }
+        }
+    }
     let targets_bytes = simple9_encode(&targets, 28);
     // mandatory BinList (0x415) stream: stock carries elems u32 Simple9 — all-zero words (mode 1).
     let binlist_bytes = simple9_encode(&vec![0u32; elem_count], 28);
@@ -2888,5 +3051,158 @@ mod merge_test {
             our.len(),
             f.len()
         );
+    }
+}
+
+/// Diagnostic: audit what column 0x406 (kind 0x0406) encodes, per block: hypothesis =
+/// number of terminal elements in the subtree of each edge's child node.
+pub fn col406_audit(b_in: &[u8]) {
+    let b = b_in;
+    let n = b.len();
+    let hdr = u32(b, 0x10) as usize;
+    let block_count = u16(b, hdr + 4) as usize;
+    let boff_base = u32(b, hdr + 24 + 5 + 1) as usize;
+    for bi in 0..block_count {
+        let bs = u32(b, boff_base + bi * 4) as usize;
+        if bs + 8 > n {
+            break;
+        }
+        let be = if bi + 1 < block_count {
+            u32(b, boff_base + (bi + 1) * 4) as usize
+        } else {
+            n
+        };
+        let node_count = u16(b, bs) as usize;
+        let num_desc = u16(b, bs + 6) as usize;
+        // (kind, flags, code, off, param)
+        let mut descs: Vec<(usize, usize, u32, usize, usize)> = Vec::new();
+        for r in 0..num_desc {
+            let p = bs + 8 + r * 12;
+            if p + 12 > be {
+                break;
+            }
+            let k = u16(b, p) as usize;
+            descs.push((k & 0xfff, k & 0xf000, u16(b, p + 2) as u32, u32(b, p + 4) as usize, u32(b, p + 8) as usize));
+        }
+        let span = |i: usize| -> usize {
+            if i + 1 < descs.len() {
+                (bs + descs[i + 1].3).max(bs + descs[i].3)
+            } else {
+                be
+            }
+        };
+        let Some(di) = descs.iter().position(|d| d.0 == 0x401 && d.1 == 0) else { continue };
+        let odv: Vec<usize> = {
+            let mut v = decode_u16(b, descs[di].2, bs + descs[di].3, span(di), descs[di].4);
+            v.resize(node_count, 0);
+            v.into_iter().map(|x| x as usize).collect()
+        };
+        let mut cs = vec![0usize; node_count];
+        let mut fe = vec![usize::MAX; node_count];
+        {
+            let mut ec = 0usize;
+            let mut root = 0usize;
+            let mut base = 1usize;
+            while root < node_count {
+                let mut stack = vec![root];
+                let mut visits = 0usize;
+                while let Some(x) = stack.pop() {
+                    fe[x] = ec;
+                    cs[x] = base + ec;
+                    ec += odv[x];
+                    visits += 1;
+                    let c0 = cs[x];
+                    for i in (0..odv[x]).rev() {
+                        if c0 + i < node_count {
+                            stack.push(c0 + i);
+                        }
+                    }
+                }
+                root += visits;
+                base += 1;
+            }
+        }
+        let mut link = vec![false; node_count];
+        if let Some(bi402) = descs.iter().position(|d| d.0 == 0x402 && d.1 == 0x4000) {
+            let bits = bitfield(b, descs[bi402].2, bs + descs[bi402].3, span(bi402), node_count);
+            for (k, v) in bits.into_iter().enumerate() {
+                if k < node_count {
+                    link[k] = v;
+                }
+            }
+        }
+        let Some(c406i) = descs.iter().position(|d| d.0 == 0x406 && d.1 == 0) else {
+            println!("block {bi}: NO col406");
+            continue;
+        };
+        let col: Vec<usize> = decode_u32(b, descs[c406i].2, bs + descs[c406i].3, span(c406i), descs[c406i].4)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        // edges: storage order = per node fe[x]+j, child = cs[x]+j (device ProcessNode/ProcessSubTree semantics)
+        let mut children = vec![Vec::new(); node_count];
+        let mut edge_child: Vec<usize> = vec![usize::MAX; col.len()];
+        for x in 0..node_count {
+            if fe[x] == usize::MAX {
+                continue;
+            }
+            for j in 0..odv[x] {
+                let e = fe[x] + j;
+                let c = cs[x] + j;
+                children[x].push(c);
+                if e < edge_child.len() {
+                    edge_child[e] = c;
+                }
+            }
+        }
+        // sub[n] = elements in subtree (leaf = od==0 && !link)
+        let mut sub = vec![usize::MAX; node_count];
+        {
+            let mut is_child = vec![false; node_count];
+            for c in edge_child.iter() {
+                if *c < node_count {
+                    is_child[*c] = true;
+                }
+            }
+            let mut stack: Vec<(usize, bool)> =
+                (0..node_count).rev().filter(|&x| !is_child[x]).map(|x| (x, false)).collect();
+            while let Some((x, exp)) = stack.pop() {
+                if x >= node_count {
+                    continue;
+                }
+                if sub[x] != usize::MAX {
+                    continue;
+                }
+                if odv[x] == 0 {
+                    sub[x] = if link[x] { 0 } else { 1 };
+                    continue;
+                }
+                if !exp {
+                    stack.push((x, true));
+                    for &c in children[x].iter().rev() {
+                        stack.push((c, false));
+                    }
+                } else {
+                    // children may still be MAX (cycles/shared) -> retry after they resolve
+                    if children[x].iter().all(|&c| c >= node_count || sub[c] != usize::MAX) {
+                        sub[x] = children[x].iter().map(|&c| if c < node_count { sub[c] } else { 0 }).sum();
+                    } else {
+                        stack.push((x, true));
+                    }
+                }
+            }
+        }
+        let mut match_cnt = 0;
+        let mut mism = Vec::new();
+        for (e, &v) in col.iter().enumerate() {
+            let c = edge_child[e];
+            let sv = if c < node_count { sub[c] } else { usize::MAX };
+            if sv == v {
+                match_cnt += 1;
+            } else if mism.len() < 6 {
+                mism.push((e, v, sv));
+            }
+        }
+        println!("block {bi}: nodes={node_count} col406={} match={match_cnt} mismatches(first6)={mism:?}", col.len());
     }
 }

@@ -498,7 +498,11 @@ an LID feature. listID 8/12 = phone numbers/phone-book entries (POI cross-rel vi
 
 ### 11.3 Block = 8-byte header + column-descriptor TOC + compressed columns (CONFIRMED)
 
-Block header `NLAsfBlock` @`00cdf404`: `u16 total, u16 x, u16 y, u16 ndescr` (leaf count = total−x). Then
+Block header `NLAsfBlock::SetDataBlock` @`00cdf404` (convenience wrapper `00cdf51c` builds opts=ALL-1):
+`u16 node_count, u16 forest_roots, u16 nbel, u16 ndescr`
+— **[CONFIRMED 2026-09-24, device-loop proof]** the second u16 is the number of trie-forest ROOTS the
+device's `CalculateTerminatingElementIndex` root-loop actually processes (`blk44: 5907−5885 = 22 = f2`);
+`nbel` = terminating elements. Then
 `ndescr` × `NLPSFListDescriptor` **12 bytes** each (`enSetListDescriptions` `00cdc0c0`):
 `{ u16 tag (tag&0xfff = column kind), u16 code/flags, u32 data_offset, u32 param }`; a column's byte span =
 `offset[i+1] − offset[i]` (last = blockEnd−offset). **Column-kind tags:** ASF `0x401…0x416` (0x401 SimpleList
@@ -531,7 +535,8 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
   return 0 → **abort**. That is exactly why our minimal files die.
 * Kind → slot dispatch (`00cdc0c0`): `0x401` SimpleList<u16> outDegree, `0x402` BlockLink (bitmap+targets),
   `0x403` EdgeLabelList (blob + edge-offsets), `0x404`/`0x405` ValueList<u16> (EDGE domain),
-  `0x406` SimpleList<u32> = **edge→child-target array** (device's PSF walk source of truth),
+  `0x406` SimpleList<u32> = per-edge **claim** (subtree terminating-element count — drives element-id/TEIC
+  numbering, NOT a child-target array — children are contiguous, §12.3),
   `0x407` Position, `0x408` SingleValue<u32>, `0x409` ValueList<u32>, `0x40a/0x40b/0x40c` SingleValue<u32>
   (`0x40c` = belonging-city), `0x40d/0x40f/0x410/0x411/0x412/0x414/0x416` Binary, `0x40e` SingleValue<u32>,
   `0x413` Binary (edge domain), `0x415` BinList.
@@ -545,6 +550,10 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
   `0x40f`[8], `0x410`[9], `0x411`[10], `0x412`[11], `0x414`[12]. A gated column may be absent only if its
   option is off — the option set comes from the search context and we cannot rely on any subset being off
   for all queries ⇒ **emit every column, every time.**
+  **[CONFIRMED 2026-09-24 per-path opts]** `NLProcessor` ctor seeds opts = **ALL-1**; UI paths override via
+  `vSetAsfBlockDecodingOptions`: `bVerifyList` `00c75ca4` → `{0x408,0x409}` on; `vCollectNamesOfCat`
+  `00bf7138` → `{0x40c,0x40b}` on; every single kind is therefore live somewhere (a zeroed `SingleValue`
+  member FAILs its `code 0x00` bitfield; zeroed `Binary` members are safe — `count==0 → 1`).
 * Every stock block (both LID20001 city and LID20006 street, all 45/98 blocks) uses the SAME 36-row
   descriptor table in the SAME order. Stock street template (our target shape), row order + codecs:
 
@@ -582,8 +591,14 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
 | 34 | `0x0412` | 0x01 | elems | raw bitmap — REAL in street |
 | 35 | `0x040d` | 0x03 | elems | sparse-clear, empty span (runs to block end) |
 
-Semantics still unknown for street-real columns `0x40f`/`0x410`/`0x412` (elems-sized bitmaps) and the
-`0x415` BinList stream (elems u32, Simple9, ~7:1). For the FIRST device test these are emitted
+Semantics resolved 2026-09-24 (`enGetAllElementProperties` `00cecbdc` accessor bodies): **`0x40d` =
+`bIsEntryValidDestination`** (a FALSE bit = element treated as not-a-destination by list browsing;
+stock city blocks carry it code `0x03` all-set with sparse clear-deltas — 3854/3951 in blk44), `0x40f` =
+`bHasEntryCrossing`, `0x410` = `bHasEntryHouseNumber`, `0x411` = `bHasEntryTileLinks` (all-set for stock
+cities), `0x412` = point-addresses/detailed-description flags, `0x414` = `bHasEntryCells`, and **`0x415`
+BinList values are a HARD GATE**: `enGetEntryCharacterStatus` `00cdcebc` returns `4` when the values
+member is empty → the element is dropped from every properties/list query (invisible city). For the FIRST
+device test these are emitted
 all-clear / all-zero (valid code+span); refine from stock data if a functional gap shows up.
 Empty-column legal patterns (all seen in stock): existence rows `kind|0x4000, code 0x02, param=count,
 span=0`; value rows `kind, code 0x11, param=0, span=0`. Rows may tie (same off) — span follows row order.
@@ -596,16 +611,18 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
 * Sub-header (right after the 0x77 outer header): `u32 element_count`, **six u16 section counts**
   `A B C D E F` (A = block count, F = `8` constant), `u32` origin X, `u32` origin Y, then
   **7 section entries `{u8 code, u32 abs_off}`**.
-* Seven vectors MUST decode from their spans (`off[i+1]−off[i]`, last = `hdr+extra−off[6]`) with
-  **EXACT consumption** (cursor check after every stream; the last sec6 is exempt):
-  `sec0/1` u32 count A (`sec0` = block BYTE SIZES VLE, `sec1` = ABSOLUTE block offsets raw — the old
-  "flags u32 at +0x0c" was really counts `E|F<<16`), `sec2/3` u32 count B, `sec4` u16 count C,
+* Seven vectors MUST decode from their spans (`off[i+1]−off[i]`, last runs to `hdr+size`) with
+  **EXACT consumption** (cursor check after every stream):
+  `sec0/1` u32 count A (`sec1` = ABSOLUTE block offsets raw; **`sec0` is NOT block sizes** — see §12.1
+  for the corrected per-stream semantics **[CORRECTED 2026-09-24]**), `sec2/3` u32 count B, `sec4` u16 count C,
   `sec5` u16 count D, `sec6` u16 count E. Any absent section entry (code 0, garbage span) → return 0
   → NL init all-or-nothing (that is why our files died even with correct blocks).
-* Stock content (POL): street `20006` → `B=0 C=0 D=1 sec5=[3]` (= its REL list id) `E=1 sec6=[39]`
-  (= the card POL language id); city `20001` → `B=180` (=4·blocks link-pair mirror: sec2 VLE
-  target-block, sec3 raw target-node), `C=4 sec4=[0,1,3,6]`, `D=3 sec5=[2,60,61]`, `E=29` = Simple9
-  list of every language id the file carries; gazetteer `20000` → `B=C=D=E=0`.
+* Stock content (POL): street `20006` → `B=0 C=0 D=1 sec5=[3]` `E=1 sec6=[39]`; city `20001` →
+  `B=180` (= 180×35-byte **index records** at file end: sec2 = record length (35 each), sec3 = their file
+  offsets — NOT a link-pair mirror **[CORRECTED 2026-09-24]**, lazy-loaded outside LoadHeader),
+  `C=4 sec4=[...]` (equivalence table), `D=3 sec5=[2,60,61]` = **file categories** (drives
+  `u32GetCurrentCategory` and the `vCollectNamesOfCat{2,0x3c}` filter), `E=29 sec6` = **language ids** the
+  file carries; gazetteer `20000` → `B=C=D=E=0`.
 * `osm2lid` now emits the stock street shape (verified by a `LoadHeader` byte-simulator: stock files
   and our new files PASS, the pre-fix files REJECT at `code 0x00` sections).
 
@@ -633,8 +650,10 @@ City-id mapping (`--auto-city`, deterministic, no fuzzy): `fold(name)` (upper + 
 Z0-9-. ]`) equality against stock `LID20001` element names with the author's `"NN NNN "` postal
 prefix stripped. Names the stock list lacks (tiny hamlets) fall back to the nearest mapped city
 within `--city-radius` PAU. Two open correctness limits:
-* appending NEW city elements is blocked - `LID20001` carries author-only sec2/3/4 sections
-  (§11.4c: link-pair mirror + extra REL list ids `[2,60,61]`) that `merge_name_list` cannot synthesize;
+* appending NEW city elements is blocked **for `merge_name_list` only** — it cannot synthesize
+  `LID20001`'s author-only sec2/3/4 sections. **[OBSOLETE as a general limit, 2026-09-25]** the
+  from-scratch generator (§11.4f) emits those sections natively, so a full from-scratch city file is
+  the chosen path instead of merge;
 * same-named villages are indistinguishable by name alone (stock has ~30 plain `PIASKI` elements,
   one per village; postal prefixes only separate the prefixed variants). The stock city LIST
   positions (`x_pau`/`y_pau`) are a per-file private encoding (non-geographic unit mix, not the
@@ -661,6 +680,28 @@ ASCII-folded UPPERCASE type-in key (`POLNEJ ROZY`), `0x09`, then the display lin
 lowercase bytes in their keys, which is why only ours were un-findable. `osm2lid` writes
 `fold(display)\tdisplay` for list-3 entries and orders entries by that key (DFS/element order must
 equal encoded-label byte order, the `write_name_list_idx` alignment invariant).
+
+### 11.4f From-scratch generation: minimal file + full-file device simulator (**[NEW 2026-09-24]**)
+
+End-game tooling (whole-set replacement instead of grafting): generate `LID*.DAT` from nothing, one
+city at a time.
+
+* `src/lid_format/examples/gen_min_city.rs` — writes a COMPLETE valid file with ONE city ("TEST"):
+  stock-copied metadata (region [0..119), sec4/5/6 tables, both file-spec constants), own sub-header
+  (`elem=1 nb=1 nrec=0`), 7 streams with exact-cursor layout, one block of 5 nodes / chain T→E→S→T with
+  the full 36-row §11.4b template. Key derived fields: label offsets are **per-edge starts** (label =
+  `[off[e], off[e+1])`, last ends at blob length); header `+2 = node_count − ΣoutDegree` (forest roots);
+  `0x40d c03` all-set (valid destinations); `0x415` Simple9 `tag9` value-word per element (never empty);
+  `0x406` claims all 1; `nbel` = leaves; TEIC then matches exactly (`terms == nbel`).
+* `diag/LID/devsim.py` `analyze_file()` — byte-level `LoadHeader` replica (all 7 streams + cursor
+  landing) + per-block `SetDataBlock`/`Decode` walk with **every kind decoded under ALL opts** (superset
+  of every UI path) + device-caller `CalculateTerminatingElementIndex` simulation (root loop advancing
+  by subtree-EDGE-COUNT+1; stock itself drifts +0..+9 over `nbel` — tolerated, generator file is exact)
+  + the §11.4b/§11.4f gates (0x415 non-empty = FAIL, 0x40d all-false = WARN, `f2` vs computed roots).
+  Validates STOCK 45/45 and the generated file 1/1.
+* Card test status: `zzmin1.DAT` (raw md5 `3beb222d8664eb4b8535ea095b097104`, 688 B) → flash as
+  `LID20001.DAT`; expected: city list shows "TEST" (streets NOT required — `LID20006` is opened only
+  after selection; `0x411=0` merely means "no tile data", it does not hide a city).
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
@@ -1016,11 +1057,28 @@ The `LID2nnnn.DAT` files are read by `NLProcessor` (`bGoToElemet` `00cef…`, `e
   ids = DFS-preorder numbering, §12.3) plus per-element columns. The block decodes into (all CONFIRMED from
   accessor bodies unless marked):
 
-**12.1 Container** (`NLNameList::LoadHeader` `00e0e63c`) — as §11.2. Sub-header `@hdrSize`:
-`u32 element_count`, `6×u16` (vec sizes; `[0]`=block count), `2×u32`, then `7×{u8 section_code, u32 file_off}`.
-Section table gives a **block table**: section w/ `code=0x11` = raw `u32` block **file offsets** (monotonic,
-cover the file); section `code=0x14` = **decoded byte-sizes** per block (VLE). Verified `POL/LID20006`:
-98 blocks, block0 @ `0x362`, Σ decoded-sizes ≈ `element_count` × ~102 B.
+**12.1 Container** (`NLNameList::LoadHeader` `00e0e63c`) — **[field-by-field CONFIRMED 2026-09-24]**.
+File layout: `[0..119)` region-1 (magic `u16=0x0402`, **`u16 listID`** (+2; =2 drives the city-list
+category filter in `vCollectNamesOfCat` → `vSetCatFilter{2,0x3c}`), two more u16, two u32, header-off
+@+16, header-size @+20; five string-offset u16 + `(13,2)` pair @+24; metadata strings blob [38..119):
+Bosch copyright, build date, **`TPLID_EQUIVALENT_CHAR`** (named equivalence-table section id)). Sub-header
+`@119`: `u32 element_count`, `6×u16` counts `[nb, nrec, c4, c5, c6, 8]`, `2×u32` file-spec constants
+(passed to the block-read vtable as h1/h2, **not content-verified** — v11 changed block bytes under
+unchanged constants and the card loaded fine), then `7×{u8 code, u32 file_off}`. Streams (counts from the
+sub-header, EXACT cursor landing per stream; the last sec6 ends at `hdr+size`):
+`sec0` `0x14` u32×nb — **advisory length hints, NOT block sizes** (stock POL20001: ~1400/block vs real
+spans ~174 kB; the reader mmaps and SetDataBlock reads past the hint — v11 shipped full spans here and
+worked; `devsim.py` warns only if hint > span);
+`sec1` `0x11` u32×nb block file offsets;
+`sec2` `0x14` u32×nrec + `sec3` `0x11` u32×nrec = **record offset table** (POL20001: 180 records;
+sec2 = record LENGTH (all `35`), sec3 = absolute file offsets of 180×35-byte index records living at the
+file end — NOT loaded by LoadHeader, fetched lazily by other paths; `nrec=0` + empty streams is legal at
+load time);
+`sec4` `0x14` u16×c4; `sec5` `0x14` u16×c5 = **file CATEGORIES** (POL20001 `{2,61,58}`; feeds
+`u32GetCurrentCategory` set `NLProcessor+0x13c` and `corfoGetAllCategories`);
+`sec6` `0x18` u16×c6 = **file LANGUAGES** (POL20001: 29 ids; feeds `NLProcessor+0x14c`, vCollectNames
+lang branch). `NLProcessor::bInitialise` = LoadHeader → `enAddNewAsfBlock(0)` → `bAddNewInputStep(0,0,node0)`
+→ seed cat/lang sets.
 
 **12.2 Block** (`NLAsfBlock::SetDataBlock` `00cdf404`) — 8-byte header `4×u16`: `[0]=node_count`,
 `[1]=f2 = tree (forest root) count`, `[2]=element_count`, `[3]=num_desc`. Then `num_desc ×
@@ -1049,8 +1107,12 @@ descriptor per sub-stream. CONFIRMED mapping in the `SetDescription` bodies (`00
   `uVar2 += ret + 1`). **The element index = rank in that DFS order**; the element's NAME is the label string
   accumulated **along the walk stack** (this is the `NLProcessor` deque string `+0x12c` that
   `NLInputStep::bSetSelectedEdge` `00cf69d0` appends to on descent and trims on ascent) — NOT a value stored
-  per node id. `+0x8c[element] = leaf node`; `enGetTerminatingElementIndex` binary-finds the node in `+0x8c`.
-  All per-element columns (position/belonging/flags) are indexed by the element rank.
+   per node id. `+0x8c[element] = leaf node`; `enGetTerminatingElementIndex` binary-finds the node in `+0x8c`.
+   All per-element columns (position/belonging/flags) are indexed by the element rank.
+   **[CONFIRMED 2026-09-24, device-loop sim]** the return value is the subtree's TOTAL EDGE count
+   (shared DAWG regions counted per visit), the root loop therefore skips shared spans and iterates
+   exactly `f2` times (`blk44: 22`); the count it accumulates may exceed `nbel` by 0..+9 on stock
+   (TEIC vector is oversized, device tolerates) — a generated file must land EXACT (`terms == nbel`).
 
 **12.4 Edge labels / names** (`NLEdgeLabelList::Decode` `00cdf2f0`, column **`0x403`**) — two sub-streams:
 - The **raw** sub-stream (code `0x11`, at object `+0x30`) = a **name blob** of `param` bytes; the **other**
@@ -1262,7 +1324,11 @@ any end-to-end `LID40006`/`PA_20006` read cannot be run here — **first card te
    city list yields an EMPTY device city index (§10.4 language/position-column gate) → city mode B
    (`osm2lid --stock-city-map TSV`: stock city files stay on the card, REL pairs streets to stock
    city element ids); fully consumable city file = mode C (36-descriptor column writer), pending.
-   **Nothing is on-device-validated yet — first card test pending.**
+   **Update 2026-09-25:** mode C + from-scratch path shipped (§11.4f); the empty-city poison is now
+   fully explained (missing gated columns + `0x415` char-status gate + file-header stream layout,
+   §§11.4b/11.4c/12.1). Graft rounds v8–v11 card-validated block-level loading (Z-prefix search OK on
+   v11); remaining v11 symptom (element truncation past first list hit) is why the graft path was
+   dropped for from-scratch generation. First card test of the generated file pending.
      **Still pending:** own META writer and on-device acceptance
      (`NLHnrToTree` against a real card). The crossing family (+10000) is **DECODED** (2026-09, golden
      DEU `LID30006`+`LID20006`; scratch decoder `src/lid_format/tests/crossing_re.rs`, `#[ignore]`).
