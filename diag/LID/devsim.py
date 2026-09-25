@@ -374,7 +374,19 @@ def analyze_file(path, tag):
             decode_block(b,bs,be); ok+=1
         except Fail as e:
             print(f"{tag} block{bi}: *** LOAD FAIL: {e}")
-    print(f"{tag}: header OK (elem={elem} nb={nb} nrec={nrec} langs={c5} cats={c6}); {ok}/{nb} blocks decode OK")
+    # relation records (sec2/sec3): header field hdroff+8 = relations this list participates in;
+    # stock invariant nrec == nb * nrel (35-byte record per (block,relation)). A file promising
+    # nrel>0 relations with nrec==0 was the top suspect for the 2026-09-25 10-city card reset.
+    nrel=struct.unpack_from('<H',b,hdroff+8)[0]
+    if nrel>0 and nrec==0:
+        print(f"{tag} *** GATE FAIL: nrel={nrel} but nrec=0 (unfulfilled relation promise)")
+    if nrec>0 and nrel>0:
+        if nrec!=nb*nrel: print(f"{tag} *** GATE FAIL: nrec={nrec} != nb*nrel={nb*nrel}")
+        roffs=[struct.unpack_from('<I',b,secs[3][1]+4*i)[0] for i in range(nrec)]
+        for i,ro in enumerate(roffs):
+            if ro+35>len(b): raise Fail(f"{tag} record{i} out of file")
+            if struct.unpack_from('<I',b,ro)[0]!=35: raise Fail(f"{tag} record{i} size != 35")
+    print(f"{tag}: header OK (elem={elem} nb={nb} nrec={nrec} nrel={nrel} langs={c5} cats={c6}); {ok}/{nb} blocks decode OK")
 
 def analyze(path, bis, tag):
     b=open(path,'rb').read()

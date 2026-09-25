@@ -538,7 +538,11 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
   `0x406` SimpleList<u32> = per-edge **claim** (subtree terminating-element count — drives element-id/TEIC
   numbering, NOT a child-target array — children are contiguous, §12.3),
   `0x407` Position, `0x408` SingleValue<u32>, `0x409` ValueList<u32>, `0x40a/0x40b/0x40c` SingleValue<u32>
-  (`0x40c` = belonging-city), `0x40d/0x40f/0x410/0x411/0x412/0x414/0x416` Binary, `0x40e` SingleValue<u32>,
+  (**[CORRECTED 2026-09-25 by getter decompiles]** `0x408` = ALTERNATIVE-name flag/main-index
+  (`bIsEntryAlternativeName` `00cdb9a0` + getter `00cdbb78` read `+0x238`), `0x40b` = EXONYM index
+  (`00cdbad8` → `+0x2f4`), `0x40c` = PERMUTATION index (`00cdbb28` → `+0x2c0`), `0x40a` = BELONGING index
+  (`00cdba88` → `+0x328`); earlier "0x40c = belonging" was wrong), `0x40d/0x40f/0x410/0x411/0x412/0x414/0x416` Binary,
+  `0x40e` SingleValue<u32>,
   `0x413` Binary (edge domain), `0x415` BinList.
 * **Tree pass (`00cdf360`, ALL FOUR always decoded, ungated):** `0x403` EdgeLabel, `0x402` BlockLink,
   `0x406` child targets, `0x401` outDegree. `0x406` MUST carry the real per-edge target array (stock
@@ -581,7 +585,7 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
 | 19–21 | `0x4409`/`0x8409`/`0x0409` | 0x02/11/11 | elems/0/0 | triple, all-empty |
 | 22–23 | `0x440a`/`0x040a` | 0x02/0x11 | elems/0 | pair empty |
 | 24–25 | `0x440b`/`0x040b` | 0x02/0x11 | elems/0 | pair empty (city: 0x040b carries 4 718 values) |
-| 26–27 | `0x440c`/`0x040c` | 0x01/0x14 | elems/K | belonging-city bitmap + values (street real, city empty) |
+| 26–27 | `0x440c`/`0x040c` | 0x01/0x14 | elems/K | permutation-name bitmap + values (street real, city: 59 vals) |
 | 28 | `0x8415` | **0x18** | elems | BinList stream — REAL in street (8 682 vals in 1 244 B) |
 | 29 | `0x0415` | 0x01 | 0 | (values stream empty) |
 | 30 | `0x040f` | 0x01 | elems | raw bitmap — REAL in street (1 086 B = ⌈elems/8⌉) |
@@ -715,6 +719,16 @@ city at a time.
   param-2000/VLE 6000 B in blk44, `0x40b` 39 vals, `0x40c` 59 vals, `0x414` bitmap 494 B); the
   all-cities/first-letter UI presumably consumes them (or the `nrec` sections — see §12.1 records).
   [OPEN - active debug; matches the historical "append new city never worked" symptom, §11.4d.] WARNING for writers: VLE is NOT LEB128 (§11.4 table).
+  **Follow-up 2026-09-25 (same day):** the header field @sub+8 is **nrel** (=4 for the city list) and the
+  generator had copied stock `nrel=4` while emitting `nrec=0` — an inconsistency stock never has
+  (nrec = nb×nrel exactly). The 35-B records decode to per-(block,relation) REL descriptors (§12.1) whose
+  partner counts reproduce the stock REL-file endpoints, and the graft failure pattern (append city ⇒ list
+  truncated past the first new-name prefix) is consistent with un-updated record/partner bookkeeping.
+  Variant-B generator now emits 4 stock-shaped records per block + fixes the 0x408/0x40a/0x40b/0x40c column
+  semantics doc (all variant getters are `empty()`-guarded, so empty columns alone can't be the poison).
+  New files (records, nrec=4): `zzcity10.DAT` 1167 B raw md5 `a99eedfd8fc5f1868dcf11e398fd0afc`,
+  compressed `zzcity10C.DAT` md5 `2f6b0c1d75b249ec60171836921c4171`; `zzmin1.DAT` 848 B md5
+  `07c673078239e9ddef6a9eb8d7014542`, compressed `187ecdfdd531ba6e12d7d20ebb55124c`. **Card test pending.**
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
@@ -1092,10 +1106,18 @@ sub-header, EXACT cursor landing per stream; the last sec6 ends at `hdr+size`):
 spans ~174 kB; the reader mmaps and SetDataBlock reads past the hint — v11 shipped full spans here and
 worked; `devsim.py` warns only if hint > span);
 `sec1` `0x11` u32×nb block file offsets;
-`sec2` `0x14` u32×nrec + `sec3` `0x11` u32×nrec = **record offset table** (POL20001: 180 records;
-sec2 = record LENGTH (all `35`), sec3 = absolute file offsets of 180×35-byte index records living at the
-file end — NOT loaded by LoadHeader, fetched lazily by other paths; `nrec=0` + empty streams is legal at
-load time);
+`sec2` `0x14` u32×nrec + `sec3` `0x11` u32×nrec = **RELATION-RECORD table** (POL20001: nrec=180 = nb×nrel
+where sub-header count `c4`@+8 = **nrel** = relations the list participates in; sec2 = record LENGTH (all
+`35`), sec3 = absolute file offsets; each 35-B record = `[u32 35][u32 partner file element count]
+[u32 this-block edge count][u32 35 ×3][u32 0 ×2][u8 tail 02 11 11]`, 4 consecutive records per block.
+City-list partners (blk44 records, f1): `{241269, 974871, 714, 38}` = the 4 REL files touching listID 2 —
+REL00000(2↔2 self), REL00001(3↔2 streets), REL00003(10↔2), REL00006(9↔2), matching their §11.7 `d2/d3`
+partner counts exactly. In DAPIAPP the record vector is consumed only by `NLCellIdAttrVector::enGetCells`
+`00e085ac` (GenAttr cells); the name-list records presumably drive the REL matrix block indexing (PROCNAV
+side unproven). `nrec=0` + empty streams is legal at LoadHeader time, but shipping `nrel>0, nrec=0` was
+the top suspect for the 2026-09-25 10-city RESET — `devsim.py` now FAILs on `nrel>0 && nrec==0` and on
+`nrec != nb×nrel`; `city.rs` synthesizes stock-shaped records natively (partner counts + tail verbatim
+from stock block-0 records, edge count = own block Σod).);
 `sec4` `0x14` u16×c4; `sec5` `0x14` u16×c5 = **file CATEGORIES** (POL20001 `{2,61,58}`; feeds
 `u32GetCurrentCategory` set `NLProcessor+0x13c` and `corfoGetAllCategories`);
 `sec6` `0x18` u16×c6 = **file LANGUAGES** (POL20001: 29 ids; feeds `NLProcessor+0x14c`, vCollectNames
@@ -1191,7 +1213,8 @@ coordinate fields are honored, and `LID20000` (gazetteer) is the "no coordinates
 
 **12.6 Hierarchy (city↔street) + element properties** — CONFIRMED accessors, indexed by `element_index`:
 - **belonging name** = parent/city element: `enGetEntryBelongingNameMainElementIndex` `00cdba88` →
-  `NLSingleValueAttrVector<u32>` @`+0x328` (column **`0x40c`**: `flags0`=bitmap "has-belonging",
+  `NLSingleValueAttrVector<u32>` @`+0x328` (column **`0x40a`** — CORRECTED 2026-09-25 from the earlier
+  `0x40c` claim; `flags0`=bitmap "has-belonging",
   `flags0x4000`=values). The value is a **block-local terminating-element id** (the device indexes all
   element columns by the per-block index from `CalculateTerminatingElementIndex`). Stock `POL/LID20000/4/6`
   set the column on **zero** elements (probe `osm2lid/tests/belonging_probe.rs`) — the city grouping lives in

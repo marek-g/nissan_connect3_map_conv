@@ -291,7 +291,7 @@ pub fn build_city_file(cities: &[CityEntry], stock: &[u8]) -> Vec<u8> {
     build_city_container(cities.len() as u32, &[block], stock, hdr)
 }
 
-// two-pass container: region1 + sub-header + section table + streams + blocks
+// two-pass container: region1 + sub-header + section table + streams + blocks + record blob
 fn build_city_container(
     elem_count: u32,
     blocks: &[Vec<u8>],
@@ -304,13 +304,59 @@ fn build_city_container(
     let sec6 = stock[1400..1428].to_vec();
     let sec0: Vec<u8> = blocks.iter().flat_map(|b| vle_encode(b.len() as u32)).collect();
     let sec1_len = 4 * nb;
+
+    // relation records (sec2/sec3): the stock name-list header promises nrel relations; each
+    // block carries one 35-byte record per relation: [u32 size][u32 partner elem count]
+    // [u32 block edge count][u32 35 x3][u32 0 x2][3-byte tail]. Stock device code iterates
+    // nrel per block; a header promising relations with zero records was the top suspect for
+    // the 2026-09-25 10-city card reset. Partner counts + tail are lifted from the stock
+    // file's own block-0 records so the list stays consistent with the stock REL*.DAT files.
+    let nrec_stock = u16::from_le_bytes(stock[hdr + 6..hdr + 8].try_into().unwrap()) as usize;
+    let nrel = u16::from_le_bytes(stock[hdr + 8..hdr + 10].try_into().unwrap()) as usize;
+    assert_eq!(nrec_stock, 45 * nrel, "unexpected stock record count");
+    let sec3_off = u32::from_le_bytes(stock[hdr + 24 + 3 * 5 + 1..hdr + 24 + 3 * 5 + 5].try_into().unwrap()) as usize;
+    let rec0 = u32::from_le_bytes(stock[sec3_off..sec3_off + 4].try_into().unwrap()) as usize;
+    let rec_stride = u32::from_le_bytes(stock[sec3_off + 4..sec3_off + 8].try_into().unwrap()) as usize - rec0;
+    assert_eq!(rec_stride, 35, "unexpected stock record size");
+    let mut partners = Vec::with_capacity(nrel);
+    for r in 0..nrel {
+        let f1 = u32::from_le_bytes(
+            stock[rec0 + r * rec_stride + 4..rec0 + r * rec_stride + 8]
+                .try_into()
+                .unwrap(),
+        );
+        partners.push(f1);
+    }
+    let rec_tail = stock[rec0 + 32..rec0 + 35].to_vec();
+    let nrec = nrel * nb;
+    let mut sec2: Vec<u8> = Vec::new();
+    let mut rec_blob: Vec<u8> = Vec::new();
+    for b in blocks.iter() {
+        let nc = u16::from_le_bytes(b[0..2].try_into().unwrap()) as usize;
+        let roots = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
+        let sum_od = (nc - roots) as u32;
+        for &p in partners.iter() {
+            sec2.extend_from_slice(&vle_encode(35));
+            rec_blob.extend_from_slice(&u32b(35));
+            rec_blob.extend_from_slice(&u32b(p));
+            rec_blob.extend_from_slice(&u32b(sum_od));
+            rec_blob.extend_from_slice(&u32b(35));
+            rec_blob.extend_from_slice(&u32b(35));
+            rec_blob.extend_from_slice(&u32b(35));
+            rec_blob.extend_from_slice(&u32b(0));
+            rec_blob.extend_from_slice(&u32b(0));
+            rec_blob.extend_from_slice(&rec_tail);
+        }
+    }
+    let sec3_len = 4 * nrec;
+
     let tbl_at = hdr + 24;
     let base = tbl_at + 35;
     let layout = [
         sec0.len(),
         sec1_len,
-        0,
-        0,
+        sec2.len(),
+        sec3_len,
         sec4.len(),
         sec5.len(),
         sec6.len(),
@@ -323,8 +369,10 @@ fn build_city_container(
     }).collect();
     let streams_end = o;
     let block_abs = streams_end;
+    let blob_abs = block_abs + blocks.iter().map(|b| b.len()).sum::<usize>();
 
-    let mut s: Vec<u8> = Vec::with_capacity(streams_end + blocks.iter().map(|b| b.len()).sum::<usize>());
+    let mut s: Vec<u8> =
+        Vec::with_capacity(blob_abs + rec_blob.len());
     s.extend_from_slice(&u16b(0x0402));
     s.extend_from_slice(&u16b(2)); // listID = 2 (city list; drives the UI category filter)
     s.extend_from_slice(&u16b(0));
@@ -344,7 +392,7 @@ fn build_city_container(
     assert_eq!(s.len(), hdr);
     s.extend_from_slice(&u32b(elem_count));
     s.extend_from_slice(&u16b(nb as u16));
-    s.extend_from_slice(&u16b(0)); // nrec
+    s.extend_from_slice(&u16b(nrec as u16)); // nrec: one record per (block, relation)
     s.extend_from_slice(&u16b(4));
     s.extend_from_slice(&u16b(3));
     s.extend_from_slice(&u16b(29));
@@ -359,6 +407,12 @@ fn build_city_container(
     assert_eq!(s.len(), base);
     s.resize(streams_end, 0);
     s[offs_sec[0]..][..sec0.len()].copy_from_slice(&sec0);
+    s[offs_sec[2]..][..sec2.len()].copy_from_slice(&sec2);
+    let mut roff = blob_abs;
+    for i in 0..nrec {
+        s[offs_sec[3] + 4 * i..offs_sec[3] + 4 * i + 4].copy_from_slice(&u32b(roff as u32));
+        roff += 35;
+    }
     let mut boff = block_abs;
     for (i, blk) in blocks.iter().enumerate() {
         s[offs_sec[1] + 4 * i..offs_sec[1] + 4 * i + 4].copy_from_slice(&u32b(boff as u32));
@@ -370,6 +424,8 @@ fn build_city_container(
     for blk in blocks.iter() {
         s.extend_from_slice(blk);
     }
+    s.extend_from_slice(&rec_blob);
+    assert_eq!(s.len(), blob_abs + rec_blob.len());
     s[20..24].copy_from_slice(&u32b((streams_end - hdr) as u32));
     s
 }
