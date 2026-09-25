@@ -55,7 +55,7 @@ fn u32b(v: u32) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 
-// The 36-row stock descriptor template (row order + codecs byte-identical to stock block45).
+// The 36-row stock descriptor template + one safety row (see dummy note in `template`).
 // (kind, code, param, payload); stream offsets are computed at emit time (row order spans).
 fn template(
     nc: u32,
@@ -105,10 +105,17 @@ fn template(
         (0x0414, 0x02, nbel, vec![]),
         (0x0412, 0x02, nbel, vec![]),
         (0x040d, 0x03, nbel, vec![]), // valid-destination all-set
+        // Dummy 37th row: the LAST TOC row's window = u32 read past the TOC (device reads it as
+        // start[last] + window from file bytes past the block buffer = heap). With count 0 the
+        // decode loop never runs, making the garbage window harmless, and 0x40d above gets
+        // window = start(dummy) - start(0x40d) = 0 -> code 3 decodes to all-TRUE without any
+        // stream read. (Stock puts 0x40d last and eats a heap read: 8 random clears per 5000,
+        // invisible at scale, fatal for a 10-city list - card-verified empty list 2026-09-25.)
+        (0x0416, 0x02, 0, vec![]),
     ]
 }
 
-/// Build ONE city-list block (trie + 36-row template). Positions are deltas vs `origin`.
+/// Build ONE city-list block (trie + 37-row template). Positions are deltas vs `origin`.
 /// Returns (block bytes, nbel). Requires: uppercase names, none a prefix of another.
 pub fn build_city_block(cities: &[CityEntry], origin: (i32, i32)) -> (Vec<u8>, usize) {
     assert!(!cities.is_empty(), "city list must be non-empty");
@@ -249,8 +256,12 @@ pub fn build_city_block(cities: &[CityEntry], origin: (i32, i32)) -> (Vec<u8>, u
     // Stock POL city file uses shift=8, so stored = round((abs - origin) / 2^shift).
     let mut pos_bytes = Vec::new();
     for c in sorted.iter() {
-        pos_bytes.extend_from_slice(&vle_encode(qdelta(c.lon_pau as i64 - origin.0 as i64) as u32));
-        pos_bytes.extend_from_slice(&vle_encode(qdelta(c.lat_pau as i64 - origin.1 as i64) as u32));
+        pos_bytes.extend_from_slice(&vle_encode(
+            qdelta(c.lon_pau as i64 - origin.0 as i64) as u32
+        ));
+        pos_bytes.extend_from_slice(&vle_encode(
+            qdelta(c.lat_pau as i64 - origin.1 as i64) as u32
+        ));
     }
     let od_bytes: Vec<u8> = od.iter().flat_map(|&d| vle_encode(d)).collect();
     let claim_bytes: Vec<u8> = claims.iter().flat_map(|&c| vle_encode(c)).collect();
@@ -398,7 +409,12 @@ pub fn build_city_relations(
         }
         best.0 as u32
     };
-    let abs = |e: &crate::Element| (ox as i64 + ((e.x_pau as i64) << sh), oy as i64 + ((e.y_pau as i64) << sh));
+    let abs = |e: &crate::Element| {
+        (
+            ox as i64 + ((e.x_pau as i64) << sh),
+            oy as i64 + ((e.y_pau as i64) << sh),
+        )
+    };
     let mapped: Vec<Option<usize>> = nl
         .elements
         .iter()
@@ -465,17 +481,15 @@ pub fn build_city_relations(
 }
 
 // two-pass container: region1 + sub-header + section table + streams + blocks + record blob
-fn build_city_container(
-    elem_count: u32,
-    blocks: &[Vec<u8>],
-    stock: &[u8],
-    hdr: usize,
-) -> Vec<u8> {
+fn build_city_container(elem_count: u32, blocks: &[Vec<u8>], stock: &[u8], hdr: usize) -> Vec<u8> {
     let nb = blocks.len();
     let sec4 = stock[1393..1397].to_vec();
     let sec5 = stock[1397..1400].to_vec();
     let sec6 = stock[1400..1428].to_vec();
-    let sec0: Vec<u8> = blocks.iter().flat_map(|b| vle_encode(b.len() as u32)).collect();
+    let sec0: Vec<u8> = blocks
+        .iter()
+        .flat_map(|b| vle_encode(b.len() as u32))
+        .collect();
     let sec1_len = 4 * nb;
 
     // relation records (sec2/sec3): the stock name-list header promises nrel relations; each
@@ -487,9 +501,14 @@ fn build_city_container(
     let nrec_stock = u16::from_le_bytes(stock[hdr + 6..hdr + 8].try_into().unwrap()) as usize;
     let nrel = u16::from_le_bytes(stock[hdr + 8..hdr + 10].try_into().unwrap()) as usize;
     assert_eq!(nrec_stock, 45 * nrel, "unexpected stock record count");
-    let sec3_off = u32::from_le_bytes(stock[hdr + 24 + 3 * 5 + 1..hdr + 24 + 3 * 5 + 5].try_into().unwrap()) as usize;
+    let sec3_off = u32::from_le_bytes(
+        stock[hdr + 24 + 3 * 5 + 1..hdr + 24 + 3 * 5 + 5]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let rec0 = u32::from_le_bytes(stock[sec3_off..sec3_off + 4].try_into().unwrap()) as usize;
-    let rec_stride = u32::from_le_bytes(stock[sec3_off + 4..sec3_off + 8].try_into().unwrap()) as usize - rec0;
+    let rec_stride =
+        u32::from_le_bytes(stock[sec3_off + 4..sec3_off + 8].try_into().unwrap()) as usize - rec0;
     assert_eq!(rec_stride, 35, "unexpected stock record size");
     let mut partners = Vec::with_capacity(nrel);
     let stock_elems = u32::from_le_bytes(stock[hdr..hdr + 4].try_into().unwrap());
@@ -537,17 +556,19 @@ fn build_city_container(
         sec6.len(),
     ];
     let mut o = base;
-    let offs_sec: Vec<usize> = layout.iter().map(|l| {
-        let c = o;
-        o += l;
-        c
-    }).collect();
+    let offs_sec: Vec<usize> = layout
+        .iter()
+        .map(|l| {
+            let c = o;
+            o += l;
+            c
+        })
+        .collect();
     let streams_end = o;
     let block_abs = streams_end;
     let blob_abs = block_abs + blocks.iter().map(|b| b.len()).sum::<usize>();
 
-    let mut s: Vec<u8> =
-        Vec::with_capacity(blob_abs + rec_blob.len());
+    let mut s: Vec<u8> = Vec::with_capacity(blob_abs + rec_blob.len());
     s.extend_from_slice(&u16b(0x0402));
     s.extend_from_slice(&u16b(2)); // listID = 2 (city list; drives the UI category filter)
     s.extend_from_slice(&u16b(0));
@@ -679,5 +700,26 @@ mod tests {
         let one = vec![CityEntry::from_deg("TEST", 21.01, 52.23)];
         let data = build_city_file(&one, &s);
         selfcheck(&data, &s, &one).expect("selfcheck");
+    }
+
+    #[test]
+    fn block_load_no_stream_reads_past_block() {
+        // Device model (NLAsfBlock::SetDataBlock): last-TOC-row window is file garbage read past
+        // the block buffer; on the card it hits heap -> random validDestination clears -> empty
+        // city list (card-verified 2026-09-25). Generated blocks must never read past the buffer.
+        use crate::device_sim::{check_block_load, check_name_list_header};
+        let s = stock();
+        for cities in [vec![CityEntry::from_deg("TEST", 21.01, 52.23)], ten()] {
+            let data = build_city_file(&cities, &s);
+            let h = check_name_list_header("zz.DAT", &data).expect("LoadHeader");
+            let bl = check_block_load("zz.DAT", &data, &h, 0).expect("SetDataBlock");
+            assert!(bl.danger.is_empty(), "overruns: {:?}", bl.danger);
+            assert_eq!(
+                bl.valid_dest_popcount as u32,
+                u32::from(bl.ne),
+                "validDestination"
+            );
+            assert_eq!(bl.root_edges.len(), if cities.len() == 1 { 1 } else { 9 });
+        }
     }
 }

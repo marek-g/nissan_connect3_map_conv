@@ -16,8 +16,16 @@ fn stock_absolute_positions() {
     println!("shift={sh} origin=({ox},{oy})");
     let deg = 2f64.powi(31) / 180.0;
     let want = [
-        "WARSZAWA", "KRAKÓW", "BYDGOSZCZ", "ŁÓDŹ", "GDAŃSK", "RADOM", "POZNAŃ", "LUBLIN",
-        "SZCZECIN", "WROCLAW",
+        "WARSZAWA",
+        "KRAKÓW",
+        "BYDGOSZCZ",
+        "ŁÓDŹ",
+        "GDAŃSK",
+        "RADOM",
+        "POZNAŃ",
+        "LUBLIN",
+        "SZCZECIN",
+        "WROCLAW",
     ];
     let mut seen = std::collections::HashSet::new();
     for (i, e) in nl.elements.iter().enumerate() {

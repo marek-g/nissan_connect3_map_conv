@@ -12,12 +12,13 @@
 //! `NLPositionAttrVector::Decode`, `NLBlockLinkAttrVector::Decode`,
 //! `NLBlock::ProcessNode`. See LID_format.md (ASF section).
 
+pub mod city;
+pub mod device_sim;
 pub mod header;
 pub mod pa;
 mod rebuild;
 pub mod rel;
 pub mod write;
-pub mod city;
 
 /// PAU = "position angle unit": deg * 2^31 / 180 (signed 32-bit).
 pub const PAU: f64 = (1i64 << 31) as f64 / 180.0;
@@ -295,6 +296,22 @@ fn decode_u32_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec
 }
 
 fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u32> {
+    decode_u16_c(b, code, start, end, n).0
+}
+
+/// RE-harness probe: same as `decode_u16` but also returns the byte cursor after the last value.
+#[doc(hidden)]
+pub fn decode_u16_probe(
+    b: &[u8],
+    code: u32,
+    start: usize,
+    end: usize,
+    n: usize,
+) -> (Vec<u32>, usize) {
+    decode_u16_c(b, code, start, end, n)
+}
+
+fn decode_u16_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<u32>, usize) {
     let mut c = Cur {
         b,
         p: start,
@@ -338,7 +355,7 @@ fn decode_u16(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> Vec<u3
             }
         }
     }
-    out
+    (out, c.p)
 }
 
 /// Decode a `NLBitfieldDecoder` bitmap of `n` bits.
@@ -380,7 +397,7 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
                 if c.eof() {
                     break;
                 }
-                acc += c.vle();
+                acc = acc.wrapping_add(c.vle());
                 if (acc as usize) < n {
                     bits[acc as usize] = true
                 }
@@ -395,7 +412,7 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
                 if c.eof() {
                     break;
                 }
-                acc += c.vle();
+                acc = acc.wrapping_add(c.vle());
                 if (acc as usize) < n {
                     bits[acc as usize] = false
                 }
@@ -430,7 +447,11 @@ pub struct Element {
 /// (`NLPositionAttrVector::operator[]` 00cdbbc8 / `Decode` 00cdd7dc; origin/shift are file-global,
 /// read from `NLAsfSubHeader` in `NLProcessor::enAddNewAsfBlock` 00ceca4c).
 pub fn pos_shift(b: &[u8]) -> u16 {
-    u16::from_le_bytes(b[0x0e + u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) as usize..][..2].try_into().unwrap())
+    u16::from_le_bytes(
+        b[0x0e + u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) as usize..][..2]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// The whole decoded name-list of a `LID*.DAT` block-container.
@@ -1605,8 +1626,11 @@ pub fn graft_city_probe(
     linked.sort_unstable();
     linked.dedup();
     if linked.last() != Some(&L) {
-        return Err("graft: host node is not the highest link id (appended pair would desync \
-                    from the ascending bitmap order the device relies on)".into());
+        return Err(
+            "graft: host node is not the highest link id (appended pair would desync \
+                    from the ascending bitmap order the device relies on)"
+                .into(),
+        );
     }
     let mut bitmap: Vec<u8> = Vec::new();
     let mut acc = 0u32;
@@ -1616,7 +1640,11 @@ pub fn graft_city_probe(
         acc = x as u32;
     }
     let mut pairs: Vec<u8> = Vec::new();
-    for v in old_pairs.iter().copied().chain([(nb + reserved_blocks) as u32, 0]) {
+    for v in old_pairs
+        .iter()
+        .copied()
+        .chain([(nb + reserved_blocks) as u32, 0])
+    {
         pairs.extend_from_slice(&vle_encode(v));
     }
     // ---- per-element column repair ----
@@ -1637,7 +1665,10 @@ pub fn graft_city_probe(
         bytes: Option<Vec<u8>>,
     }
     let mut ovs: Vec<Option<Ov>> = vec![None; num_desc];
-    for kd in [0x407u32, 0x408, 0x409, 0x40a, 0x40b, 0x40c, 0x40d, 0x40e, 0x40f, 0x410, 0x411, 0x412, 0x414, 0x415] {
+    for kd in [
+        0x407u32, 0x408, 0x409, 0x40a, 0x40b, 0x40c, 0x40d, 0x40e, 0x40f, 0x410, 0x411, 0x412,
+        0x414, 0x415,
+    ] {
         let rows_i: Vec<usize> = descs
             .iter()
             .enumerate()
@@ -1662,7 +1693,11 @@ pub fn graft_city_probe(
                 nb.extend_from_slice(&bits[t + 1..]);
                 let bb = crate::rebuild::encode_row(&[], &nb, d.code)
                     .ok_or("graft: bitmap re-encode: unpinned code")?;
-                ovs[i] = Some(Ov { code: d.code, param: new_nbel as u32, bytes: Some(bb) });
+                ovs[i] = Some(Ov {
+                    code: d.code,
+                    param: new_nbel as u32,
+                    bytes: Some(bb),
+                });
                 bits
             }
             None => Vec::new(),
@@ -1677,7 +1712,11 @@ pub fn graft_city_probe(
             if matches!(d.code, 0x01 | 0x02 | 0x03) || span0 == 0 {
                 // placeholder (secondary all-clear/set or empty span): domain param only.
                 if d.param as usize == old_nbel {
-                    ovs[i] = Some(Ov { code: d.code, param: new_nbel as u32, bytes: None });
+                    ovs[i] = Some(Ov {
+                        code: d.code,
+                        param: new_nbel as u32,
+                        bytes: None,
+                    });
                 }
                 continue;
             }
@@ -1685,12 +1724,22 @@ pub fn graft_city_probe(
             let vals = decode_u32(stock, d.code, bs + d.off as usize, span_end(i), 64_000_000);
             if vals.iter().all(|&v| v == 0) && popc_old == 0 {
                 // empty-content numeric (all-clear BinList): keep zero bytes, retarget domain.
-                let p = if d.param as usize == old_nbel { new_nbel as u32 } else { d.param };
-                ovs[i] = Some(Ov { code: d.code, param: p, bytes: None });
+                let p = if d.param as usize == old_nbel {
+                    new_nbel as u32
+                } else {
+                    d.param
+                };
+                ovs[i] = Some(Ov {
+                    code: d.code,
+                    param: p,
+                    bytes: None,
+                });
                 continue;
             }
             if old_bits.is_empty() {
-                return Err(format!("graft: kind {kd:04x} value stream without domain bitmap"));
+                return Err(format!(
+                    "graft: kind {kd:04x} value stream without domain bitmap"
+                ));
             }
             if d.code != 0x14 && d.code != 0x18 {
                 return Err(format!(
@@ -1723,7 +1772,11 @@ pub fn graft_city_probe(
             } else {
                 d.param
             };
-            ovs[i] = Some(Ov { code: d.code, param: p, bytes: Some(bytes) });
+            ovs[i] = Some(Ov {
+                code: d.code,
+                param: p,
+                bytes: Some(bytes),
+            });
         }
     }
     // ---- rebuild host block: table unchanged size, streams re-anchored ----
@@ -2525,7 +2578,9 @@ pub fn build_block(anchor: Option<(i32, i32)>, entries: &[NameEntry]) -> (Vec<u8
         sub_cnt[id] = if outdeg[id] == 0 {
             1
         } else {
-            (cs[id]..cs[id] + outdeg[id] as usize).map(|c| sub_cnt[c]).sum()
+            (cs[id]..cs[id] + outdeg[id] as usize)
+                .map(|c| sub_cnt[c])
+                .sum()
         };
     }
     let mut fe = vec![0usize; nc];
@@ -3091,7 +3146,13 @@ pub fn col406_audit(b_in: &[u8]) {
                 break;
             }
             let k = u16(b, p) as usize;
-            descs.push((k & 0xfff, k & 0xf000, u16(b, p + 2) as u32, u32(b, p + 4) as usize, u32(b, p + 8) as usize));
+            descs.push((
+                k & 0xfff,
+                k & 0xf000,
+                u16(b, p + 2) as u32,
+                u32(b, p + 4) as usize,
+                u32(b, p + 8) as usize,
+            ));
         }
         let span = |i: usize| -> usize {
             if i + 1 < descs.len() {
@@ -3100,7 +3161,9 @@ pub fn col406_audit(b_in: &[u8]) {
                 be
             }
         };
-        let Some(di) = descs.iter().position(|d| d.0 == 0x401 && d.1 == 0) else { continue };
+        let Some(di) = descs.iter().position(|d| d.0 == 0x401 && d.1 == 0) else {
+            continue;
+        };
         let odv: Vec<usize> = {
             let mut v = decode_u16(b, descs[di].2, bs + descs[di].3, span(di), descs[di].4);
             v.resize(node_count, 0);
@@ -3133,7 +3196,13 @@ pub fn col406_audit(b_in: &[u8]) {
         }
         let mut link = vec![false; node_count];
         if let Some(bi402) = descs.iter().position(|d| d.0 == 0x402 && d.1 == 0x4000) {
-            let bits = bitfield(b, descs[bi402].2, bs + descs[bi402].3, span(bi402), node_count);
+            let bits = bitfield(
+                b,
+                descs[bi402].2,
+                bs + descs[bi402].3,
+                span(bi402),
+                node_count,
+            );
             for (k, v) in bits.into_iter().enumerate() {
                 if k < node_count {
                     link[k] = v;
@@ -3144,10 +3213,16 @@ pub fn col406_audit(b_in: &[u8]) {
             println!("block {bi}: NO col406");
             continue;
         };
-        let col: Vec<usize> = decode_u32(b, descs[c406i].2, bs + descs[c406i].3, span(c406i), descs[c406i].4)
-            .into_iter()
-            .map(|x| x as usize)
-            .collect();
+        let col: Vec<usize> = decode_u32(
+            b,
+            descs[c406i].2,
+            bs + descs[c406i].3,
+            span(c406i),
+            descs[c406i].4,
+        )
+        .into_iter()
+        .map(|x| x as usize)
+        .collect();
         // edges: storage order = per node fe[x]+j, child = cs[x]+j (device ProcessNode/ProcessSubTree semantics)
         let mut children = vec![Vec::new(); node_count];
         let mut edge_child: Vec<usize> = vec![usize::MAX; col.len()];
@@ -3173,8 +3248,11 @@ pub fn col406_audit(b_in: &[u8]) {
                     is_child[*c] = true;
                 }
             }
-            let mut stack: Vec<(usize, bool)> =
-                (0..node_count).rev().filter(|&x| !is_child[x]).map(|x| (x, false)).collect();
+            let mut stack: Vec<(usize, bool)> = (0..node_count)
+                .rev()
+                .filter(|&x| !is_child[x])
+                .map(|x| (x, false))
+                .collect();
             while let Some((x, exp)) = stack.pop() {
                 if x >= node_count {
                     continue;
@@ -3193,8 +3271,14 @@ pub fn col406_audit(b_in: &[u8]) {
                     }
                 } else {
                     // children may still be MAX (cycles/shared) -> retry after they resolve
-                    if children[x].iter().all(|&c| c >= node_count || sub[c] != usize::MAX) {
-                        sub[x] = children[x].iter().map(|&c| if c < node_count { sub[c] } else { 0 }).sum();
+                    if children[x]
+                        .iter()
+                        .all(|&c| c >= node_count || sub[c] != usize::MAX)
+                    {
+                        sub[x] = children[x]
+                            .iter()
+                            .map(|&c| if c < node_count { sub[c] } else { 0 })
+                            .sum();
                     } else {
                         stack.push((x, true));
                     }

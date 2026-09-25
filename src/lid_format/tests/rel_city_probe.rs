@@ -32,7 +32,11 @@ fn city_relation_domains() {
     let (b2, i2) = rel("REL00002.DAT");
     for id in [233759u32] {
         let r = get_relations(&b2, &i2, true, id, id + 1).unwrap();
-        println!("REL00002 city {id}: {} POIs, first {:?}", r.len(), &r[..r.len().min(5)]);
+        println!(
+            "REL00002 city {id}: {} POIs, first {:?}",
+            r.len(),
+            &r[..r.len().min(5)]
+        );
     }
     // REL00003 (10<->2) and REL00006 (9<->2): district / region of our cities
     for file in ["REL00003.DAT", "REL00006.DAT"] {
@@ -47,7 +51,11 @@ fn city_relation_domains() {
     let (b1, i1) = rel("REL00001.DAT");
     for id in [233759u32] {
         let r = get_relations(&b1, &i1, false, id, id + 1).unwrap();
-        println!("REL00001 city {id}: {} streets, first {:?}", r.len(), &r[..r.len().min(6)]);
+        println!(
+            "REL00001 city {id}: {} streets, first {:?}",
+            r.len(),
+            &r[..r.len().min(6)]
+        );
     }
     // sanity: stock ids all exist within REL00003 target domain (714 src x 241269 tgt)
     let _ = stock_ids;

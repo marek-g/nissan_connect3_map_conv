@@ -70,7 +70,10 @@ fn main() {
         &cities,
     )
     .expect("build city relations");
-    let dir = std::path::Path::new(&out_path).parent().unwrap().to_path_buf();
+    let dir = std::path::Path::new(&out_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
     for (name, bytes) in [
         ("REL00000.DAT", &fam.rel0),
         ("REL00001.DAT", &fam.rel1),

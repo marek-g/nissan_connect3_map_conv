@@ -169,6 +169,9 @@ pub fn get_relations(
                     return Err(format!("rel: cell {g} values out of tile"));
                 }
                 let (row_base, col_base) = ((r0 + r as u64) * d4, (c0 + c as u64) * d5);
+                if std::env::var("REL_DEBUG").is_ok() && by_source && row_base == 450 {
+                    eprintln!("cell {g} r0 {r0} c0 {c0} r {r} c {c} ci {ci} row_base {row_base} col_base {col_base} start {start} end {end} size {size}");
+                }
                 if (by_source && hi as u64 <= row_base) || (!by_source && hi as u64 <= col_base) {
                     continue;
                 }

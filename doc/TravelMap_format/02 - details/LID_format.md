@@ -422,6 +422,85 @@ Position = `PA` point if present, else `pos = street[i + idx/(n-1)]` between the
 7. Resolve coordinate (GenAttr HNR + `PA`, else interpolate; city = LID element WGS84 or `DB_CITY`) →
    handed to the router via `posfi_tclMsgSetPositionByLocation`.
 
+### 10.4b City-screen `vSearchCity` flow — RE session 2026-09-25 **[NEW]**
+
+**Calibration correction (user-confirmed): the on-screen keyboard NEVER worked with ANY of our
+generated city files.** The only working artifact ever = the single-city `TEST` file, which was
+AUTO-SELECTED without keyboard input. That auto-select matches the position-driven tail of
+`vSearchCity` (below): exactly one candidate, picked by distance, filled the city field.
+
+Full reverse-geocode/entry chain (all decompiled 2026-09-25, `/DAPIAPP.OUT`):
+
+1. `LISA_tclAddressSearch::vSearchCity` `00c76fd8` — entry with `(name, position, …)`; builds a
+   `LISA_tclVector<LISA_tclRegionSearchInfo>`; calls steps 2-4 in order, aborting if any returns 0.
+2. `bSearchRootNames` `00c75f28` → `LISA_tclRootCatSearch::bSearchRootCat` — parses the input
+   string against the root-category tags (`LineParser` + `CONF` delimiters, `corfoGetConfLevelCalcCfg`),
+   finds country/state/country-name roots (stock root data - INDEPENDENT of our city file) and
+   SEEDS the RegionSearchInfo vector. Failure ⇒ whole call returns before any list work.
+3. `bSearchStreetsAndCities` `00c766b4` — per RSI: `vFillAddrAndZipTemplates` + `vFillNoTermNames`
+   (config `NoTermNames` set) + `vFillSearchedParts`; then per searched category (vector `this+0x1a4`):
+   * `bVerifyList` `00c75bf4`: opens the category file via `NLDataBlockReader(fileID, 0x13)` +
+     `NLProcessor` with decode-options `{1,1,0,0,0}` and **`NLProcessor::bInitialise` `00cee6e4` =
+     hard gate** (`NLNameList::LoadHeader` 00e0e63c → `enAddNewAsfBlock` 00ceca4c →
+     `NLBlockDataContainer::enReadAsfBlock` 00cf4f70 → `NLAsfBlock::SetDataBlock` 00cdf404;
+     any `!= 1` ⇒ `bVerifyList=0` ⇒ **whole search returns 0 ⇒ empty list AND empty keyboard**).
+     Optional `vSetLangIdxFilter({u8GetCurrUILangIndex})` when `bOnlyUILangFilterInLists` (dap conf).
+   * `bVerifyFLIList` `00c754e0` (FLI = optional per-list First-Letter-Index file, `0xffff` = skip;
+     POL META carries no relType 6 ⇒ skipped).
+   * on `bVerifyAllStrings` `00c6f910` (→ `NLProcessor::bFindNames` `00cee7d0` →
+     `bSearchInCurrentLayer` = **the TEIC query-walk, still NOT modeled**; then a reload +
+     `vRemoveInvalidLangNames` `00c6f1a4` = NLProcessor INDEX-FILTER (language) pass over the
+     match sets + `vRemoveUnwantedExonymAndAlternateNames`; the function itself always returns 1,
+     but an empty match map = empty results).
+   * `vAdd100PercentMatches` → on a 100 %-match flag: `u16DetRelIdForCategories(3→2, reltype 1)` →
+     `LISA_tclRelationMap(fileID, relId, access 3)` → `bSendListUpdate` `00c74fc8` (REL populate,
+     `vPopulateCityIndices` `00c73b68` — gates modeled in `device_sim::CityScreen`).
+   * `this[0x162]` set ⇒ `LISA_tclHypothesisCreator::vCreateAddressHypothesisList`.
+4. `bFindBestCity` `00c74aac` — for each RSI takes its `poGetSearchStrList()` result set, keeps the
+   entry with fewest mismatches (and `searched-parts` prefix-rank rule), collects element indices →
+   `bGetNames(cat 2)` fills a `cityID → WGS84 position` map, then picks the MINIMUM
+   `MEMU2METER(memuDistance(car, city_pos))` — this writes the city name + position back to the HMI
+   (the `city:` string build). **TEST auto-selected here**: distance-picked single candidate.
+
+**File-gate verdict 2026-09-25:** `device_sim::check_name_list_header` (faithful `LoadHeader` incl.
+S9 fill-stop) + `RelSim::open` gate replica → stock and OUR `zzmin1`/`old_city`/`zzcity10` city
+files and `REL00000/1/3/6` ALL PASS. The card's empty-list+dead-keyboard therefore originates
+DOWNSTREAM: in the TEIC query walk (`bSearchInCurrentLayer` `00cee?` — `enGetFirstTargetNode`
+`00cdd8d8` / `enGetNodeOutgoingEdges` `00cde3d0` / `ProcessSubTreeTEIC` `00cde0b0`), the language
+index-filter, or the `bSearchRootNames` seeding — **next RE + sim target: `bSearchInCurrentLayer`.**
+Note stock LID20001 block0 root edges = the full alphabet (`0-9A-ZŁ…` table-order) while our
+generated block root carries only our initials — structurally legal: `bSearchInCurrentLayer` is a
+FULL DFS over every edge (order-independent insertion sort by `u32GetSortValue(label[0])`, no
+binary search), so root edge order is irrelevant. **Root-step init decoded (`vResetInputPath` @
+`00cecefc` → `NLInputPath::bInitialize` @`00cf5b44` → `NLInputStep::bInitialise` @`00cf7130`):
+sets = (sub+0x70 cats vector = s5, sub+0x80 lang vector = s6), root node = element 0, edges from
+`enGetNodeOutgoingEdges` @`00cdbd40` = (start=prefix-summed u32 view, count=col `0x401`), labels
+from col `0x403` (blob + `0x8403` VLE offsets, 2-row descriptor); invalid-cat/lang cols `0x404/0x405`
+DELETE from the live sets in `bSetSelectedEdge` @`00cf69d0` (empty = permissive).**
+
+**The upstream hard gate (`[NEW 2026-09-25]`): `bDetermineFileIDs/bDetermineFileIDForRegion`
+@`00c906e8/00c90168`** runs BEFORE any category-file load and returns 0 ⇒ whole search dead
+(empty list + dead keyboard). It reads the region GLOBAL header (**`LID50001.DAT` = kind-4 file for
+POL listID 2**, same 0x77 outer header, sub-header 268 B at file `+0x77`) via
+`bDetermineLDToNLFiles(rootName)` → `LISA_tclPSFBasExternalList{fileID, startOffset, cntElems}` and
+loads a **const list** (`LISA_tclPSFBasGlobalEntry` rows `{catID, control.subType∈{0x6000 NL,
+0x6100 FLI}, cntSubseqEntries = NL fileID ∈ (19999,30000)}`; cat3 additionally registers
+cat4=file+10000, cat5=file+20000; `bExistPAFile` → PA flag). [OPEN-CRITICAL] whether the const-list
+`startOffset/cntElems` address a region inside `LID20001` itself (then a regenerated list file must
+carry it byte-exact — our standalone rebuilds do not) or only inside LID50001 (then stock untouched).
+
+**Root cause #4 — empty city list (`[CONFIRMED 2026-09-25]`):** `vPopulateCityIndices` @`00c73b68`
+per candidate: (a) district-linked + `dist ≥ this+0x170`, (b) `enGetAllElementProperties`
+@`00cecbdc` must return 1 — its element attributes (`bIsEntryValidDestination`, permutation/main
+indices, char-status) read the ELEMENT-DOMAIN columns, whose stock payloads are: `0x40f/0x410/0x411`
+= code `0x2` RAW u8/elem (0/1/0x15/…), `0x414` = code `0x3` bytes, `0x40b` = Simple9 (values
+`17×19, 37×19, 57×19…` after zip rows [semantics OPEN]), `0x40d/0x412` = len-nbel rows aliased to
+block end [OPEN], `0x8415` = char-status Simple9 (non-zero stock). **Our generator emits ALL of
+these EMPTY ⇒ every candidate drops ⇒ empty list + empty position map ⇒ `bFindBestCity` also
+finds nothing.** The element lang set the index build filters on is NOT col-carried per element —
+it is the live file set (`s6`) minus per-edge invalid langs (`0x405`, empty in ours = permissive).
+Fix = the mode-C element payloads (writer `city.rs`), tracked in TODO 2026-09-25z.
+
 ### 10.5 `DB_CITY.DAT` / `GLOB_POI.DAT` (SQLite)
 
 - `DB_CITY.DAT` (optional; **absent on the reviewed EUR card** — regional LID name-lists are used instead):
@@ -629,6 +708,20 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
   file carries; gazetteer `20000` → `B=C=D=E=0`.
 * `osm2lid` now emits the stock street shape (verified by a `LoadHeader` byte-simulator: stock files
   and our new files PASS, the pre-fix files REJECT at `code 0x00` sections).
+* **[EXACT LAYOUT + S9 SEMANTICS CONFIRMED 2026-09-25, DIS-level]** The subheader field stream at
+  `hdr+0`: `u16 elem_count`, `u16 flag(3)`, `u16 nb`, `u16 nrec`, `u16 nrel`, `u16 cnt5`, `u16 cnt6`,
+  `u16 shift(8)`, `u32 originX`, `u32 originY`, then 7×`{u8 code, u32 abs_off}` at `hdr+0x18`; the
+  last stream window ends at `hdr+region_size` (the 0x10/0x14 container words double as `+0x70/+0x74`).
+  Stream codes: the strict "consumed to window end" cursor check applies to codes `0x11..0x17` ONLY.
+  Code `0x18` = `DecodeSimple9` 00cdc908/00cdc3bc fills a vector sized by the stream count and
+  STOPS ADDING when full (extra packed values are read and discarded); it fails ONLY on a bad mode
+  nibble (bits 28..32 ∉ 1..9) or on running out of bytes before `count` values. Mode table
+  `(values, bits)`: 1=(28,1) 2=(14,2) 3=(9,3) 4=(7,4) 5=(5,5) 6=(4,7) 7=(3,9) 8=(2,14) 9=(1,16/28)
+  — mode 9 narrows to 16 bits in the u16 flavor.
+  Device-faithful Rust replica: `lid_format::device_sim::check_name_list_header` (example
+  `sim_file_gates`). RESULT 2026-09-25: stock `LID20001/20002/20006`, our TEST file `zzmin1`,
+  our records-build and our quantized 10-city file ALL PASS this gate + the REL subheader gates;
+  **the card symptom therefore does NOT originate in any file-admission gate** (see §10.4b).
 
 ### 11.4d Merge-into-stock workflow + city-id mapping (**[CONFIRMED 2026-09-21, card-validated merge]**)
 
@@ -713,8 +806,9 @@ city at a time.
   file origin** (§11.5 storage note — absolute coords stored raw were WRONG-by-luck only), claims =
   subtree leaf counts. Test file: 10 PL cities (`zzcity10.DAT` 1007 B, raw md5
   `bb11498ae17b2b0353e894b71ccb01a7`, compressed md5 `32e8f1b225bcfb2f250019a1d9dcb148`).
-  **Card test 2026-09-25 FAILED:** city list empty (only the first-letter keyboard filter saw the
-  names), the all-cities button RESET the unit — while devsim+reader pass. Gap found immediately
+  **Card test 2026-09-25 FAILED:** city list empty, the first-letter keyboard produced nothing
+  (calibration 2026-09-25: the keyboard NEVER worked on any of our builds — list and keyboard die
+  together), the all-cities button RESET the unit — while devsim+reader pass. Gap found immediately
   after: stock city blocks carry REAL data in columns our template leaves empty (`0x408` SV values
   param-2000/VLE 6000 B in blk44, `0x40b` 39 vals, `0x40c` 59 vals, `0x414` bitmap 494 B); the
   all-cities/first-letter UI presumably consumes them (or the `nrec` sections — see §12.1 records).
@@ -747,6 +841,41 @@ city at a time.
   `9732e2efcf939a7248562122075b50f2`, `REL00003C.DAT` 200 B md5 `5cda735f95570a4c63a83dd3763e14e3`,
   `REL00006C.DAT` 220 B md5 `3d11fa4f2e06a9de558c2d0feb222676` (all in `/tmp/opencode/`). Test
   `src/lid_format/tests/city_family.rs` asserts the browser queries answer with the NEW ids.
+  **Follow-up 3 (2026-09-25, root cause of empty list + dead keyboard):** see §11.4g below.
+
+### 11.4g SetDataBlock stream windows + the 0x40d trailer rule (**[CONFIRMED 2026-09-25 — THE killer]**)
+
+`NLAsfBlock::SetDataBlock` `00cdf404` = `enSetListDescriptions` `00cdc0c0` (TOC → descriptor objects,
+never fails) + `enDecodeTreeStructure` `00cdf360` + `enDecodeAttrLists` `00cddf18` (fixed column order
+`0x404,0x405,0x413,0x407,0x408,0x409,0x40c,0x40b,0x40a,0x40f,0x40e,0x410,0x40d,…`; abort on first non-1;
+decode options = all-1 via `NLAsfBlockElemDecodeOptions('\x01')`). Device semantics:
+
+* TOC row = `{u16 kind, u16 code, u32 start, u32 count}` — **`code` (decoder selector) is the 2nd u16**,
+  not part of the kind. Descriptor object = `{start, window, count, kind, code}`.
+* **`window_i = start[i+1] − start[i]` in TOC row order** (equal starts ⇒ window 0 ⇒ zero reads).
+  The LAST row's window = `u32` read 8 bytes past the TOC — file bytes that land PAST the block's
+  container buffer. The container is an exact-size malloc'd copy of the block
+  (`NLBlockDataContainer::enReadAsfBlock` `00cf4f70`), so the last row's stream is read **from heap**
+  on the card — nondeterministic garbage.
+* Bitfield rows: code 1/2/3 never fail (loop stops at window end); code 3 = init-all-TRUE then clear at
+  VLE-delta positions; code 2 = init-all-FALSE then set. Other codes hard-fail. Standard codes
+  `0x11/0x14/0x16/0x18` enforce "decoded count == param AND cursor == window end"; `0x12/0x13/0x15/0x17`
+  always pass. Composite: link/position pair count = 2×popcount(bitmap); SingleValue with popcount 0
+  skips its value column.
+* **Stock consequence:** stock city blocks end their TOC with `0x40d` (validDestination, code 3) at
+  `start == block_len` — stock also reads past its buffer, and heap deltas clear a handful of random
+  bits per 5000-element block (≈8/block — UX-invisible at stock scale). A 10-city file turns the same
+  heap read into a near-total `bIsEntryValidDestination=false`: `vPopulateCityIndices` `00c73b68`
+  drops every candidate ⇒ **empty city list, and the input UI never renders a keyboard for an empty
+  list ⇒ the "dead keyboard" symptom is the same bug** (calibration: keyboard never worked on any of
+  our builds; single-city TEST only ever auto-selected by position).
+* **Generator rule (now enforced):** the LAST TOC row must have `count = 0` (garbage window never
+  read). `city::template` appends a dummy `{kind 0x0416, code 0x02, count 0, start = block end}` row,
+  which gives the real `0x40d` row window 0 ⇒ code 3 decodes to all-TRUE with zero reads, deterministic
+  on-device. Regression: `city::tests::block_load_no_stream_reads_past_block` + the device simulator
+  `device_sim::check_block_load` (reports `DANGER: … reads past block buffer`; stock blocks report
+  exactly this known hazard, generated files must report none). Simulator validated: reproduces the
+  stock blk0 root-edge letters `0-9A-ZŁ希腊Ср` set and `validDest 4957/4965`.
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
