@@ -516,7 +516,7 @@ device's `CalculateTerminatingElementIndex` root-loop actually processes (`blk44
 | `0x11` | raw LE | | `0x15` | RLE + VLE |
 | `0x12` | RLE (value = run len) | | `0x16` | delta-VLE (prefix sum) |
 | `0x13` | bitmap (set positions) | | `0x17` | sparse-fill, delta-VLE gaps |
-| `0x14` | **VLE = unsigned LEB128** (`00cdb218`) | | `0x18` | **Simple9** (`00cdc3bc`) |
+| `0x14` | **VLE, base-128 with biased digits** (`ReadVle` `00cdb218`) — NOT LEB128: value = Σ(contᵢ·128^k⁻ⁱ) + final, cont byte `b∈0x80..0xFF` contributes digit `b−0x7f ∈ [1..128]`, final byte `b<0x80` contributes `b`. Encoder: `d₀=v%128; w=(v−d₀)/128; while w>0 { dig=w%128; dig==0 → digit 128,w=w/128−1 else digit dig,w=(w−dig)/128 }`, bytes `0x7f+dig` in reverse + `d₀` last (`gen_cities.rs::vle`) | | `0x18` | **Simple9** (`00cdc3bc`) |
 
 Fixed ints little-endian (`ReadUnsigned<u32>` `00cdb2e8`). Code `0x0d` is **invalid** (decoders reject it) →
 confirms the header `0d 00`s are counts, and `0x0dNN` high-bytes elsewhere are PA/GenAttr column tags.
@@ -700,8 +700,21 @@ city at a time.
   + the §11.4b/§11.4f gates (0x415 non-empty = FAIL, 0x40d all-false = WARN, `f2` vs computed roots).
   Validates STOCK 45/45 and the generated file 1/1.
 * Card test status: `zzmin1.DAT` (raw md5 `3beb222d8664eb4b8535ea095b097104`, 688 B) → flash as
-  `LID20001.DAT`; expected: city list shows "TEST" (streets NOT required — `LID20006` is opened only
-  after selection; `0x411=0` merely means "no tile data", it does not hide a city).
+  `LID20001.DAT`; **PASSED on card 2026-09-25** (single TEST city appears and is selectable).
+* `gen_cities.rs` — multi-city step (logic now in the shared crate module `lid_format::city`:
+  `CityEntry/build_city_block/build_city_file/selfcheck`, examples are thin CLIs; TSV input supported): N cities in one shared-prefix trie (forest f2=1), device node-id
+  layout (child = treeBase+fe+i — NOT plain DFS order; simulation required), UTF-8 uppercase labels
+  (stock-confirmed: stock city blobs carry raw UTF-8 diacritics), names sorted by byte order == TEIC
+  element order (valid while no name is a prefix of another), `0x407` positions as VLE **deltas vs the
+  file origin** (§11.5 storage note — absolute coords stored raw were WRONG-by-luck only), claims =
+  subtree leaf counts. Test file: 10 PL cities (`zzcity10.DAT` 1007 B, raw md5
+  `bb11498ae17b2b0353e894b71ccb01a7`, compressed md5 `32e8f1b225bcfb2f250019a1d9dcb148`).
+  **Card test 2026-09-25 FAILED:** city list empty (only the first-letter keyboard filter saw the
+  names), the all-cities button RESET the unit — while devsim+reader pass. Gap found immediately
+  after: stock city blocks carry REAL data in columns our template leaves empty (`0x408` SV values
+  param-2000/VLE 6000 B in blk44, `0x40b` 39 vals, `0x40c` 59 vals, `0x414` bitmap 494 B); the
+  all-cities/first-letter UI presumably consumes them (or the `nrec` sections — see §12.1 records).
+  [OPEN - active debug; matches the historical "append new city never worked" symptom, §11.4d.] WARNING for writers: VLE is NOT LEB128 (§11.4 table).
 
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
@@ -709,6 +722,15 @@ A block's places have **no per-record lon/lat field**. Positions live in `NLPosi
 a separate compressed **X** column (`+0x20`) + **Y** column (`+0x30`) + a delta/origin `tNLHPosition` (`+0x48`);
 element *i*'s coordinate = origin + `(X[i], Y[i])`. (The empirical `lon@+0x0c/lat@+0x10/text_id@+0x14` belongs to
 the flat `fm_tcl` **POI** record of §5b — a *different* block type — which is why it did not match the name-list.)
+
+**[STORAGE MEASURED 2026-09-25]** `NLPositionAttrVector::Decode` `00cdd7dc`: bitmap row `0x4407` (code 0x03,
+count=nbel) gates which elements have a position (bit 0 → sentinel `0xffffffff`); the value row is `0x0407`
+with the stream's OWN code — stock city files use **`0x14` VLE** (street blocks raw `0x11`), value count =
+**popcount(bitmap)×2** (the row `param` is NOT the value count); values are PAU **deltas vs `tNLHPosition`**
+stored at `this+0x48/0x4c` — for a lazily-queried block the queried city position, at file load the SUB-HEADER
+origin constants (`hdr+0x10+0x10/0x14`, POL20001 = `0x0a0f77e3`/`0x22eb5f5f` ≈ 14.1475°E/49.1054°N) — signed
+deltas wrap to u32 (consumer adds as int). A from-scratch file must encode `stored = real − origin` (verified
+end-to-end by `gen_cities.rs` self-read: absolute = origin + delta recovers each city exactly).
 
 ### 11.6 GenAttr/HNR columns (fileID+20000) (CONFIRMED: `enDecodeHnr` `00e0c09c` / `enGetHnr` `00e0d078`)
 

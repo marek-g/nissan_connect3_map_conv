@@ -17,6 +17,7 @@ pub mod pa;
 mod rebuild;
 pub mod rel;
 pub mod write;
+pub mod city;
 
 /// PAU = "position angle unit": deg * 2^31 / 180 (signed 32-bit).
 pub const PAU: f64 = (1i64 << 31) as f64 / 180.0;
