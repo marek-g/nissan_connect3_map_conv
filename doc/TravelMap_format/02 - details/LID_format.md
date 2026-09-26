@@ -877,6 +877,21 @@ decode options = all-1 via `NLAsfBlockElemDecodeOptions('\x01')`). Device semant
   exactly this known hazard, generated files must report none). Simulator validated: reproduces the
   stock blk0 root-edge letters `0-9A-ZŁ希腊Ср` set and `validDest 4957/4965`.
 
+**City-list collector replica (2026-09-25):** `device_sim::check_city_list` reproduces
+`vPopulateCityIndices` `00c73b68`: RSI context ranges → `RelationMap::bUpdateRange` `00c8c23c` →
+`NLRelationProcessor::bGetRelationsPerIndex` `00cf1f28` (per-index matrix query keyed by CITY;
+multimap key = queried city element) → candidates = keys inside the context ranges → gates
+`bGoToElement` + props (`+8==-1` ctor default ⇒ pass, current UI lang ∈ stock META s6 ⇒ pass) +
+`bIsEntryValidDestination`. REL query sides: REL00000 `by_source=true` (2↔2), REL00001/3/6
+`by_source=false` (city is target side). Validation: stock family full context = **44645 of 44661
+keys listed, 16 dropped by validDestination** (stock's own heap clears) — model matches device
+behavior; generated 10-city family = all 10 listed, `danger=0`
+(`tests/city_family.rs::city_list_simulator_lists_all_new_cities`). The old card build lists 10 in
+sim (file bytes) but carries the `danger` flag: on the card its validDestination bits came from
+heap ⇒ random clears ⇒ the observed empty list. Not modeled (display bookkeeping only):
+homonym `u32GetCntElemWithSameName`>1, `vGetSortedCityIDs`/`bGetNames` sort stage, RSI
+`vSetRange` back-fill loop.
+
 ### 11.5 Positions are a COLUMN (CONFIRMED) — resolves the record-offset conflict
 
 A block's places have **no per-record lon/lat field**. Positions live in `NLPositionAttrVector` (tag `0x407`):
@@ -1083,6 +1098,29 @@ neither the RNW files nor the RNW binary; it only needs the same OSM input and t
 changes — a drifted clusterer silently mis-routes every `0xc11` row). `lid2dump --sqlite`
 decodes all of this into `block_cells` (table rows; `cell_ord` = the `0xc11`/PA cell space),
 `cellmap` (flattened `0xc11/0xc12/0x003/0xc14` values) and the `hnr` side/cell columns.
+
+### 11.6b From-scratch HNR generation + device replay model (**[CONFIRMED 2026-09-26]**)
+
+`city::street` stage facts (`device_sim::check_hnr` = the device read path, VALIDATED end-to-end
+on `POL/LID40006`: **2 351 692 records over 288 391 streets decode + owner-walk consistent**):
+
+* The sub-header TOC (`NLGenAttrFile::DecodeSubHeader` `00e0e3d0`) element ranges are **INCLUSIVE**
+  (last row ends at `elem_count - 1`, next row starts at `prev_end + 1`) and a **single-block file is
+  legal** (the device does not enforce a minimum row count — the old `toccount >= 2` reader heuristic
+  was too strict and is relaxed to `>= 1`, the tiling check stays).
+* HNR read path semantics (from `enDecodeHnr` `00e0c09c` + `enGetHnr` `00e0d078` + stock samples):
+  `0xc01` values = the **house number per record** (owner street is IMPLICIT — `enGetHnrIndices`
+  `00e0c3a0` maps element -> records via the existence bitmap + cumulative starts, record k belongs
+  to the k-th interval); `0xc02` = per-record scalar (`NLHnr+0xc`); `0xc11` = the **gate** (its
+  existence-flag count must cover the records — the values themselves are some id, not identity);
+  `0xc09`/`0xc0a` = per-record **parity-group bits, independent of the number parity** (stock: odd
+  numbers with the even bit set on mixed-parity streets; number-parity agreement = 88.82% over the
+  whole stock file — so a writer must NOT be checked against `number % 2`).
+* Generator: `street::build_hnr_file` (one block, records per street odd-then-even, stock author
+  block) + `city::build_street_file`/`build_street_relations` for the `LID20006` twin
+  (`listID 3`, `nrel=0`, sec5 `[3]`, sec6 `[39]`, SAME 37-row block template as cities — stock
+  `LID20006` blocks 0..97 all pass `check_block_load`). Tests: `tests/street_family.rs`
+  (generated file green + stock replay green), examples `streets.rs` / `hnr_stock.rs`.
 
 ### 11.7 `PA_%05u` (point addresses) and `REL_%05u` (relations)
 

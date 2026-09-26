@@ -18,6 +18,7 @@ pub mod header;
 pub mod pa;
 mod rebuild;
 pub mod rel;
+pub mod street;
 pub mod write;
 
 /// PAU = "position angle unit": deg * 2^31 / 180 (signed 32-bit).
@@ -503,7 +504,7 @@ fn gen_attr_toc(b: &[u8]) -> Option<(u32, Vec<GenAttrTocEntry>)> {
     }
     let elem_count = u32(b, hdr);
     let toccount = u32(b, hdr + 8);
-    if toccount < 2 || toccount > 1_000_000 || elem_count < 1 || elem_count > 0x7fff_ffff {
+    if toccount < 1 || toccount > 1_000_000 || elem_count < 1 || elem_count > 0x7fff_ffff {
         return None;
     }
     let mut p = hdr + 12;

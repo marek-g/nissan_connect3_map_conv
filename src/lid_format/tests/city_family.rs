@@ -115,3 +115,36 @@ fn city_family_queries_answer_with_new_ids() {
     let lid = build_city_file(&cs, &stock("LID20001.DAT"));
     lid_format::city::selfcheck(&lid, &stock("LID20001.DAT"), &cs).unwrap();
 }
+
+/// End-to-end device replica: vPopulateCityIndices candidate collection + gates over the
+/// generated family must list every city, with no past-buffer stream reads.
+#[test]
+fn city_list_simulator_lists_all_new_cities() {
+    use lid_format::device_sim::check_city_list;
+    let cs = cities10();
+    let lid = build_city_file(&cs, &stock("LID20001.DAT"));
+    let fam: CityRelations = build_city_relations(
+        &stock("LID20001.DAT"),
+        &stock("REL00000.DAT"),
+        &stock("REL00001.DAT"),
+        &stock("REL00003.DAT"),
+        &stock("REL00006.DAT"),
+        &cs,
+    )
+    .expect("build family");
+    let rels: [(&[u8], bool); 4] = [
+        (&fam.rel0, true),
+        (&fam.rel1, false),
+        (&fam.rel3, false),
+        (&fam.rel6, false),
+    ];
+    let owned: Vec<(u16, &[u8], bool)> = rels
+        .iter()
+        .enumerate()
+        .map(|(i, (b, bs))| (i as u16, *b, *bs))
+        .collect();
+    let r = check_city_list(&lid, &owned, &[(0, cs.len() as u32)]).expect("list");
+    assert!(r.danger.is_empty(), "past-buffer reads: {:?}", r.danger);
+    assert_eq!(r.list, (0..cs.len() as u32).collect::<Vec<u32>>());
+    assert!(r.dropped.is_empty(), "dropped: {:?}", r.dropped);
+}

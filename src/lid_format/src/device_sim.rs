@@ -529,8 +529,11 @@ fn bitfield_decode(b: &[u8], base: usize, d: Desc, n: usize) -> (bool, Vec<bool>
     (true, bits)
 }
 
-fn overrun(b: &[u8], base: usize, d: Desc, read_bytes: u64) -> bool {
-    (d.start as u64 + read_bytes.max(d.win as u64)) > (b.len() - base) as u64
+fn overrun(b: &[u8], base: usize, d: Desc) -> bool {
+    // Every device decoder loop is bounded by its WINDOW end (ptr < end), so a stream can
+    // only touch [start, start+win) relative to the block buffer. start == block_len with
+    // win 0 (the stock zero-read cluster tail) is NOT a read.
+    d.start as u64 + d.win as u64 > (b.len() - base) as u64
 }
 
 /// Full SetDataBlock simulation of block `bi`.  `danger` collects columns whose
@@ -540,6 +543,7 @@ pub struct BlockLoad {
     pub root_edges: Vec<(String, u32)>, // root node edge labels + interval end
     pub letters: String,                // chars bGetNextValidCharacters would offer at root
     pub valid_dest_popcount: usize,     // bits in col 0x40d (bIsEntryValidDestination)
+    pub valid_bits: Vec<bool>,          // full 0x40d column (element-indexed)
     pub danger: Vec<String>,
 }
 
@@ -675,8 +679,8 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
         }
     }
     let mut danger = Vec::new();
-    let mut chk_ovr = |col: &str, d: Desc, rb: u64, danger: &mut Vec<String>| {
-        if overrun(b, base, d, rb) {
+    let mut chk_ovr = |col: &str, d: Desc, danger: &mut Vec<String>| {
+        if overrun(b, base, d) {
             danger.push(format!(
                 "col {col} start {:#x} win {:#x} reads past block buffer",
                 d.start, d.win
@@ -692,8 +696,8 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_edge[0].code
         ));
     }
-    chk_ovr("0x8403", o_edge[0], 0, &mut danger);
-    chk_ovr("0x403", o_edge[1], o_edge[1].count as u64, &mut danger); // raw blob copy
+    chk_ovr("0x8403", o_edge[0], &mut danger);
+    chk_ovr("0x403", o_edge[1], &mut danger); // raw blob copy
     let (ok_bmp, link_bits) = bitfield_decode(b, base, o_link[0], o_deg.count as usize);
     if !ok_bmp {
         return f(format!(
@@ -701,7 +705,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_link[0].code
         ));
     }
-    chk_ovr("0x4402", o_link[0], 0, &mut danger);
+    chk_ovr("0x4402", o_link[0], &mut danger);
     let npairs = link_bits.iter().filter(|x| **x).count() * 2;
     let (ok, _, _) = std_decode(b, base, o_link[1], npairs, true);
     if !ok {
@@ -710,7 +714,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_link[1].code
         ));
     }
-    chk_ovr("0x402", o_link[1], 0, &mut danger);
+    chk_ovr("0x402", o_link[1], &mut danger);
     let (ok, claims, _) = std_decode(b, base, o_claim, o_claim.count as usize, true);
     if !ok {
         return f(format!(
@@ -718,7 +722,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_claim.code
         ));
     }
-    chk_ovr("0x406", o_claim, 0, &mut danger);
+    chk_ovr("0x406", o_claim, &mut danger);
     let (ok, degs, _) = std_decode(b, base, o_deg, ne1, false);
     if !ok {
         return f(format!(
@@ -726,7 +730,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_deg.code
         ));
     }
-    chk_ovr("0x401", o_deg, 0, &mut danger);
+    chk_ovr("0x401", o_deg, &mut danger);
 
     // ---- stage 3: enDecodeAttrLists (exact device order, opts all =1) ----
     let valuelist = |o: [Desc; 3],
@@ -742,10 +746,10 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
                 o[0].code
             )));
         }
-        chk_ovr(col, o[0], 0, danger);
+        chk_ovr(col, o[0], danger);
         let (okr, _, _) = std_decode(b, base, o[1], o[1].count as usize, wide);
         let _ = okr; // device ignores rank decode result
-        chk_ovr(col, o[1], 0, danger);
+        chk_ovr(col, o[1], danger);
         let (okv, _, _) = std_decode(b, base, o[2], o[2].count as usize, wide);
         if !okv {
             return Err(Gate(format!(
@@ -753,7 +757,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
                 o[2].code
             )));
         }
-        chk_ovr(col, o[2], 0, danger);
+        chk_ovr(col, o[2], danger);
         Ok(())
     };
     valuelist(o_404, ne1, false, "0x404", &mut danger)?;
@@ -766,7 +770,7 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
                 o[0].code
             )));
         }
-        chk_ovr(col, o[0], 0, danger);
+        chk_ovr(col, o[0], danger);
         let pc = bits.iter().filter(|x| **x).count();
         if pc != 0 {
             let (okv, _, _) = std_decode(b, base, o[1], pc, true);
@@ -776,50 +780,33 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
                     o[1].code
                 )));
             }
-            chk_ovr(col, o[1], 0, danger);
+            chk_ovr(col, o[1], danger);
         }
         Ok(pc)
     };
     // bitmap-only binary columns in exact order: 0x413, 0x40f, 0x40e(sv), 0x410, 0x40d,
     // 0x411, 0x412, 0x414, 0x416(ignore). Position + 0x409 + singles interleaved per device.
-    let binary = |d: Desc, col: &str, danger: &mut Vec<String>| -> Result<usize, Gate> {
-        if d.count != 0 {
-            let (ok, bits) = bitfield_decode(b, base, d, d.count as usize);
-            if !ok {
-                return Err(Gate(format!("col {col} bitmap bad code {:#04x}", d.code)));
+    let binary =
+        |d: Desc, col: &str, danger: &mut Vec<String>| -> Result<(usize, Vec<bool>), Gate> {
+            if d.count != 0 {
+                let (ok, bits) = bitfield_decode(b, base, d, d.count as usize);
+                if !ok {
+                    return Err(Gate(format!("col {col} bitmap bad code {:#04x}", d.code)));
+                }
+                let pc = bits.iter().filter(|x| **x).count();
+                chk_ovr(col, d, danger);
+                Ok((pc, bits))
+            } else {
+                Ok((0, Vec::new()))
             }
-            let pc = bits.iter().filter(|x| **x).count();
-            chk_ovr(
-                col,
-                d,
-                if matches!(d.code, 2 | 3) {
-                    d.count as u64
-                } else {
-                    0
-                },
-                danger,
-            );
-            Ok(pc)
-        } else {
-            Ok(0)
-        }
-    };
-    let pc_413 = binary(o_bin[5], "0x413", &mut danger)?;
+        };
+    let (pc_413, _) = binary(o_bin[5], "0x413", &mut danger)?;
     // position (opts[0]): bitmap = n4 row; pairs = n0 row; count = 2*popcount
     let (ok, posbits) = bitfield_decode(b, base, o_pos[0], o_pos[0].count as usize);
     if !ok {
         return f(format!("0x4407 pos bitmap bad code {:#04x}", o_pos[0].code));
     }
-    chk_ovr(
-        "0x4407",
-        o_pos[0],
-        if matches!(o_pos[0].code, 2 | 3) {
-            o_pos[0].count as u64
-        } else {
-            0
-        },
-        &mut danger,
-    );
+    chk_ovr("0x4407", o_pos[0], &mut danger);
     let npc = posbits.iter().filter(|x| **x).count() * 2;
     let (ok, _, _) = std_decode(b, base, o_pos[1], npc, true);
     if !ok {
@@ -828,19 +815,19 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             o_pos[1].code
         ));
     }
-    chk_ovr("0x407", o_pos[1], 0, &mut danger);
+    chk_ovr("0x407", o_pos[1], &mut danger);
     single(o_sv[0], "0x408", &mut danger)?; // opts[1]
     valuelist(o_409, ne1, true, "0x409", &mut danger)?; // opts[2]
     single(o_sv[3], "0x40c", &mut danger)?; // opts[3]
     let pc_40b = single(o_sv[2], "0x40b", &mut danger)?; // opts[4]
     single(o_sv[1], "0x40a", &mut danger)?; // opts[5]
-    binary(o_bin[1], "0x40f", &mut danger)?; // opts[8]
+    let _ = binary(o_bin[1], "0x40f", &mut danger)?; // opts[8]
     single(o_sv[4], "0x40e", &mut danger)?; // opts[7]
-    binary(o_bin[2], "0x410", &mut danger)?; // opts[9]
-    let pc_40d = binary(o_bin[0], "0x40d", &mut danger)?; // opts[6] valid destinations
-    binary(o_bin[3], "0x411", &mut danger)?; // opts[10]
-    binary(o_bin[4], "0x412", &mut danger)?; // opts[11]
-    binary(o_bin[6], "0x414", &mut danger)?; // opts[12]
+    let _ = binary(o_bin[2], "0x410", &mut danger)?; // opts[9]
+    let (pc_40d, bits_40d) = binary(o_bin[0], "0x40d", &mut danger)?; // opts[6] valid destinations
+    let _ = binary(o_bin[3], "0x411", &mut danger)?; // opts[10]
+    let _ = binary(o_bin[4], "0x412", &mut danger)?; // opts[11]
+    let _ = binary(o_bin[6], "0x414", &mut danger)?; // opts[12]
     let _ = pc_413;
     let _ = pc_40b;
     // BinList 0x415/0x8415 (unconditional, aborts): main S9 list + aux bitmap
@@ -852,9 +839,9 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
                 o_bl[0].code
             ));
         }
-        chk_ovr("0x8415", o_bl[0], 0, &mut danger);
+        chk_ovr("0x8415", o_bl[0], &mut danger);
     }
-    binary(o_bl[1], "0x415", &mut danger)?; // aux bitmap result ignored... (device runs it, result used for 0x490 obj)
+    let _ = binary(o_bl[1], "0x415", &mut danger)?; // aux bitmap result ignored... (device runs it, result used for 0x490 obj)
 
     // ---- root NLInputStep (bInitialise 00cf7130) ----
     let nedges = degs.iter().map(|x| *x as usize).sum::<usize>();
@@ -894,6 +881,206 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
         root_edges,
         letters,
         valid_dest_popcount: pc_40d,
+        valid_bits: bits_40d,
         danger,
     })
+}
+
+/// Replica of `LISA_tclAddressSearch::vPopulateCityIndices` `00c73b68` candidate collection +
+/// keep-gates, given the city name-list, its REL matrices and the RSI context ranges.
+/// Device chain (all CONFIRMED 2026-09-25): RSI ranges -> `bUpdateRange` `00c8c23c` ->
+/// `NLRelationProcessor::bGetRelationsPerIndex` `00cf1f28` (per-index matrix query, multimap
+/// key = queried city element) -> candidate set = keys inside the RSI ranges -> per candidate:
+/// `bGoToElement` + `enGetAllElementProperties`==1 && props+8==-1 (ctor default = pass) +
+/// current UI lang in the META s6 set (stock META = pass) + `bIsEntryValidDestination` (col
+/// 0x40d). Homonym `u32GetCntElemWithSameName>1` / name & position bookkeeping drives display
+/// sorting only. Element-existence stands in for bGoToElement (index < element count).
+pub struct CityList {
+    pub ne: usize,
+    pub keys: usize,
+    pub candidates: usize,
+    pub list: Vec<u32>,
+    pub dropped: Vec<(u32, &'static str)>,
+    pub danger: Vec<String>,
+}
+
+/// `rels` = (rel file id, bytes, by_source) — by_source=true when the city is the matrix SOURCE
+/// side (REL00000 2<->2), false when it is the TARGET side (REL00001 3->2, REL00003 10->2,
+/// REL00006 9->2); pairs returned keyed by city. `ctx` = RSI ranges (inclusive lo, exclusive hi).
+pub fn check_city_list(
+    lid: &[u8],
+    rels: &[(u16, &[u8], bool)],
+    ctx: &[(u32, u32)],
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("city.lid", lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    let mut danger = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+        danger.extend(bl.danger);
+    }
+    let ne = valid.len();
+    let mut keys = std::collections::BTreeSet::new();
+    for (id, bytes, bys) in rels {
+        let idx = RelIndex::parse(bytes).map_err(|e| Gate(format!("REL{id:05}: parse: {e}")))?;
+        for &(lo, hi) in ctx {
+            for (k, _) in get_relations(bytes, &idx, *bys, lo, hi)
+                .map_err(|e| Gate(format!("REL{id:05}: query: {e}")))?
+            {
+                keys.insert(k);
+            }
+        }
+    }
+    let nkeys = keys.len();
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    let mut candidates = 0;
+    for k in keys {
+        if !ctx.iter().any(|&(lo, hi)| k >= lo && k < hi) {
+            continue;
+        }
+        candidates += 1;
+        if (k as usize) >= ne {
+            dropped.push((k, "bGoToElement"));
+        } else if !valid[k as usize] {
+            dropped.push((k, "validDestination"));
+        } else {
+            list.push(k);
+        }
+    }
+    Ok(CityList {
+        ne,
+        keys: nkeys,
+        candidates,
+        list,
+        dropped,
+        danger,
+    })
+}
+
+/// Device street-screen fetch (`LISA_tclAddressSearch` REL-row stage): selecting city elements
+/// queries REL00001 rows (city = TARGET side) and lists the street elements they name, after
+/// the same element gates as the city screen (`bGoToElement` existence + `bIsEntryValidDestination`).
+pub fn check_street_list(
+    lid: &[u8],
+    rel1: &[u8],
+    city_of: &[(u32, u32)],
+) -> Result<Vec<u32>, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("street.lid", lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("street.lid", lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+    }
+    let idx = RelIndex::parse(rel1).map_err(|e| Gate(format!("REL00001: {e}")))?;
+    let mut out = std::collections::BTreeSet::new();
+    for &(lo, hi) in city_of {
+        for (_, street) in
+            get_relations(rel1, &idx, false, lo, hi).map_err(|e| Gate(format!("REL00001: {e}")))?
+        {
+            if (street as usize) < valid.len() && valid[street as usize] {
+                out.insert(street);
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// One decoded house number record (device `enGetHnr` answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HnrRec {
+    pub street: u32,
+    pub number: u32,
+    pub even: bool,
+}
+
+/// Device HNR read path over a GenAttr (fileID+20000) file: `read_gen_attr` (=
+/// `NLGenAttrFile::DecodeSubHeader` `00e0e3d0` incl. TOC tiling check) then per block replay
+/// `enGetHnrIndices` `00e0c3a0` (existence bitmap `0xc01/0x4000` + cumulative starts
+/// `0xc01/0x8000`) and `enGetHnr` `00e0d078` (gate `0xc11.param`, number `0xc01`, owner
+/// `0xc02`, parity `0xc09` even / `0xc0a` odd). Fails the device path on gate overrun,
+/// start-vector gaps/overflow, or parity contradiction.
+pub fn check_hnr(b: &[u8]) -> Result<Vec<HnrRec>, Gate> {
+    if !crate::is_gen_attr(b) {
+        return Err(Gate(
+            "HNR: not a GenAttr file (TOC does not tile [0,elem))".into(),
+        ));
+    }
+    let gi = crate::read_gen_attr(b).map_err(|e| Gate(format!("HNR: {e}")))?;
+    let mut out = Vec::new();
+    for bi in 0..gi.blocks.len() {
+        let blk = gi
+            .decode_block(b, bi)
+            .map_err(|e| Gate(format!("HNR blk{bi}: decode: {e}")))?;
+        let st = |col: u32, flag: u32| -> Result<&crate::GenAttrStream, Gate> {
+            blk.streams
+                .iter()
+                .find(|s| s.col == col && s.flags == flag)
+                .ok_or_else(|| {
+                    Gate(format!(
+                        "HNR blk{bi}: missing column {col:#05x}/{flag:#06x}"
+                    ))
+                })
+        };
+        // enDecodeHnr object map (CONFIRMED 2026-09-26): +0x28 value VL = selector 0xc01 (u32
+        // per-record number), +0x260/+0x280 even/odd parity bits = 0xc09/0xc0a (per-record
+        // GROUP flags, independent of the number), +0x380 gate VL existence = 0xc11, owner
+        // street is implicit: enGetHnrIndices maps an element to [start, next start) records.
+        let ex = &st(0xc01, 0x4000)?.bits;
+        let starts = &st(0xc01, 0x8000)?.values;
+        let nums = &st(0xc01, 0)?.values;
+        let gate_bits = &st(0xc11, 0x4000)?.bits;
+        let ev = &st(0xc09, 0)?.bits;
+        let od = &st(0xc0a, 0)?.bits;
+        let gate_n = gate_bits.len().max(st(0xc11, 0)?.values.len());
+        if gate_n < nums.len() {
+            return Err(Gate(format!(
+                "HNR blk{bi}: gate 0xc11 covers {gate_n} < {} records",
+                nums.len()
+            )));
+        }
+        if ev.len() < nums.len() || od.len() < nums.len() {
+            return Err(Gate(format!(
+                "HNR blk{bi}: parity vectors shorter than records"
+            )));
+        }
+        let span = (gi.blocks[bi].elem_end - gi.blocks[bi].elem_start + 1) as usize; // INCLUSIVE
+        let existing: Vec<usize> = (0..span.min(ex.len())).filter(|&e| ex[e]).collect();
+        if starts.len() != existing.len() {
+            return Err(Gate(format!(
+                "HNR blk{bi}: {} starts for {} existing elements",
+                starts.len(),
+                existing.len()
+            )));
+        }
+        if existing.is_empty() != nums.is_empty() {
+            return Err(Gate(format!(
+                "HNR blk{bi}: records/elements existence mismatch"
+            )));
+        }
+        // record -> owner: the k-th existing element owns records [starts[k], starts[k+1]).
+        let owner_of = |rec: usize| -> Result<u32, Gate> {
+            for (k, lo) in starts.iter().enumerate() {
+                let hi = starts.get(k + 1).copied().unwrap_or(nums.len() as u32) as usize;
+                if rec < hi {
+                    if rec < *lo as usize {
+                        return Err(Gate(format!("HNR blk{bi}: record {rec} below starts")));
+                    }
+                    return Ok(gi.blocks[bi].elem_start + existing[k] as u32);
+                }
+            }
+            Err(Gate(format!("HNR blk{bi}: record {rec} past last start")))
+        };
+        for rec in 0..nums.len() {
+            out.push(HnrRec {
+                street: owner_of(rec)?,
+                number: nums[rec],
+                even: ev[rec],
+            });
+        }
+    }
+    Ok(out)
 }
