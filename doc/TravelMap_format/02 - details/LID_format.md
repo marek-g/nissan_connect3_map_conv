@@ -485,9 +485,15 @@ POL listID 2**, same 0x77 outer header, sub-header 268 B at file `+0x77`) via
 `bDetermineLDToNLFiles(rootName)` → `LISA_tclPSFBasExternalList{fileID, startOffset, cntElems}` and
 loads a **const list** (`LISA_tclPSFBasGlobalEntry` rows `{catID, control.subType∈{0x6000 NL,
 0x6100 FLI}, cntSubseqEntries = NL fileID ∈ (19999,30000)}`; cat3 additionally registers
-cat4=file+10000, cat5=file+20000; `bExistPAFile` → PA flag). [OPEN-CRITICAL] whether the const-list
-`startOffset/cntElems` address a region inside `LID20001` itself (then a regenerated list file must
-carry it byte-exact — our standalone rebuilds do not) or only inside LID50001 (then stock untouched).
+cat4=file+10000, cat5=file+20000; `bExistPAFile` → PA flag). **[SOLVED 2026-09-26k] the offsets are
+LID50001-internal:** `bReadGlobalHeader` `00be347c` reads the kind-4 file, takes the global-entry
+record from `LID50001`'s OWN file header (`vGetsGlobalEntry{startOffset,recLength}`) and clones that
+region as the const list; `bDetermineLDToNLFiles` `00c6436c` then re-reads `fileType 0x13` at
+`startOffset & 0xffff0000` with the fileID stored in the cloned block = **`LID50001` itself** — the
+`AsfEntryHeader` strings it matches (`coszGetCurrBegString` + per-entry completion strings, with
+NAR state-abbreviation stripping) all live inside `LID50001` (the 268 B sub-header is its const-list
+anchor). The regenerated `LID20001` is NOT referenced by this hard gate; shipping stock
+`LID50001` untouched keeps it healthy for 2b (path = typed global/LD country-name resolution).
 
 **Root cause #4 — empty city list (`[CONFIRMED 2026-09-25]`):** `vPopulateCityIndices` @`00c73b68`
 per candidate: (a) district-linked + `dist ≥ this+0x170`, (b) `enGetAllElementProperties`
@@ -500,6 +506,20 @@ these EMPTY ⇒ every candidate drops ⇒ empty list + empty position map ⇒ `b
 finds nothing.** The element lang set the index build filters on is NOT col-carried per element —
 it is the live file set (`s6`) minus per-edge invalid langs (`0x405`, empty in ours = permissive).
 Fix = the mode-C element payloads (writer `city.rs`), tracked in TODO 2026-09-25z.
+**Decided 2026-09-26k: ship WITHOUT mode-C columns** — V1's death is fully explained by region
+seeding keying (§11.7, 26h) without them, and every consumer is predicate-guarded (25bb); blind
+emission without card feedback adds corruption risk, so they stay empty unless the 2b card test
+shows wrong DISPLAY (not death). Related closures from the same pass: ZIP/POSTAL display =
+element-domain columns inside the replaced city file itself (empty in ours = no zip shown,
+permissive); `LID40001` city GenAttr decodes to `addr_number`/`addr_to_street` HNR-join streams
+joined by element ORDINAL — our 10 elements join the stock records of ordinals 0..9 (display-only
+wrongness on leaf address hops, non-fatal). `bSendListUpdate` `00c74fc8` `this+0xec` is a
+**skip-if-full threshold** (`return 1` when current UI list size ≥ it), NOT a generation gate —
+fresh opens (size 0) always process, so a 10-element list passes under any value; the raw constant
+stays [OPEN trivia]. Post-processing seen in that body (`vRemoveDuplicateEntries`,
+`vSortByConfidence`, `vDeleteObsoleteAddresses`, `vRemoveEntriesWithSameCellID`,
+`vFilterExtraEntries`, `vTestAmbiguity`) may additionally trim entries — first suspects if 2b's
+on-card count differs from the sim prediction.
 
 ### 10.5 `DB_CITY.DAT` / `GLOB_POI.DAT` (SQLite)
 
@@ -574,6 +594,16 @@ of streets (every `KRAKÓW, ULICA …` address row adds one; verified: `UL. GROM
 an LID feature. listID 8/12 = phone numbers/phone-book entries (POI cross-rel via `REL00004`).
 `lid2dump --sqlite` exposes all of this in tables `addr`/`region`/`city_prefixed` and view
 `v_city_street` (source column `rel` vs `addr`).
+**Device chain CONFIRMED (2026-09-26j):** `LISA_tclHnrProcessing::bSetUpStreetIndcesByHnr`
+`00be0b80` → `NLGenAttrProcessor::bSetUpResumingStreetIndices` `00ce7980` →
+`NLGenAttrHnrStreetIdxDetermination` (receives the **city NAME string** + candidate set, scans the
+street list's GenAttr blocks via `bProcBlocksForElemIndices`). Data side (full `lid2dump` of
+`LID20000`): prefix rows `"KRAKOW, "` = 4387 rows / 1163 distinct streets; all 10 test cities have
+782–8588 rows / 261–2341 streets after TPLID equivalent-char folding (Warszawa 2341). Consequence
+for replacement city files: the street layer is **name-keyed**, so a rebuilt `LID20001` whose labels
+match stock labels (any diacritic variant, folded) inherits the stock street set completely — V1's
+and 2b's street browse are identical and healthy; V1's empty city list was purely the region-seeding
+keying (§11.7). Simulator mirror: `device_sim::city_street_rows` (+ `fold_equivalent_chars`).
 
 ### 11.3 Block = 8-byte header + column-descriptor TOC + compressed columns (CONFIRMED)
 
@@ -708,8 +738,11 @@ happened EARLIER, at the file sub-header parse (block bodies are loaded lazily; 
   file carries; gazetteer `20000` → `B=C=D=E=0`.
 * `osm2lid` now emits the stock street shape (verified by a `LoadHeader` byte-simulator: stock files
   and our new files PASS, the pre-fix files REJECT at `code 0x00` sections).
-* **[EXACT LAYOUT + S9 SEMANTICS CONFIRMED 2026-09-25, DIS-level]** The subheader field stream at
-  `hdr+0`: `u16 elem_count`, `u16 flag(3)`, `u16 nb`, `u16 nrec`, `u16 nrel`, `u16 cnt5`, `u16 cnt6`,
+* **[EXACT LAYOUT + S9 SEMANTICS CONFIRMED 2026-09-25, DIS-level; elem-WIDTH FIXED 2026-09-27]** The
+  subheader field stream at `hdr+0`: **`u32 elem_count`** (NOT u16+flag — `GetAsfSubHeader@00e0e5d0`
+  returns the struct base at the elem u32 and `NLProcessor::bInitialise@00cee6e4` does `elem-1` on that
+  very u32; stock `LID20001` = 241269, a u16 read truncates to 44661), `u16 nb`, `u16 nrec`,
+  `u16 nrel`, `u16 cnt5`, `u16 cnt6`,
   `u16 shift(8)`, `u32 originX`, `u32 originY`, then 7×`{u8 code, u32 abs_off}` at `hdr+0x18`; the
   last stream window ends at `hdr+region_size` (the 0x10/0x14 container words double as `+0x70/+0x74`).
   Stream codes: the strict "consumed to window end" cursor check applies to codes `0x11..0x17` ONLY.
@@ -1196,7 +1229,22 @@ on `POL/LID40006`: **2 351 692 records over 288 391 streets decode + owner-walk 
   REL00006(9,2) — 100 % consistent. Observed: `REL file d0/d1 = (meta record to, from)` in all 6 files.
   `d0/d1` in the file sub-header are these `rIdxListID` list ids — the search-domain kinds
   (`TEMPLATE.XML` comments: 2=TOWN, 3=STREET, 4=JUNCTION, 5=HOUSENUMBER, 60=CITYDISTRICT, 61=POSTAL DISTRICT;
-  stock POL additionally uses POI-domain ids 9, 10, 12 and 129=`0x81` — the latter's domain is [OPEN]).
+  stock POL additionally uses ids 9, 10, 12 and 129=`0x81`). **Domain→file mapping CONFIRMED 2026-09-26h**
+  from the REL sub-headers (the pair of u16 counts at sub-header +0x8/+0xc = src/tgt element totals, which
+  equal the owning name-lists' own `elem` field): list 2=`LID20001` (towns, 44661), 3=`LID20006` (streets,
+  57367), 9=`LID20005` (**REGION name-list, 38 elements = 16 Polish voivodeships in 3 label variants**:
+  German `WOIWODSCHAFT …` 0–15, ASCII `WOJ. …` 16–24+, diacritic `WOJ. …` 25–37), 10=`LID20002` (714
+  districts/powiats), 12=`LID20004` (**phone-book/POI names**, 19176 — §11.2), 129=`LID20000` (the full
+  `CITY, STREET NUMBER` address list). So `REL00006` = **LID20005→LID20001 membership** (38 keys,
+  5409–86663 city targets each), `REL00003` = district→town, `REL00002` = city→POI (2→12: 596778 rows
+  / 26985 cities, but target ids span 0..412391 — the matrix indexes the **global POI id space**
+  (`GLOB_POI.DAT`), not `LID20004` ordinals; stock city ids 0–9 have no rows ⇒ city→POI browse was
+  empty for V1's fake cities and stays empty for 2b — a stock-only feature).
+  **`REL00001` sparsity fact (2026-09-26i):** querying it by target gives ~0–4
+  streets per city (stock `KRAKÓW` 208837 → exactly 1 row) — REL00001 is NOT the city→street-browse
+  source (that seeding still lives unresolved in the `vAddStreet`/`vGetOrigStreetElemIDs`/FLI layer);
+  `device_sim::check_city_streets` measures REL1-as-source behavior only (V1 shows 4 garbage streets
+  per fake city, districts REL0 = 0; set-2b self-pairs REL0 = 1 district = the city itself).
   A name-list file can also carry its related meta-relidx vector in its ASF sub-header (`RAM +0x64..+0x68`,
   `bGetListSpecRelIdxFromMetaDataRelIdx` `00cec9e8` maps meta idx ⇒ list-local idx).
   **City-family consequence (2026-09-25):** replacing `LID20001` with fewer elements requires shipping
@@ -1210,6 +1258,24 @@ on `POL/LID40006`: **2 351 692 records over 288 391 streets decode + owner-walk 
   (2↔3), so `osm2lid` writes exactly `REL00001.DAT` (street→city) with stock-faithful headers — any *additional*
   relation would require rewriting the META table (offset/count live at `+0x10/+0x14`; append-at-EOF relocation
   is safe since only the header anchors the table).
+- **Region-browse entry seeding (SOLVED 2026-09-26h — closes the V1 empty-list gap with facts):**
+  the city screen for a selected region performs **no string matching**.
+  `vCreateSearchStrListMapForMandateCats` `00c76300` walks the selected `ELocExtendLocDescriptor`
+  list (skipping cats 1/9/0x76) and injects the descriptor's **`corfoGetResumingElementIndices()`**
+  collection directly as a pre-made 100 %-match result (`LISA_tclStringSearchResult::vAddMatches(1,
+  idxColl)`); `vAdd100PercentMatches` `00c71cb4` turns every exact match into a `LISA_tclAddressCity`
+  via `poAddNewAddress` `00c88c1c`; `vPopulateCityIndices` `00c73b68` lists each entry's element id
+  (gated per-entry by `bGoToElemet` `00cef570`); zero valid entries ⇒ `bSendListUpdate` `00c74fc8`
+  returns 0 ⇒ the UI request aborts = empty city list + dead keyboard — the exact V1 symptom. The
+  descriptor's `ResumingElementIndices` are the **REL00006 rows of the chosen `LID20005` region
+  element**: stock REL6 targets are stock city ids, so V1 (our file + stock REL6) listed **0** under
+  every voivodeship selection except the German macro keys 9/23 (whose 86663 targets happen to
+  include ids 0–9). Reproduced in `device_sim::check_region_browse`: keys {25,26,27} → stock 16931
+  listed, V1 0, set-2b {0,2,5}; all 38 keys → stock 241269, V1 10, 2b 10. Card-state dependence
+  (which region element the UI seeds) explains why offline prediction of "2b shows all 10" is only
+  valid for the full-country seeding path. Rule for replacement files: regional browse works **only**
+  if `REL00006` is shipped with `LID20005` keys targeting the NEW city ids — which
+  `city::build_city_relations` already does (stock membership inherited per city).
 - **Writer implemented** in `src/lid_format/src/rel.rs` (`write_rel` + reader model `RelIndex::parse` /
   `get_relations` / `bands_per_group`; `REL_BAND = 512` elems, target `REL_CELL_BANDS = 32` band-groups,
   writer replicates the device `bpr/bpc` derivation so tables agree; empty matrix cells still get a real tile

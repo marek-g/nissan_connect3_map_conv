@@ -481,37 +481,45 @@ pub fn build_city_relations(
 }
 
 // two-pass container: region1 + sub-header + section table + streams + blocks + record blob
+/// City-list container = shared `crate::nlfile` builder + the stock city-list extras:
+/// sec4/5/6 streams (REL ids, file categories, 29 language ids) copied verbatim from the
+/// stock POL file, and the 35-byte per-(block,relation) records whose partner counts and
+/// tail come from stock block 0 (the self-relation partner is re-pointed to `elem_count`).
 fn build_city_container(elem_count: u32, blocks: &[Vec<u8>], stock: &[u8], hdr: usize) -> Vec<u8> {
-    let nb = blocks.len();
-    let sec4 = stock[1393..1397].to_vec();
-    let sec5 = stock[1397..1400].to_vec();
-    let sec6 = stock[1400..1428].to_vec();
-    let sec0: Vec<u8> = blocks
-        .iter()
-        .flat_map(|b| vle_encode(b.len() as u32))
-        .collect();
-    let sec1_len = 4 * nb;
+    // stock sec4/5/6: raw stream bytes + declared counts + codes (subheader table spans).
+    // sec6's span ends at hdr+reg (reg = stream region size, main header u32 @0x14).
+    let blob_end = hdr + u32::from_le_bytes(stock[0x14..0x18].try_into().unwrap()) as usize;
+    let tbl = hdr + 24;
+    let sec_off = |i: usize| {
+        u32::from_le_bytes(stock[tbl + i * 5 + 1..tbl + i * 5 + 5].try_into().unwrap()) as usize
+    };
+    let sec_code = |i: usize| stock[tbl + i * 5];
+    let ends = [sec_off(4), sec_off(5), sec_off(6), blob_end];
+    let cnt = |o: usize| u16::from_le_bytes(stock[hdr + o..hdr + o + 2].try_into().unwrap());
+    let sec_stream = |i: usize| crate::nlfile::SecStream {
+        code: sec_code(i + 4),
+        count: cnt(8 + i * 2),
+        bytes: stock[ends[i]..ends[i + 1]].to_vec(),
+    };
 
-    // relation records (sec2/sec3): the stock name-list header promises nrel relations; each
-    // block carries one 35-byte record per relation: [u32 size][u32 partner elem count]
-    // [u32 block edge count][u32 35 x3][u32 0 x2][3-byte tail]. Stock device code iterates
-    // nrel per block; a header promising relations with zero records was the top suspect for
-    // the 2026-09-25 10-city card reset. Partner counts + tail are lifted from the stock
+    // relation records: the stock name-list header promises nrel relations; each block carries
+    // one 35-byte record per relation: [u32 size][u32 partner elem count][u32 edge count]
+    // [u32 35 x3][u32 0 x2][3-byte tail]. Partner counts + tail are lifted from the stock
     // file's own block-0 records so the list stays consistent with the stock REL*.DAT files.
     let nrec_stock = u16::from_le_bytes(stock[hdr + 6..hdr + 8].try_into().unwrap()) as usize;
     let nrel = u16::from_le_bytes(stock[hdr + 8..hdr + 10].try_into().unwrap()) as usize;
     assert_eq!(nrec_stock, 45 * nrel, "unexpected stock record count");
-    let sec3_off = u32::from_le_bytes(
-        stock[hdr + 24 + 3 * 5 + 1..hdr + 24 + 3 * 5 + 5]
-            .try_into()
-            .unwrap(),
-    ) as usize;
+    let sec3_off = sec_off(3);
     let rec0 = u32::from_le_bytes(stock[sec3_off..sec3_off + 4].try_into().unwrap()) as usize;
     let rec_stride =
         u32::from_le_bytes(stock[sec3_off + 4..sec3_off + 8].try_into().unwrap()) as usize - rec0;
-    assert_eq!(rec_stride, 35, "unexpected stock record size");
-    let mut partners = Vec::with_capacity(nrel);
+    assert_eq!(
+        rec_stride,
+        crate::nlfile::REL_RECORD_LEN,
+        "unexpected stock record size"
+    );
     let stock_elems = u32::from_le_bytes(stock[hdr..hdr + 4].try_into().unwrap());
+    let mut partners = Vec::with_capacity(nrel);
     for r in 0..nrel {
         let f1 = u32::from_le_bytes(
             stock[rec0 + r * rec_stride + 4..rec0 + r * rec_stride + 8]
@@ -521,109 +529,34 @@ fn build_city_container(elem_count: u32, blocks: &[Vec<u8>], stock: &[u8], hdr: 
         // the self-relation record names OUR own element count as partner, not the stock's.
         partners.push(if f1 == stock_elems { elem_count } else { f1 });
     }
-    let rec_tail = stock[rec0 + 32..rec0 + 35].to_vec();
-    let nrec = nrel * nb;
-    let mut sec2: Vec<u8> = Vec::new();
-    let mut rec_blob: Vec<u8> = Vec::new();
-    for b in blocks.iter() {
-        let nc = u16::from_le_bytes(b[0..2].try_into().unwrap()) as usize;
-        let roots = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
-        let sum_od = (nc - roots) as u32;
-        for &p in partners.iter() {
-            sec2.extend_from_slice(&vle_encode(35));
-            rec_blob.extend_from_slice(&u32b(35));
-            rec_blob.extend_from_slice(&u32b(p));
-            rec_blob.extend_from_slice(&u32b(sum_od));
-            rec_blob.extend_from_slice(&u32b(35));
-            rec_blob.extend_from_slice(&u32b(35));
-            rec_blob.extend_from_slice(&u32b(35));
-            rec_blob.extend_from_slice(&u32b(0));
-            rec_blob.extend_from_slice(&u32b(0));
-            rec_blob.extend_from_slice(&rec_tail);
-        }
-    }
-    let sec3_len = 4 * nrec;
+    let mut tail = [0u8; 3];
+    tail.copy_from_slice(&stock[rec0 + 32..rec0 + 35]);
 
-    let tbl_at = hdr + 24;
-    let base = tbl_at + 35;
-    let layout = [
-        sec0.len(),
-        sec1_len,
-        sec2.len(),
-        sec3_len,
-        sec4.len(),
-        sec5.len(),
-        sec6.len(),
-    ];
-    let mut o = base;
-    let offs_sec: Vec<usize> = layout
-        .iter()
-        .map(|l| {
-            let c = o;
-            o += l;
-            c
-        })
-        .collect();
-    let streams_end = o;
-    let block_abs = streams_end;
-    let blob_abs = block_abs + blocks.iter().map(|b| b.len()).sum::<usize>();
-
-    let mut s: Vec<u8> = Vec::with_capacity(blob_abs + rec_blob.len());
-    s.extend_from_slice(&u16b(0x0402));
-    s.extend_from_slice(&u16b(2)); // listID = 2 (city list; drives the UI category filter)
-    s.extend_from_slice(&u16b(0));
-    s.extend_from_slice(&u16b(0x41ec));
-    s.extend_from_slice(&u32b(0));
-    s.extend_from_slice(&u32b(1));
-    s.extend_from_slice(&u32b(hdr as u32));
-    s.extend_from_slice(&u32b(0)); // header size: patched below
-    s.extend_from_slice(&u16b(38));
-    s.extend_from_slice(&u16b(84));
-    s.extend_from_slice(&u16b(95));
-    s.extend_from_slice(&u16b(96));
-    s.extend_from_slice(&u16b(13));
-    s.extend_from_slice(&u16b(2));
-    s.extend_from_slice(&u16b(118));
-    s.extend_from_slice(&stock[38..hdr]);
-    assert_eq!(s.len(), hdr);
-    s.extend_from_slice(&u32b(elem_count));
-    s.extend_from_slice(&u16b(nb as u16));
-    s.extend_from_slice(&u16b(nrec as u16)); // nrec: one record per (block, relation)
-    s.extend_from_slice(&u16b(4));
-    s.extend_from_slice(&u16b(3));
-    s.extend_from_slice(&u16b(29));
-    s.extend_from_slice(&u16b(CITY_POS_SHIFT));
-    s.extend_from_slice(&stock[hdr + 16..hdr + 24]); // file-spec constants / position origin
-    assert_eq!(s.len(), tbl_at);
-    let codes: [u8; 7] = [0x14, 0x11, 0x14, 0x11, 0x14, 0x14, 0x18];
-    for (i, c) in codes.iter().enumerate() {
-        s.push(*c);
-        s.extend_from_slice(&u32b(offs_sec[i] as u32));
+    let spec = crate::nlfile::NameListSpec {
+        region: 0x0402,
+        list_id: 2, // city list; drives the UI category filter
+        elem_count,
+        shift: CITY_POS_SHIFT,
+        origin: (
+            i32::from_le_bytes(stock[hdr + 16..hdr + 20].try_into().unwrap()),
+            i32::from_le_bytes(stock[hdr + 20..hdr + 24].try_into().unwrap()),
+        ),
+        blocks: blocks.to_vec(),
+        sec4: sec_stream(0),
+        sec5: sec_stream(1),
+        sec6: sec_stream(2),
+        records: Some(crate::nlfile::RelRecords { partners, tail }),
+        // city block header words: node count @0, roots @2 (device block template §12).
+        block_edges: &|b: &[u8]| {
+            let nc = u16::from_le_bytes(b[0..2].try_into().unwrap()) as u32;
+            let roots = u16::from_le_bytes(b[2..4].try_into().unwrap()) as u32;
+            nc - roots
+        },
+    };
+    match crate::nlfile::build_name_list(&spec) {
+        Ok(f) => f,
+        Err(e) => panic!("build_city_file produced an un-loadable file: {e}"),
     }
-    assert_eq!(s.len(), base);
-    s.resize(streams_end, 0);
-    s[offs_sec[0]..][..sec0.len()].copy_from_slice(&sec0);
-    s[offs_sec[2]..][..sec2.len()].copy_from_slice(&sec2);
-    let mut roff = blob_abs;
-    for i in 0..nrec {
-        s[offs_sec[3] + 4 * i..offs_sec[3] + 4 * i + 4].copy_from_slice(&u32b(roff as u32));
-        roff += 35;
-    }
-    let mut boff = block_abs;
-    for (i, blk) in blocks.iter().enumerate() {
-        s[offs_sec[1] + 4 * i..offs_sec[1] + 4 * i + 4].copy_from_slice(&u32b(boff as u32));
-        boff += blk.len();
-    }
-    s[offs_sec[4]..][..sec4.len()].copy_from_slice(&sec4);
-    s[offs_sec[5]..][..sec5.len()].copy_from_slice(&sec5);
-    s[offs_sec[6]..][..sec6.len()].copy_from_slice(&sec6);
-    for blk in blocks.iter() {
-        s.extend_from_slice(blk);
-    }
-    s.extend_from_slice(&rec_blob);
-    assert_eq!(s.len(), blob_abs + rec_blob.len());
-    s[20..24].copy_from_slice(&u32b((streams_end - hdr) as u32));
-    s
 }
 
 /// Self-check via the crate reader: names, order and absolute positions must round-trip.

@@ -15,6 +15,7 @@
 pub mod city;
 pub mod device_sim;
 pub mod header;
+pub mod nlfile;
 pub mod pa;
 mod rebuild;
 pub mod rel;
@@ -2030,10 +2031,8 @@ pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
         (-1, -1)
     };
 
-    // --- file sub-header exactly as `NLNameList::LoadHeader` (00e0e63c) demands (§11.4c): u32
-    //     element_count, six u16 section counts (A=blocks, D=REL-list ids carried, E=language ids),
-    //     F=8, the file origin pair, then 7 {code, offset} section entries whose streams MUST each
-    //     consume their span EXACTLY (the device cursor-checks every one). Stock street shape:
+    // --- file container: shared builder (crate::nlfile), see §11.4c; the sub-header counts/streams
+    //     MUST cross-check (exact count + exact span per stream, device rule). Stock street shape:
     //     sec0=VLE block sizes, sec1=raw block offsets, sec2..4 empty, sec5=VLE [list_id], sec6=VLE [39].
     let linked = list_id == 3; // street lists mirror stock LID20006 (REL id + POL language vector)
     let (d_ids, e_ids): (Vec<u32>, Vec<u32>) = if linked {
@@ -2041,65 +2040,32 @@ pub fn encode_id(region: u16, list_id: u16, entries: &[NameEntry]) -> Vec<u8> {
     } else {
         (vec![], vec![])
     };
-    let mut sec0: Vec<u8> = Vec::new();
-    for (blk, _) in &blocks {
-        sec0.extend_from_slice(&vle_encode(blk.len() as u32));
+    let spec = crate::nlfile::NameListSpec {
+        region,
+        list_id,
+        elem_count: total_elem as u32,
+        shift: 8,
+        origin: corner,
+        blocks: blocks.into_iter().map(|(b, _)| b).collect(),
+        sec4: crate::nlfile::SecStream::empty(0x11),
+        sec5: crate::nlfile::SecStream {
+            code: 0x14,
+            count: d_ids.len() as u16,
+            bytes: d_ids.iter().flat_map(|v| vle_encode(*v)).collect(),
+        },
+        sec6: crate::nlfile::SecStream {
+            code: 0x14,
+            count: e_ids.len() as u16,
+            bytes: e_ids.iter().flat_map(|v| vle_encode(*v)).collect(),
+        },
+        records: None,
+        block_edges: &|_| 0,
+    };
+    match crate::nlfile::build_name_list(&spec) {
+        Ok(f) => f,
+        // Unreachable for correct specs; a violation here is a generator bug, not a data error.
+        Err(e) => panic!("encode_id produced an un-loadable file: {e}"),
     }
-    let mut sec5: Vec<u8> = Vec::new();
-    for v in &d_ids {
-        sec5.extend_from_slice(&vle_encode(*v));
-    }
-    let mut sec6: Vec<u8> = Vec::new();
-    for v in &e_ids {
-        sec6.extend_from_slice(&vle_encode(*v));
-    }
-
-    let hdr = crate::header::NL_HEADER_LEN as u32;
-    let sec1_len = (blocks.len() * 4) as u32;
-    let extra: u32 = 59 + sec0.len() as u32 + sec1_len + sec5.len() as u32 + sec6.len() as u32;
-    let mut f = crate::header::nl_header(crate::header::KIND_NAME_LIST, region, list_id, extra);
-    let mut sh: Vec<u8> = Vec::new();
-    sh = put_u32(sh, total_elem as u32); // element_count (global)
-    sh = put_u16(sh, blocks.len() as u16); // A
-    sh = put_u16(sh, 0); // B
-    sh = put_u16(sh, 0); // C
-    sh = put_u16(sh, d_ids.len() as u16); // D
-    sh = put_u16(sh, e_ids.len() as u16); // E
-    sh = put_u16(sh, 8); // F (constant on stock)
-    sh = put_u32(sh, corner.0 as u32);
-    sh = put_u32(sh, corner.1 as u32); // file-level tNLHPosition (PAU)
-    let base = hdr + 59;
-    let o1 = base + sec0.len() as u32;
-    let o5 = o1 + sec1_len;
-    let o6 = o5 + sec5.len() as u32;
-    for (code, off) in [
-        (0x14u8, base),
-        (0x11, o1),
-        (0x11, o5),
-        (0x11, o5),
-        (0x11, o5),
-        (0x14, o5),
-        (0x14, o6),
-    ] {
-        sh.push(code);
-        sh = put_u32(sh, off);
-    }
-    assert_eq!(sh.len(), 59);
-    f.extend_from_slice(&sh);
-    f.extend_from_slice(&sec0);
-    let blocks_abs0 = hdr + extra;
-    let mut p = blocks_abs0;
-    for (blk, _) in &blocks {
-        f = put_u32(f, p); // sec1: ABSOLUTE block offsets (stock convention)
-        p += blk.len() as u32;
-    }
-    f.extend_from_slice(&sec5);
-    f.extend_from_slice(&sec6);
-    assert_eq!(f.len(), blocks_abs0 as usize);
-    for (blk, _) in &blocks {
-        f.extend_from_slice(blk);
-    }
-    f
 }
 
 /// Group entries by city (first-seen order) and chunk each city under `MAX_NODES_PER_BLOCK`.

@@ -148,3 +148,24 @@ fn city_list_simulator_lists_all_new_cities() {
     assert_eq!(r.list, (0..cs.len() as u32).collect::<Vec<u32>>());
     assert!(r.dropped.is_empty(), "dropped: {:?}", r.dropped);
 }
+
+/// Root region browse (2026-09-26f): the device searches the CURRENT REGION NAME (CONNECT
+/// mandate string, e.g. POLSKA) inside the city name list itself and enters via that element's
+/// REL00000 rows. A replacement city file WITHOUT the region-name element cannot open the
+/// city screen at all (request aborts -> empty list + dead keyboard, the V1 card symptom).
+#[test]
+fn root_region_browse_requires_region_name_element() {
+    use lid_format::device_sim::{blob_has_name, check_root_region_browse};
+    let ours = build_city_file(&cities10(), &stock("LID20001.DAT"));
+    assert!(
+        !blob_has_name(&ours, b"POLSKA"),
+        "generator must not silently grow region-name elements"
+    );
+    assert!(
+        blob_has_name(&stock("LID20001.DAT"), b"POLSKA"),
+        "stock city file carries the region-name elements"
+    );
+    let cl = check_root_region_browse(&ours, &[], None).expect("aborted browse");
+    assert!(cl.list.is_empty() && cl.keys == 0);
+    assert!(!cl.danger.is_empty(), "aborted browse must be flagged");
+}

@@ -341,14 +341,17 @@ fn u16le(b: &[u8], o: usize) -> u16 {
 }
 
 /// Decoded name-list subheader (file kind 0x13/0x14/0x15), as `NLNameList::LoadHeader`
-/// 00e0e63c reads it (verified layout, 2026-09-25):
-/// `+0 elem_count, +2 flag, +4 nb, +6 nrec, +8 nrel, +0x0a cnt5, +0x0c cnt6,
-///  +0x0e shift, +0x10/0x14 origin, +0x18 7x{u8 codec, u32 file offset}`.
+/// 00e0e63c reads it (verified layout, 2026-09-27):
+/// `+0 elem_count u32, +4 nb, +6 nrec, +8 nrel, +0x0a cnt5, +0x0c cnt6, +0x0e shift,
+///  +0x10/0x14 origin, +0x18 7x{u8 codec, u32 file offset}`.
+/// elem_count is a u32 at sub +0 (the device's `GetAsfSubHeader` = struct base, and
+/// `NLProcessor::bInitialise` does `elem_count - 1` on this very u32). Stock LID20001
+/// stores 241269 here: reading it as u16 silently truncates to 44661.
 #[derive(Debug, Clone)]
 pub struct NlHeader {
     pub hdr: usize,
     pub blob_end: usize,
-    pub elem: u16,
+    pub elem: u32,
     pub nb: u16,
     pub nrec: u16,
     pub nrel: u16,
@@ -381,7 +384,8 @@ pub fn check_name_list_header(name: &str, b: &[u8]) -> Result<NlHeader, Gate> {
     }
     let h = hdr;
     let hd = |o: usize| u16le(b, h + o) as usize;
-    let (elem, nb, nrec, nrel) = (u16le(b, h), hd(4) as u16, hd(6) as u16, hd(8) as u16);
+    let elem = u32le(b, h); // device: u32 at sub+0 (struct base of GetAsfSubHeader)
+    let (nb, nrec, nrel) = (hd(4) as u16, hd(6) as u16, hd(8) as u16);
     let (cnt5, cnt6, shift) = (hd(0x0a), hd(0x0c), u16le(b, h + 0x0e));
     let origin = (u32le(b, h + 0x10) as i32, u32le(b, h + 0x14) as i32);
     let mut desc = [(0u8, 0usize); 7];
@@ -389,6 +393,14 @@ pub fn check_name_list_header(name: &str, b: &[u8]) -> Result<NlHeader, Gate> {
         desc[i] = (b[h + 0x18 + i * 5], u32le(b, h + 0x19 + i * 5) as usize);
     }
     for i in 0..7 {
+        // `NLStandardDecoder::Decode` dispatches on 0x11..=0x18; any other code (incl. the
+        // absent-section marker 0) fails the decode and LoadHeader returns 0.
+        if !(0x11..=0x18).contains(&desc[i].0) {
+            return Gate::fail(format!(
+                "{name}: LoadHeader: stream {} codec {:#04x} not in NLStandardDecoder alphabet",
+                i, desc[i].0
+            ));
+        }
         if desc[i].1 > blob_end || (i + 1 < 7 && desc[i + 1].1 < desc[i].1) {
             return Gate::fail(format!(
                 "{name}: LoadHeader: stream {} window {}..{} invalid (blob_end {blob_end})",
@@ -540,10 +552,13 @@ fn overrun(b: &[u8], base: usize, d: Desc) -> bool {
 /// streams are read past the container buffer (heap-read on the device).
 pub struct BlockLoad {
     pub ne: u16,
+    pub degs: Vec<u32>, // col 0x401, children per node (BFS node order, root = slot 0's children)
+    pub claims: Vec<u32>, // col 0x406, element-subtree counts per node (edge order)
+    pub link_bits: Vec<bool>, // col 0x4402, block-link per node
     pub root_edges: Vec<(String, u32)>, // root node edge labels + interval end
-    pub letters: String,                // chars bGetNextValidCharacters would offer at root
-    pub valid_dest_popcount: usize,     // bits in col 0x40d (bIsEntryValidDestination)
-    pub valid_bits: Vec<bool>,          // full 0x40d column (element-indexed)
+    pub letters: String, // chars bGetNextValidCharacters would offer at root
+    pub valid_dest_popcount: usize, // bits in col 0x40d (bIsEntryValidDestination)
+    pub valid_bits: Vec<bool>, // full 0x40d column (element-indexed)
     pub danger: Vec<String>,
 }
 
@@ -565,11 +580,15 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
     );
     let _ = roots;
     let toc = base + 8;
-    let mut rows = Vec::with_capacity(ndesc);
-    for i in 0..ndesc {
+    // Device reads ndesc+1 rows: the last one is a real row (stock ships a tag-0 sentinel;
+    // files without one get a "row" parsed from the stream-table bytes, tag -> unknown,
+    // ignored by enSetListDescriptions).  Only the window of the FINAL row is computed
+    // from the 4 bytes past the last TOC row (stream-table data by design).
+    let mut rows = Vec::with_capacity(ndesc + 1);
+    for i in 0..=ndesc {
         let o = toc + i * 12;
         if o + 12 > b.len() {
-            return f("TOC outside file".into());
+            break;
         }
         rows.push(TocRow {
             tag: u16le(b, o),
@@ -582,8 +601,8 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
         if i + 1 < rows.len() {
             rows[i + 1].start.wrapping_sub(rows[i].start)
         } else {
-            // device reads the next row's start field 8 bytes past the last TOC row
-            let p = toc + ndesc * 12 + 8;
+            // device reads the next row's start field 8 bytes past the last parsed TOC row
+            let p = toc + rows.len() * 12 + 8;
             let garbage = if p + 4 <= b.len() {
                 u32le(b, p)
             } else {
@@ -878,12 +897,115 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
     }
     Ok(BlockLoad {
         ne: ne as u16,
+        degs,
+        claims,
+        link_bits,
         root_edges,
         letters,
         valid_dest_popcount: pc_40d,
         valid_bits: bits_40d,
         danger,
     })
+}
+
+/// Raw TOC rows of a block: `(tag, code, start, count)` per descriptor (the +1 sentinel row
+/// the device reads is included when present).
+pub fn block_toc(b: &[u8], h: &NlHeader, bi: usize) -> Vec<(u16, u16, u32, u32)> {
+    let base = if bi == 0 {
+        h.blob_end
+    } else {
+        h.streams[1][bi] as usize
+    };
+    let ndesc = u16le(b, base + 6) as usize;
+    let toc = base + 8;
+    (0..ndesc)
+        .map(|i| toc + i * 12)
+        .take_while(|&o| o + 12 <= b.len())
+        .map(|o| {
+            (
+                u16le(b, o),
+                u16le(b, o + 2),
+                u32le(b, o + 4),
+                u32le(b, o + 8),
+            )
+        })
+        .collect()
+}
+
+/// Faithful UI-walk replica of one block's input-step machinery, verified 2026-09-26 against
+/// `bAddNewInputStep` `00cf7130` (+ `enGetEdgeTargetNode` `00cdbd8c`,
+/// `enGetEdgeNoOfElements` `00cf6240`, `bSetSelectedEdge` `00cf69d0`):
+/// child edges of node n occupy `[cs[n], cs[n]+degs[n])` with `cs` = prefix sum of `degs`
+/// (col 0x401, file node order, root = node 0, target(edge e) = e+1); the device assigns every
+/// step edge its `NLInterval` by CUMULATIVE SUM of the claims column (0x406) starting at the
+/// parent interval start; a node terminates `claims[e] - sum(child claims)` elements directly
+/// (trie prefix elements; stock ships many, our generator emits 0); keyboard letters come from
+/// edges with `claims > 0` and a non-empty label (empty labels bump a hidden step counter at
+/// `+0x14` and are never offered); TEI elements = direct-claim nodes without block link.
+pub struct UiWalk {
+    pub domain: usize, // sum of root-child claims = element-id interval domain of the block
+    pub letters: String, // chars bGetNextValidCharacters offers at root
+    pub elements: usize, // TEI: nodes with direct claims and no block link
+    pub tei_entries: usize, // sum of direct claims over TEI nodes
+    pub over: usize,   // child claims exceed parent claims (tolerated; stock: many)
+}
+
+pub fn walk_ui(bl: &BlockLoad) -> UiWalk {
+    let mut cs: Vec<usize> = Vec::with_capacity(bl.degs.len());
+    let mut cur = 0usize;
+    for &d in bl.degs.iter() {
+        cs.push(cur);
+        cur += d as usize;
+    }
+    let claim = |v: usize| -> usize {
+        if v == 0 {
+            bl.claims[..bl.degs[0] as usize]
+                .iter()
+                .map(|&x| x as usize)
+                .sum()
+        } else if v - 1 < bl.claims.len() {
+            bl.claims[v - 1] as usize
+        } else {
+            0
+        }
+    };
+    let mut w = UiWalk {
+        domain: claim(0),
+        letters: String::new(),
+        elements: 0,
+        tei_entries: 0,
+        over: 0,
+    };
+    for v in 1..bl.degs.len() {
+        let d = bl.degs[v] as usize;
+        let csum: usize = if cs[v] + d <= bl.claims.len() {
+            bl.claims[cs[v]..cs[v] + d]
+                .iter()
+                .map(|&x| x as usize)
+                .sum()
+        } else {
+            0
+        };
+        let cl = claim(v);
+        if cl > csum {
+            if !bl.link_bits.get(v - 1).copied().unwrap_or(false) {
+                w.elements += 1;
+                w.tei_entries += cl - csum;
+            }
+        } else if cl < csum {
+            w.over += 1;
+        }
+    }
+    for (e, (lab, _)) in bl.root_edges.iter().enumerate() {
+        if bl.claims[e] > 0 && !lab.is_empty() {
+            if let Some(c) = lab.chars().next() {
+                if !w.letters.contains(c) {
+                    w.letters.push(c);
+                }
+            }
+        }
+    }
+    w
 }
 
 /// Replica of `LISA_tclAddressSearch::vPopulateCityIndices` `00c73b68` candidate collection +
@@ -954,6 +1076,338 @@ pub fn check_city_list(
         ne,
         keys: nkeys,
         candidates,
+        list,
+        dropped,
+        danger,
+    })
+}
+
+/// Faithful 2026-09-26e replica of the device city browser: candidates are the REGION ENTRY
+/// city element ids carried by the RSI entries (`vPopulateCityIndices` `00c73b68` first loop:
+/// `vtbl+0x20` per `param_1+0x2cc` entry; the entries are seeded from the region/CONNECT DB,
+/// i.e. STOCK city ids while stock region metadata is on the card), kept only when some REL
+/// file has at least one row keyed by that city (`bUpdateRange` `00c8c23c`), then
+/// `bGoToElemet` (id must exist in the name list). `bIsEntryValidDestination` is only STORED
+/// in `NLElementProperties` (`enGetAllElementProperties` `00cecbdc` writes `props[0]`; the city
+/// loop never tests it) - it gates the street/HNR screens, not the city list.
+pub fn check_city_list_entries(
+    lid: &[u8],
+    rels: &[(u16, &[u8], bool)],
+    entries: &[u32],
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("city.lid", lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    let mut danger = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+        danger.extend(bl.danger);
+    }
+    let ne = valid.len();
+    let mut keyed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for (id, bytes, bys) in rels {
+        let idx = RelIndex::parse(bytes).map_err(|e| Gate(format!("REL{id:05}: parse: {e}")))?;
+        let (lo, hi) = if *bys {
+            (0u32, idx.d[2])
+        } else {
+            (0u32, idx.d[3])
+        };
+        let rows = get_relations(bytes, &idx, *bys, lo, hi)
+            .map_err(|e| Gate(format!("REL{id:05}: query: {e}")))?;
+        for (k, _) in rows {
+            keyed.insert(k);
+        }
+    }
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    let mut candidates = 0;
+    for &e in entries {
+        if !keyed.contains(&e) {
+            continue;
+        }
+        candidates += 1;
+        if (e as usize) >= ne {
+            dropped.push((e, "bGoToElement"));
+        } else {
+            list.push(e);
+        }
+    }
+    let keys = keyed.len();
+    Ok(CityList {
+        ne,
+        keys,
+        candidates,
+        list,
+        dropped,
+        danger,
+    })
+}
+
+/// Faithful REGION browse (CONFIRMED 2026-09-26h): selecting a region element (LID20005 - the
+/// 38-entry voivodeship name list, German + ASCII + diacritic variants) seeds the descriptor's
+/// `ResumingElementIndices` from REL00006 (src = LID20005 element id, d2=38; tgt = LID20001
+/// city ids). `vCreateSearchStrListMapForMandateCats` injects those ids as pre-made 100%-match
+/// results -> `vAdd100PercentMatches` -> RSI AddressCity entries -> `vPopulateCityIndices`
+/// gates them through `bGoToElemet`. `region_elems` = the LID20005 ids the UI actually seeds
+/// (province selection vs country-wide set are DIFFERENT key sets - card-state dependent).
+pub fn check_region_browse(
+    lid: &[u8],
+    rel6: &[u8],
+    region_elems: &[u32],
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("city.lid", lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    let mut danger = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+        danger.extend(bl.danger);
+    }
+    let _ = valid;
+    let ne = valid.len();
+    let idx = RelIndex::parse(rel6).map_err(|e| Gate(format!("REL00006: parse: {e}")))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for &r in region_elems {
+        let rows = get_relations(rel6, &idx, true, r, r + 1)
+            .map_err(|e| Gate(format!("REL00006: query {r}: {e}")))?;
+        for (_, t) in rows {
+            seen.insert(t);
+        }
+    }
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    let keys = seen.len();
+    for &t in &seen {
+        if (t as usize) >= ne {
+            dropped.push((t, "bGoToElement"));
+        } else {
+            list.push(t);
+        }
+    }
+    Ok(CityList {
+        ne,
+        keys,
+        candidates: keys,
+        list,
+        dropped,
+        danger,
+    })
+}
+
+/// Faithful CITY -> STREET browse (2026-09-26i): selecting a city seeds its street list from
+/// REL00001 queried by TARGET (d0/d1=(3,2): bFindRelation reverse-match, access type 2).
+/// Street ids live in LID20006 (never replaced by our trials - stock stays valid), so the
+/// `bGoToElemet` gate only fails for ids beyond the street file's element total. V1 preview:
+/// stock REL1 keyed by our city ids returns the streets of whatever stock element happened
+/// to occupy that id - garbage but technically navigable.
+pub fn check_city_streets(
+    street_lid: &[u8],
+    rel1: &[u8],
+    city_elem: u32,
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("street.lid", street_lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("street.lid", street_lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+    }
+    let ne = valid.iter().filter(|v| **v).count();
+    let idx = RelIndex::parse(rel1).map_err(|e| Gate(format!("REL00001: parse: {e}")))?;
+    let rows = get_relations(rel1, &idx, false, city_elem, city_elem + 1)
+        .map_err(|e| Gate(format!("REL00001: query {city_elem}: {e}")))?;
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    for (s, t) in rows {
+        let _ = t;
+        if (s as usize) >= valid.len() || !valid[s as usize] {
+            dropped.push((s, "bGoToElement"));
+        } else {
+            list.push(s);
+        }
+    }
+    Ok(CityList {
+        ne,
+        keys: 1,
+        candidates: list.len() + dropped.len(),
+        list,
+        dropped,
+        danger: Vec::new(),
+    })
+}
+
+/// Faithful CITY -> URBAN-PART/district browse (2026-09-26i): REL00000 (2<->2) queried by SOURCE
+/// yields the city's FLI/resuming partners; same file, gated by block valid bits + bGoToElemet.
+pub fn check_city_districts(
+    city_lid: &[u8],
+    rel0: &[u8],
+    city_elem: u32,
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("city.lid", city_lid)?;
+    let mut valid: Vec<bool> = Vec::new();
+    let mut danger = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", city_lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+        danger.extend(bl.danger);
+    }
+    let ne = valid.len();
+    let idx = RelIndex::parse(rel0).map_err(|e| Gate(format!("REL00000: parse: {e}")))?;
+    let rows = get_relations(rel0, &idx, true, city_elem, city_elem + 1)
+        .map_err(|e| Gate(format!("REL00000: query {city_elem}: {e}")))?;
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    for (_, t) in rows {
+        if (t as usize) >= ne || !valid[t as usize] {
+            dropped.push((t, "bGoToElement"));
+        } else {
+            list.push(t);
+        }
+    }
+    Ok(CityList {
+        ne,
+        keys: 1,
+        candidates: list.len() + dropped.len(),
+        list,
+        dropped,
+        danger,
+    })
+}
+
+/// Faithful city->street seeding preview (CONFIRMED 2026-09-26j): the card derives a city's
+/// street set from the listID-129 address file `LID20000` (`bSetUpStreetIndcesByHnr`
+/// `00be0b80` -> `NLGenAttrProcessor::bSetUpResumingStreetIndices` `00ce7980`, note its `const
+/// String&` = CITY NAME parameter: matching is by NAME, not by element id!). Address entries
+/// are encoded `"CITY, STREET NUMBER"`; every row with the selected city's name as prefix
+/// contributes its street component. Consequence for replacement files: the street layer is
+/// NAME-keyed, so a rebuilt LID20001 whose labels match stock labels inherits the stock street
+/// set unchanged (stock KRAKOW prefix = 4387 rows / 1195 distinct streets). `hnr_names` = all
+/// decoded LID20000 element names (e.g. from `lid2dump` JSON). Diacritic label variants need
+/// their own prefix run (TPLID equivalent chars map only inside the DAWG, not in this string
+/// prefix test), so pass the exact label text the UI shows.
+pub fn city_street_rows(hnr_names: &[String], city_name: &str) -> (usize, usize) {
+    let pref = format!("{}, ", fold_equivalent_chars(city_name));
+    let mut rows = 0usize;
+    let mut streets = std::collections::BTreeSet::new();
+    for n in hnr_names {
+        let folded = fold_equivalent_chars(n);
+        if let Some(rest) = folded.strip_prefix(&pref) {
+            rows += 1;
+            streets.insert(street_of_addr(rest));
+        }
+    }
+    (rows, streets.len())
+}
+
+/// Stock TPLID_EQUIVALENT_CHAR folding (diacritic -> ASCII, case preserved) as used by the
+/// address-name DAWG; sufficient for the PL label set.
+pub fn fold_equivalent_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'ą' => 'a',
+            'Ą' => 'A',
+            'ć' => 'c',
+            'Ć' => 'C',
+            'ę' => 'e',
+            'Ę' => 'E',
+            'ł' => 'l',
+            'Ł' => 'L',
+            'ń' => 'n',
+            'Ń' => 'N',
+            'ó' => 'o',
+            'Ó' => 'O',
+            'ś' => 's',
+            'Ś' => 'S',
+            'ź' | 'ż' => 'z',
+            'Ź' | 'Ż' => 'Z',
+            other => other,
+        })
+        .collect()
+}
+
+/// Street component of an `"STREET NUMBER"` address tail: trailing numeric token(s) stripped.
+pub fn street_of_addr(rest: &str) -> String {
+    let toks: Vec<&str> = rest.split(' ').collect();
+    let end = toks
+        .iter()
+        .rposition(|t| !t.chars().next().map_or(false, |c| c.is_ascii_digit()))
+        .map_or(toks.len(), |i| i + 1);
+    toks[..end.max(1)].join(" ")
+}
+
+/// Quick faithful name-presence probe: labels are stored as plaintext runs in the name blob,
+/// so a region-name hit exists only if the raw string occurs in the file (device: searching a
+/// region name that is not in the file yields no 100% match -> the whole list request dies).
+pub fn blob_has_name(lid: &[u8], name: &[u8]) -> bool {
+    lid.windows(name.len()).any(|w| w == name)
+}
+
+/// Faithful ROOT region browse (CONFIRMED 2026-09-26f): the city screen seeds its RSI entries
+/// by searching the CURRENT REGION NAME (mandate search strings from the CONNECT location
+/// descriptor - `vCreateSearchStrListMapForMandateCats` -> `bVerifyList` ->
+/// `vAdd100PercentMatches` -> `poAddNewAddress(LISA_tclAddressCity)`) in the city name list
+/// ITSELF: stock LID20001 carries the region/state hierarchy elements at its high element ids
+/// (stock REL00000 hubs: src 233478..241251 -> 77310/14612 targets; strings POLSKA/MAZOWIEC...
+/// present in the stock blob). The hit region element becomes the entry (`vtbl+0x20`), and
+/// REL00000 (2<->2, same-domain region relation) supplies the region's city element targets via
+/// `bUpdateRange`, gated only by `bGoToElemet`. When the region name does NOT exist in the
+/// file, the mandate search fails -> `bSearchStreetsAndCities` returns 0 -> the whole list
+/// request aborts -> empty list + dead keyboard (the exact V1 symptom). `region_elem` is the
+/// element id of the region-name hit; `None` = the region name is absent from the file labels
+/// (see `blob_has_name`) -> models the request-death path with an empty result.
+pub fn check_root_region_browse(
+    lid: &[u8],
+    rel0: &[u8],
+    region_elem: Option<u32>,
+) -> Result<CityList, Gate> {
+    use crate::rel::{get_relations, RelIndex};
+    let h = check_name_list_header("city.lid", lid)?;
+    let region_elem = match region_elem {
+        None => {
+            return Ok(CityList {
+                ne: 0,
+                keys: 0,
+                candidates: 0,
+                list: Vec::new(),
+                dropped: Vec::new(),
+                danger: vec!["region-name element absent: request aborted".into()],
+            })
+        }
+        Some(e) => e,
+    };
+    let mut valid: Vec<bool> = Vec::new();
+    let mut danger = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", lid, &h, bi)?;
+        valid.extend_from_slice(&bl.valid_bits);
+        danger.extend(bl.danger);
+    }
+    let _ = valid;
+    let ne = valid.len();
+    let idx = RelIndex::parse(rel0).map_err(|e| Gate(format!("REL00000: parse: {e}")))?;
+    let rows = get_relations(rel0, &idx, true, region_elem, region_elem + 1)
+        .map_err(|e| Gate(format!("REL00000: query: {e}")))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut list = Vec::new();
+    let mut dropped = Vec::new();
+    for (_, t) in rows {
+        if !seen.insert(t) {
+            continue;
+        }
+        if (t as usize) >= ne {
+            dropped.push((t, "bGoToElement"));
+        } else {
+            list.push(t);
+        }
+    }
+    let keys = seen.len();
+    Ok(CityList {
+        ne,
+        keys,
+        candidates: keys,
         list,
         dropped,
         danger,
@@ -1083,4 +1537,45 @@ pub fn check_hnr(b: &[u8]) -> Result<Vec<HnrRec>, Gate> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn street_of_addr_strips_trailing_numbers() {
+        assert_eq!(
+            street_of_addr("ULICA MARSZAŁA JÓZEFA PIŁSUDZEGO 12"),
+            "ULICA MARSZAŁA JÓZEFA PIŁSUDZEGO"
+        );
+        assert_eq!(street_of_addr("94"), "94");
+        assert_eq!(
+            street_of_addr("KLADKA OJCA BERNATKA"),
+            "KLADKA OJCA BERNATKA"
+        );
+    }
+
+    #[test]
+    fn fold_preserves_case() {
+        assert_eq!(fold_equivalent_chars("KRAKÓW"), "KRAKOW");
+        assert_eq!(fold_equivalent_chars("Łódź"), "Lodz");
+    }
+
+    #[test]
+    fn city_street_rows_matches_folded_prefix() {
+        let names: Vec<String> = [
+            "KRAKOW, ULICA WIELICKA 4",
+            "KRAKOW, ULICA WIELICKA 5",
+            "KRAKOW, 94",
+            "ANDRYCHOW, ULICA KRAKOWSKA 31",
+            "WARSZAWA, ULICA SIEMIATYCZA 3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(city_street_rows(&names, "KRAKÓW"), (3, 2));
+        assert_eq!(city_street_rows(&names, "WARSZAWA"), (1, 1));
+        assert_eq!(city_street_rows(&names, "GDAŃSK"), (0, 0));
+    }
 }
