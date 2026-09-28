@@ -675,12 +675,13 @@ header is stock-identical. Root cause chain fully decompiled (all in `DAPIAPP.OU
 | 0 | `0x4402` | 0x02 | nodes | block-link bitmap (all-clear if no links) |
 | 1 | `0x0402` | 0x14 | 2K | block-link (blk,node) pairs (0 = none) |
 | 2 | `0x0401` | **0x18** | nodes | outDegree Simple9 (**not 0x11**) |
-| 3 | `0x4404` | 0x02 | edges | existence bitmap all-clear |
-| 4 | `0x8404` | 0x11 | 0 | tertiary empty |
-| 5 | `0x0404` | 0x11 | 0 | values empty |
-| 6 | `0x4405` | 0x02 | edges | existence bitmap all-clear |
-| 7 | `0x8405` | 0x11 | 0 | empty |
-| 8 | `0x0405` | 0x11 | 0 | empty |
+| 3 | `0x4404` | 0x02/0x01 | edges | invalid-category existence bitmap (street all-clear; city/POI real) |
+| 4 | `0x8404` | 0x13/0x16/0x17/0x11 | set | tertiary value-list offsets (city/POI: set-bit positions/delta/sparse) |
+| 5 | `0x0404` | 0x14/0x18/0x11 | vals | invalid categories per edge (`NLValueListAttrVector<u16>`) |
+| 6 | `0x4405` | 0x02/0x01 | edges | invalid-language existence bitmap |
+| 7 | `0x8405` | 0x16/0x13/0x11 | set | tertiary (languages) |
+| 8 | `0x0405` | 0x18/0x14/0x11 | vals | invalid languages per edge |
+| 9 | `0x8403` | 0x14 | edges | edge-label OFFSETS (flags **0x8000**, not 0x4000!) |
 | 9 | `0x8403` | 0x14 | edges | edge-label OFFSETS (flags **0x8000**, not 0x4000!) |
 | 10 | `0x0403` | 0x11 | blobLen | edge-label blob |
 | 11 | `0x0406` | **0x18** | edges | **child targets u32 (Simple9) — REAL DATA** |
@@ -715,6 +716,19 @@ device test these are emitted
 all-clear / all-zero (valid code+span); refine from stock data if a functional gap shows up.
 Empty-column legal patterns (all seen in stock): existence rows `kind|0x4000, code 0x02, param=count,
 span=0`; value rows `kind, code 0x11, param=0, span=0`. Rows may tie (same off) — span follows row order.
+
+**[CONFIRMED 2026-09-28 — per-element categories decoded]** The 0x404/0x405 rows are a
+`NLValueListAttrVector<u16>` (`Decode` 00cdd8fc, `enGetValues` 00cdf86c): existence bitmap (flags
+0x4000) + tertiary offsets (flags 0x8000; per-stock-block codes 0x11/0x13/0x16/0x17) + values (flags 0;
+0x11/0x14/0x18). Per-edge lists = `values[offsets[e]..offsets[e+1])`; `offsets` is built backwards from
+the value count, set edges taking tertiary values from the end, unset edges copying the next offset.
+`NLInputPath::bInitialize` 00cf5b44 seeds the walk's category set from sec5; `NLInputStep::bSetSelectedEdge`
+00cf69d0 subtracts each edge's invalid categories. `lid_format::read` computes the per-element category =
+first file category not invalidated along its trie path; POL20001 = **2=CITY (4601), 60=CITYDISTRICT
+(46681), 61=ZIP (189987)** — plain city names are 2, `NN NNN NAME` postal areas are 61 and are excluded
+from the {2, 0x3c} type-in filter; regions (LID20005) are 9=STATE. Fixed decoder codes 0x12/0x15/0x17
+(sparse-fill/RLE) were NOT filling the remaining values (device tail-loop does) — stock LID20004 blocks
+panicked on the slice; now filled.
 
 ### 11.4c The file-level gate: `NLNameList::LoadHeader` `00e0e63c` (**[CONFIRMED 2026-09-21 — the real L1/C1 poison]**)
 
@@ -1266,16 +1280,30 @@ on `POL/LID40006`: **2 351 692 records over 288 391 streets decode + owner-walk 
   idxColl)`); `vAdd100PercentMatches` `00c71cb4` turns every exact match into a `LISA_tclAddressCity`
   via `poAddNewAddress` `00c88c1c`; `vPopulateCityIndices` `00c73b68` lists each entry's element id
   (gated per-entry by `bGoToElemet` `00cef570`); zero valid entries ⇒ `bSendListUpdate` `00c74fc8`
-  returns 0 ⇒ the UI request aborts = empty city list + dead keyboard — the exact V1 symptom. The
-  descriptor's `ResumingElementIndices` are the **REL00006 rows of the chosen `LID20005` region
-  element**: stock REL6 targets are stock city ids, so V1 (our file + stock REL6) listed **0** under
-  every voivodeship selection except the German macro keys 9/23 (whose 86663 targets happen to
-  include ids 0–9). Reproduced in `device_sim::check_region_browse`: keys {25,26,27} → stock 16931
-  listed, V1 0, set-2b {0,2,5}; all 38 keys → stock 241269, V1 10, 2b 10. Card-state dependence
-  (which region element the UI seeds) explains why offline prediction of "2b shows all 10" is only
-  valid for the full-country seeding path. Rule for replacement files: regional browse works **only**
-  if `REL00006` is shipped with `LID20005` keys targeting the NEW city ids — which
-  `city::build_city_relations` already does (stock membership inherited per city).
+   returns 0 ⇒ the UI request aborts = empty city list + dead keyboard — the exact V1 symptom. The
+   descriptor's `ResumingElementIndices` are the **REL00006 rows of the chosen `LID20005` region
+   element**: stock REL6 targets are stock city ids, so V1 (our file + stock REL6) listed **0** under
+   every voivodeship selection except the German macro keys 9/23 (whose 86663 targets happen to
+   include ids 0–9). Reproduced in `device_sim::check_region_browse`: keys {25,26,27} → stock 16931
+   listed, V1 0, set-2b {0,2,5}; all 38 keys → stock 241269, V1 10, 2b 10. Card-state dependence
+   (which region element the UI seeds) explains why offline prediction of "2b shows all 10" is only
+   valid for the full-country seeding path. Rule for replacement files: regional browse works **only**
+   if `REL00006` is shipped with `LID20005` keys targeting the NEW city ids — which
+   `city::build_city_relations` already does (stock membership inherited per city).
+   **REGION-KEY MODEL CORRECTED 2026-09-28 (RE-verified decoder):** the REL6 src keys 0..37 are
+   **ZIP-REGION groups, NOT the LID20005 voivodeship element ids**. Re-decoding stock REL00006 with an
+   independent reader built from `enGetRelationsByType` 00e11310 / `enGetSubMatricesInBlock` 00e10fd4 /
+   `enGetRelations` 00e114d8 gives the per-key member geography by postal prefix — e.g. key 3/26 = zip
+   34–35 (Mszana Dolna/Rzeszów = Małopolskie+Podkarpackie; `KRAKÓW` 208838 ∈ {3,26}), key 25/11 = zip 44
+   (Śląskie), key 27 = zip 14 (Warmińsko-Mazurskie), key 7/19/37 = zip 26, key 0/33/34 = zip 09/10, key
+   9/23 = zip 00 macro (foreign-variant city names + Warsaw areas, includes ids 0..9). The LID20005
+   element NAMES (MALOPOLSKIE 25 / MAZOWIECKIE 26 / MAŁOPOLSKIE 27) do NOT match their key's geography —
+   only key 26 is actually Małopolskie-ish; `check_region_browse`'s {25,26,27} scenario therefore sums
+   three unrelated zip-regions (the 16931 stock total is real, the "Małopolskie" label is not). Our
+   10-city REL6 inherited the stock keys per city; `KRAKÓW` ∈ {3,26} means the Małopolskie zip-region
+   DOES include our Kraków — so REL6 membership per se is not the failure. **STILL OPEN:** which
+   CONNECT region id the UI seeds per voivodeship (states are not plaintext in CONNECT.DAT; the
+   region→key binding lives in the CONNECT/global-entry layer, LID50001 has no region names).
 - **Writer implemented** in `src/lid_format/src/rel.rs` (`write_rel` + reader model `RelIndex::parse` /
   `get_relations` / `bands_per_group`; `REL_BAND = 512` elems, target `REL_CELL_BANDS = 32` band-groups,
   writer replicates the device `bpr/bpc` derivation so tables agree; empty matrix cells still get a real tile
@@ -1376,8 +1404,9 @@ side unproven). `nrec=0` + empty streams is legal at LoadHeader time, but shippi
 the top suspect for the 2026-09-25 10-city RESET — `devsim.py` now FAILs on `nrel>0 && nrec==0` and on
 `nrec != nb×nrel`; `city.rs` synthesizes stock-shaped records natively (partner counts + tail verbatim
 from stock block-0 records, edge count = own block Σod).);
-`sec4` `0x14` u16×c4; `sec5` `0x14` u16×c5 = **file CATEGORIES** (POL20001 `{2,61,58}`; feeds
-`u32GetCurrentCategory` set `NLProcessor+0x13c` and `corfoGetAllCategories`);
+`sec4` `0x14` u16×c4; `sec5` `0x14` u16×c5 = **file CATEGORIES** (POL20001 `{2,60,61}` = CITY/CITYDISTRICT/ZIP — decoded by
+`lid_format::read` into `NameList.categories`; feeds `u32GetCurrentCategory` set `NLProcessor+0x13c`
+and `corfoGetAllCategories`);
 `sec6` `0x18` u16×c6 = **file LANGUAGES** (POL20001: 29 ids; feeds `NLProcessor+0x14c`, vCollectNames
 lang branch). `NLProcessor::bInitialise` = LoadHeader → `enAddNewAsfBlock(0)` → `bAddNewInputStep(0,0,node0)`
 → seed cat/lang sets.

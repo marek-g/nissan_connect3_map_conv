@@ -260,29 +260,31 @@ fn decode_u32_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec
                 }
             }
         }
-        0x12 | 0x15 => {
-            let mut i = 0usize;
-            let mut val = 0u32;
-            while !c.eof() && i < n {
-                let cnt = if code == 0x12 { c.ru32() } else { c.vle() };
-                while val < cnt && i < n {
-                    out.push(val);
-                    val += 1;
-                    i += 1
-                }
-            }
-        }
-        0x17 => {
+        0x12 | 0x15 | 0x17 => {
+            // RLE / RLE+VLE / sparse-fill: the device fills `out[i] = i` up to the decoded target and
+            // then continues the run over the remaining `count` (NLStandardDecoder::Decode<u16> 00cdcf6c
+            // case 0x12/0x15/0x17 tail loops). The earlier no-tail version left the vector short and the
+            // ValueList offsets (00cdd8fc) read garbage on stock LID20004 blocks.
             let mut i = 0usize;
             let mut val = 0u32;
             let mut tgt = 0u32;
             while !c.eof() && i < n {
-                tgt = tgt.wrapping_add(c.vle());
+                if code == 0x17 {
+                    tgt = tgt.wrapping_add(c.vle());
+                } else {
+                    let cnt = if code == 0x12 { c.ru32() } else { c.vle() };
+                    tgt = cnt;
+                }
                 while val < tgt && i < n {
                     out.push(val);
                     val += 1;
                     i += 1
                 }
+            }
+            while i < n {
+                out.push(val);
+                val += 1;
+                i += 1
             }
         }
         _ => {
@@ -430,6 +432,10 @@ fn bitfield_c(b: &[u8], code: u32, start: usize, end: usize, n: usize) -> (Vec<b
 pub struct Element {
     pub block: usize, // 0-based NLAsfBlock index this element belongs to
     pub node: usize,  // trie node (leaf) of this element inside its block
+    /// First file category this element belongs to (`u32GetCurrentCategory` 00cead18 — first of the
+    /// set at NLProcessor+0x13c; set = file categories minus the per-edge invalid-category union along
+    /// the trie path, `bSetSelectedEdge` 00cf69d0). POL city list: 2=CITY, 0x3c=60=CITYDISTRICT,
+    /// 0x3d=61=ZIP (postal areas, excluded from the city type-in by the {2, 0x3c} filter).
     pub category: u16,
     pub name: String,
     /// Full raw device string of this element's trie path **before** the display cut (line 1 =
@@ -461,6 +467,10 @@ pub struct NameList {
     pub element_count: u32,
     pub block_count: usize,
     pub elements: Vec<Element>,
+    /// The file categories (sec5 stream, `NLInputPath::bInitialize` 00cf5b44 seeds the walk's category
+    /// set from it; `vCollectNamesOfCat` 00bf72ec filters the city list by {2, 0x3c}). POL LID20001:
+    /// [2, 60, 61] = CITY / CITYDISTRICT / ZIP; LID20006: [3] = STREET.
+    pub categories: Vec<u16>,
     /// File position origin (PAU) = the `tNLHPosition` the sub-header carries (`hdr+0x10/+0x14`, gated by
     /// bit `0x0008_0000` of `hdr+0x0c`); street tiles use it only when no city context exists, street
     /// coordinates are otherwise relative to the *queried city* (see §12.5). `None` = "-1/-1" = the file
@@ -896,6 +906,11 @@ struct ParsedBlock<'a> {
     coords: Vec<u32>,
     belongs_flag: Vec<bool>,
     belongs_vals: Vec<u32>,
+    /// Per-edge invalid categories (`NLValueListAttrVector<u16>` col 0x404); the walk subtracts each
+    /// edge's list from the file-category set (NLInputStep::bSetSelectedEdge 00cf69d0).
+    edge_incat: Vec<Vec<u32>>,
+    /// Per terminating element: bitmask of invalid categories accumulated along its trie path.
+    raw_cat: Vec<u64>,
 }
 
 impl<'a> ParsedBlock<'a> {
@@ -1161,21 +1176,65 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
             None => vec![],
         };
 
+        // Edge-domain value lists (col 0x404 = invalid categories, 0x405 = invalid languages):
+        // `NLValueListAttrVector<u16>::Decode` 00cdd8fc — existence bitmap (flags 0x4000) + tertiary
+        // offsets (flags 0x8000, code 0x13 = set-bit positions) + values (flags 0). Per-edge lists are
+        // `values[offsets[e]..offsets[e+1])` where `offsets` is built backwards: the last offset = the
+        // total value count, a set edge takes the next tertiary value, an unset edge copies the next
+        // edge's offset (=> empty list). `enGetValues` 00cdf86c reads exactly that slice.
+        let n_edges = od.iter().sum::<u32>() as usize;
+        let edge_incat: Vec<Vec<u32>> =
+            match (get(0x404, 0x4000), get(0x404, 0x8000), get(0x404, 0)) {
+                (Some(bd), Some(td), Some(vd)) => {
+                    let bits = bitfield(b, bd.code, bs + bd.off as usize, span_end(bd), n_edges);
+                    let nset = bits.iter().filter(|&&x| x).count();
+                    let tert = decode_u32(b, td.code, bs + td.off as usize, span_end(td), nset);
+                    let vals = decode_u16(
+                        b,
+                        vd.code,
+                        bs + vd.off as usize,
+                        span_end(vd),
+                        vd.param as usize,
+                    );
+                    let mut offsets = vec![vals.len() as u32; n_edges + 1];
+                    let mut t = tert.len();
+                    for e in (0..n_edges).rev() {
+                        if bits[e] {
+                            if t > 0 {
+                                offsets[e] = tert[t - 1];
+                                t -= 1;
+                            }
+                        } else {
+                            offsets[e] = offsets[e + 1];
+                        }
+                    }
+                    (0..n_edges)
+                        .map(|e| {
+                            let (s, en) = (offsets[e] as usize, offsets[e + 1] as usize);
+                            vals[s.min(vals.len())..en.min(vals.len())].to_vec()
+                        })
+                        .collect()
+                }
+                _ => vec![Vec::new(); n_edges],
+            };
+
         // Element names: replay `CalculateTerminatingElementIndex`/`ProcessSubTreeTEIC` — a PURE DFS
         // per forest root over the DAG (a shared node is visited once per incoming path; its element
         // name is the labels accumulated along THAT path, appended exactly like
         // `NLInputStep::bSetSelectedEdge` does when the device walks). At each node: first register
         // the leaf children (od==0, no block-link) as elements, then recurse into internal children.
         // Raw label per (parent n, i-th child) = blob[loff[fe[n]+i] .. loff[fe[n]+i+1]].
-        let (term_nodes, raw_local): (Vec<usize>, Vec<Vec<u8>>) = {
+        let (term_nodes, raw_local, raw_cat): (Vec<usize>, Vec<Vec<u8>>, Vec<u64>) = {
             let mut tnodes: Vec<usize> = Vec::with_capacity(elem_count_b);
             let mut out: Vec<Vec<u8>> = Vec::with_capacity(elem_count_b);
-            let mut stack: Vec<(usize, Vec<u8>)> = Vec::new(); // (node, accumulated string so far)
+            let mut cats: Vec<u64> = Vec::with_capacity(elem_count_b);
+            // (node, accumulated string, accumulated invalid-category bitmask)
+            let mut stack: Vec<(usize, Vec<u8>, u64)> = Vec::new();
             let mut root = 0usize;
             while root < node_count {
                 let mut edgevisits = 0usize; // ProcessSubTreeTEIC return value for this root
-                stack.push((root, Vec::new()));
-                while let Some((n, s)) = stack.pop() {
+                stack.push((root, Vec::new(), 0u64));
+                while let Some((n, s, cm)) = stack.pop() {
                     edgevisits += od[n] as usize;
                     let base = cs[n];
                     let fen = fe[n];
@@ -1184,8 +1243,13 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
                         if c < node_count && od[c] == 0 && !blocklink[c] {
                             let mut t = s.clone();
                             t.extend_from_slice(lab_loc(&blob, &loff, fen + i));
+                            let mut c2 = cm;
+                            for &v in edge_incat.get(fen + i).unwrap_or(&vec![]) {
+                                c2 |= 1u64 << (v % 64);
+                            }
                             tnodes.push(c);
                             out.push(t);
+                            cats.push(c2);
                         }
                     }
                     for i in (0..od[n] as usize).rev() {
@@ -1193,13 +1257,17 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
                         if c < node_count && od[c] != 0 {
                             let mut t = s.clone();
                             t.extend_from_slice(lab_loc(&blob, &loff, fen + i));
-                            stack.push((c, t));
+                            let mut c2 = cm;
+                            for &v in edge_incat.get(fen + i).unwrap_or(&vec![]) {
+                                c2 |= 1u64 << (v % 64);
+                            }
+                            stack.push((c, t, c2));
                         }
                     }
                 }
                 root += edgevisits + 1;
             }
-            (tnodes, out)
+            (tnodes, out, cats)
         };
 
         bp.push(ParsedBlock {
@@ -1217,6 +1285,8 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
             coords,
             belongs_flag,
             belongs_vals,
+            edge_incat,
+            raw_cat,
         });
     }
 
@@ -1226,18 +1296,20 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
     // forward, so one ascending sweep resolves every reached terminal's full raw string. Terminals
     // of subtrees that no link addresses keep their block-local spelling (their string starts at
     // the local root, empty prefix — identical to the old per-block reading).
-    let mut global: std::collections::HashMap<(usize, usize), Vec<u8>> =
+    // Cross-block pass also tracks the accumulated invalid-category bitmask (`NLInputStep::bStepDown`
+    // re-homes on a linked node; `bSetSelectedEdge` subtracts invalid categories/languages per edge).
+    let mut global: std::collections::HashMap<(usize, usize), (Vec<u8>, u64)> =
         std::collections::HashMap::new();
-    let mut entries: Vec<Vec<(usize, Vec<u8>)>> = vec![Vec::new(); bp.len()];
+    let mut entries: Vec<Vec<(usize, Vec<u8>, u64)>> = vec![Vec::new(); bp.len()];
     if let Some(first) = bp.first() {
         for &r in &first.roots {
-            entries[0].push((r, Vec::new()));
+            entries[0].push((r, Vec::new(), 0u64));
         }
     }
     for bi in 0..bp.len() {
         let blk = &bp[bi];
-        let mut stack: Vec<(usize, Vec<u8>)> = std::mem::take(&mut entries[bi]);
-        while let Some((node, s)) = stack.pop() {
+        let mut stack: Vec<(usize, Vec<u8>, u64)> = std::mem::take(&mut entries[bi]);
+        while let Some((node, s, cm)) = stack.pop() {
             if node >= blk.node_count {
                 continue;
             }
@@ -1247,12 +1319,12 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
             let link = blk.links.get(&node).copied();
             if let Some((tb, tn)) = link {
                 if tb < bp.len() && tb > bi {
-                    entries[tb].push((tn, s.clone()));
+                    entries[tb].push((tn, s.clone(), cm));
                 }
             }
             if deg == 0 {
                 if link.is_none() || !matches!(link, Some((tb, _)) if tb < bp.len() && tb > bi) {
-                    global.entry((bi, node)).or_insert_with(|| s.clone());
+                    global.entry((bi, node)).or_insert_with(|| (s.clone(), cm));
                 }
                 continue;
             }
@@ -1263,10 +1335,14 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
                 }
                 let mut t = s.clone();
                 t.extend_from_slice(blk.lab(fen + i));
+                let mut c2 = cm;
+                for &v in blk.edge_incat.get(fen + i).unwrap_or(&vec![]) {
+                    c2 |= 1u64 << (v % 64);
+                }
                 match blk.links.get(&c).copied() {
-                    Some((tb, tn)) if tb < bp.len() && tb > bi => entries[tb].push((tn, t)),
+                    Some((tb, tn)) if tb < bp.len() && tb > bi => entries[tb].push((tn, t, c2)),
                     _ => {
-                        global.entry((bi, c)).or_insert_with(|| t);
+                        global.entry((bi, c)).or_insert_with(|| (t, c2));
                     }
                 }
             }
@@ -1275,7 +1351,11 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
                 if c < blk.node_count && blk.od[c] != 0 {
                     let mut t = s.clone();
                     t.extend_from_slice(blk.lab(fen + i));
-                    stack.push((c, t));
+                    let mut c2 = cm;
+                    for &v in blk.edge_incat.get(fen + i).unwrap_or(&vec![]) {
+                        c2 |= 1u64 << (v % 64);
+                    }
+                    stack.push((c, t, c2));
                 }
             }
         }
@@ -1290,13 +1370,30 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
         })
         .collect();
 
+    // File categories (sec5 stream): `NLInputPath::bInitialize` 00cf5b44 seeds the walk's category set
+    // from the `hdr+0x70` vector (this is what `u32GetCurrentCategory` + the {2, 0x3c} city filter read).
+    let categories: Vec<u16> = {
+        let cnt = u16(b, hdr + 0x0a) as usize;
+        let off = sec[5].1 as usize;
+        if cnt == 0 {
+            Vec::new()
+        } else {
+            let mut c = Cur {
+                b,
+                p: off,
+                end: sec[6].1 as usize,
+            };
+            (0..cnt).map(|_| c.vle() as u16).collect()
+        }
+    };
+
     let mut elements: Vec<Element> = Vec::new();
     for (bi, blk) in bp.iter().enumerate() {
         let mut pos_rank = 0usize;
         let mut bel_rank = 0usize;
         for ei in 0..blk.term_nodes.len() {
             let raw: &[u8] = match global.get(&(bi, blk.term_nodes[ei])) {
-                Some(t) => t,
+                Some((t, _)) => t,
                 None => &blk.raw_local[ei],
             };
             let name = decode_name(raw);
@@ -1326,10 +1423,22 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
             if name.trim().is_empty() {
                 continue;
             }
+            // Category = the first file category not invalidated along the element's path
+            // (`u32GetCurrentCategory` 00cead18 returns the first of the set at NLProcessor+0x13c;
+            // the city list filter is {2, 0x3c}, ZIP areas (61) are excluded from the type-in list).
+            let inval = match global.get(&(bi, blk.term_nodes[ei])) {
+                Some((_, cm)) => *cm,
+                None => blk.raw_cat.get(ei).copied().unwrap_or(0),
+            };
+            let category = categories
+                .iter()
+                .copied()
+                .find(|&c| c < 64 && (inval & (1u64 << c)) == 0)
+                .unwrap_or(0);
             elements.push(Element {
                 block: bi,
                 node: blk.term_nodes[ei],
-                category: 0,
+                category,
                 name,
                 sort_name: {
                     let mut s: &[u8] = raw;
@@ -1371,6 +1480,7 @@ fn read_full(b_in: &[u8]) -> Result<(NameList, Vec<BlockLinkInfo>), String> {
             element_count: elem_count,
             block_count: block_off.len(),
             elements,
+            categories,
             origin,
         },
         link_maps,
@@ -2856,6 +2966,46 @@ mod tests {
             );
         }
         assert_eq!(ok, nblocks, "all blocks must byte-rebuild exactly");
+    }
+
+    /// Stock POL city list categories (sec5 {2, 60, 61} minus per-edge invalid-category union):
+    /// plain city names are CITY (2), ZIP areas are 61 (excluded from the {2, 0x3c} type-in filter),
+    /// the region list is STATE (9). LID20004 blocks exercise the 0x17/0x12/0x15 sparse/RLE codecs.
+    #[test]
+    #[ignore] // needs the reference card mounted
+    fn stock_categories() {
+        let base = "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/Map_unpacked/CRYPTNAV/DATA/DATA/LID/CCP/POL/";
+        let nl = read(&std::fs::read(format!("{base}LID20001.DAT")).unwrap()).unwrap();
+        assert_eq!(nl.categories, vec![2, 60, 61]);
+        let by_cat: std::collections::HashMap<u16, u32> = nl
+            .elements
+            .iter()
+            .map(|e| e.category)
+            .fold(std::collections::HashMap::new(), |mut m, c| {
+                *m.entry(c).or_default() += 1;
+                m
+            });
+        assert_eq!(by_cat[&2], 4601, "CITY elements");
+        assert_eq!(by_cat[&60], 46681, "CITYDISTRICT elements");
+        assert_eq!(by_cat[&61], 189987, "ZIP elements");
+        let find = |n: &str| {
+            nl.elements
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("missing {n}"))
+        };
+        assert_eq!(find("KRAKOW").category, 2);
+        assert_eq!(find("KRAKÓW").category, 2);
+        assert_eq!(find("WARSZAWA").category, 2);
+        assert_eq!(find("30 036 KRAKOW").category, 61);
+        let regions = read(&std::fs::read(format!("{base}LID20005.DAT")).unwrap()).unwrap();
+        assert_eq!(regions.categories, vec![9]);
+        assert!(regions.elements.iter().all(|e| e.category == 9));
+        let poi = read(&std::fs::read(format!("{base}LID20004.DAT")).unwrap()).unwrap();
+        assert!(
+            poi.elements.iter().any(|e| e.category > 0),
+            "LID20004 must decode 0x404 across its varied codecs"
+        );
     }
 
     /// Synthetic GenAttr HnR file in the **stock** layout (§11.6b): block ranges are STREET elements,
