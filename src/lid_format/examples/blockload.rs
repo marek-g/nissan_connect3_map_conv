@@ -20,12 +20,18 @@ fn main() {
         }) {
             match check_block_load(&short, &b, &h, bi) {
                 Ok(bl) => {
+                    let perm_drop = bl.perm_dropped.iter().filter(|&&p| p).count();
                     println!(
-                        "{short} blk{bi}: nE={} root-edges={} letters=\"{}\" validDest={}/{} danger={}",
+                        "{short} blk{bi}: nE={} root-edges={} letters=\"{}\" validDest={}/{} \
+                         charStatus={}/{} permDropped={}/{} danger={}",
                         bl.ne,
                         bl.root_edges.len(),
                         bl.letters,
                         bl.valid_dest_popcount,
+                        bl.ne,
+                        bl.char_status_count,
+                        bl.ne,
+                        perm_drop,
                         bl.ne,
                         bl.danger.len()
                     );

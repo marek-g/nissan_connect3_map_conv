@@ -44,19 +44,22 @@ fn main() {
     };
     // Give diacritic cities an ASCII-folded search key as line 1 + the diacritic display form as
     // line 2 (stock shape `GDANSK\tGDAŃSK`); the device searches line 1 (ASCII type-in).
-    let cities: Vec<CityEntry> = cities.iter().map(|c| c.with_ascii_fold()).collect();
-    let mut sorted: Vec<&CityEntry> = cities.iter().collect();
-    sorted.sort_unstable_by_key(|c| c.name.as_bytes());
+    let mut cities: Vec<CityEntry> = cities.iter().map(|c| c.with_ascii_fold()).collect();
+    // Sort by stored (folded) name bytes ONCE and use that order for BOTH the LID and the RELs.
+    // build_city_block sorts internally with the same key; build_city_relations indexes targets by
+    // this list's order — so they only agree if we hand it the already-sorted list. (Bug: passing
+    // the unsorted input desynced 7/10 city ids between RELs and LID.)
+    cities.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     println!(
         "expected list order: {:?}",
-        sorted.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+        cities.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
     );
     let data = build_city_file(&cities, &stock);
     std::fs::write(&out_path, &data).expect("write");
     println!("wrote {} bytes to {}", data.len(), out_path);
     selfcheck(&data, &stock, &cities).expect("selfcheck");
     println!("OK: {} cities verified", cities.len());
-    for (i, c) in sorted.iter().enumerate() {
+    for (i, c) in cities.iter().enumerate() {
         println!("  id {i:>3} = {}", c.name);
     }
 

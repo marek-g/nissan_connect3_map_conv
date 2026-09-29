@@ -685,4 +685,52 @@ mod tests {
             assert_eq!(bl.root_edges.len(), if cities.len() == 1 { 1 } else { 9 });
         }
     }
+
+    #[test]
+    fn element_domain_column_validator() {
+        // Faithful column-values validator (vPopulateCityIndices 00c73b68 gate chain): a generated city
+        // file must PASS it (char-status present, no plain city permutation-dropped), and the validator
+        // must CATCH a file whose char-status column is empty (enGetEntryCharacterStatus returns 4 for
+        // every element -> enGetAllElementProperties fails -> all candidates drop).
+        use crate::device_sim::{block_toc, check_block_load, check_name_list_header};
+        let s = stock();
+        let data = build_city_file(&ten(), &s);
+        let h = check_name_list_header("zz.DAT", &data).expect("LoadHeader");
+
+        // (1) normal file: char-status covers every element; no element marked permutated.
+        let bl = check_block_load("zz.DAT", &data, &h, 0).expect("SetDataBlock");
+        assert_eq!(
+            bl.char_status_count as u32,
+            u32::from(bl.ne),
+            "char-status (0x8415) must cover all {ne} elements",
+            ne = bl.ne
+        );
+        assert!(
+            bl.perm_dropped.iter().all(|&p| !p),
+            "plain cities must not be permutation-dropped: {:?}",
+            bl.perm_dropped
+        );
+        assert!(
+            !bl.danger.iter().any(|d| d.contains("char-status count 0")),
+            "no false char-status danger on a valid file: {:?}",
+            bl.danger
+        );
+
+        // (2) zero the 0x8415 descriptor count -> the device's enGetEntryCharacterStatus hard-fails.
+        let mut bad = data.clone();
+        let rows = block_toc(&bad, &h, 0);
+        let i = rows
+            .iter()
+            .position(|(tag, _, _, _)| *tag == 0x8415)
+            .expect("0x8415 descriptor present");
+        let cnt_off = h.blob_end + 8 + i * 12 + 8; // TOC entry: tag(2) code(2) start(4) count(4)
+        bad[cnt_off..cnt_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        let bl_bad = check_block_load("zz.DAT", &bad, &h, 0).expect("SetDataBlock (count 0 still loads)");
+        assert_eq!(bl_bad.char_status_count, 0, "mutated char-status count must read back as 0");
+        assert!(
+            bl_bad.danger.iter().any(|d| d.contains("char-status count 0")),
+            "validator must flag the empty char-status column: {:?}",
+            bl_bad.danger
+        );
+    }
 }

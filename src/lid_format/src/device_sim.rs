@@ -559,6 +559,15 @@ pub struct BlockLoad {
     pub letters: String, // chars bGetNextValidCharacters would offer at root
     pub valid_dest_popcount: usize, // bits in col 0x40d (bIsEntryValidDestination)
     pub valid_bits: Vec<bool>, // full 0x40d column (element-indexed)
+    /// col 0x8415 char-status BinList element count (`NLAsfBlock::this+0x458`). `enGetEntryCharacterStatus`
+    /// (`00cdcebc`) returns 4 (hard fail of `enGetAllElementProperties`) for EVERY element when this is 0,
+    /// so the whole block's candidates drop. 0 here = column absent/empty.
+    pub char_status_count: u32,
+    /// Per-element permutation gate result (`vPopulateCityIndices` `00c73b68`: candidate kept only when
+    /// `NLElementProperties+8 == -1`). Element i is dropped iff col 0x40f is present AND
+    /// `bIsEntryPermutated(i)` (`00cdb94c`, = `HasAttribute` of the non-empty permutation vector) is true.
+    /// Empty 0x40f column => all false (every plain city survives). Element-indexed.
+    pub perm_dropped: Vec<bool>,
     pub danger: Vec<String>,
 }
 
@@ -840,7 +849,20 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
     single(o_sv[3], "0x40c", &mut danger)?; // opts[3]
     let pc_40b = single(o_sv[2], "0x40b", &mut danger)?; // opts[4]
     single(o_sv[1], "0x40a", &mut danger)?; // opts[5]
-    let _ = binary(o_bin[1], "0x40f", &mut danger)?; // opts[8]
+    // 0x40f permutation HasAttribute bitmap (bIsEntryPermutated 00cdb94c): element i is dropped by the
+    // city-list gate only when this column is present AND its bit is set. Empty column => all survive.
+    let (_pc_40f, perm_attr_bits) = binary(o_bin[1], "0x40f", &mut danger)?; // opts[8]
+    let perm_dropped: Vec<bool> = if o_bin[1].count == 0 {
+        vec![false; ne as usize]
+    } else {
+        let mut v = vec![false; ne as usize];
+        for (i, &bit) in perm_attr_bits.iter().enumerate() {
+            if i < v.len() {
+                v[i] = bit;
+            }
+        }
+        v
+    };
     single(o_sv[4], "0x40e", &mut danger)?; // opts[7]
     let _ = binary(o_bin[2], "0x410", &mut danger)?; // opts[9]
     let (pc_40d, bits_40d) = binary(o_bin[0], "0x40d", &mut danger)?; // opts[6] valid destinations
@@ -849,9 +871,12 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
     let _ = binary(o_bin[6], "0x414", &mut danger)?; // opts[12]
     let _ = pc_413;
     let _ = pc_40b;
-    // BinList 0x415/0x8415 (unconditional, aborts): main S9 list + aux bitmap
-    if o_bl[0].count != 0 {
-        let (ok, _, _) = std_decode(b, base, o_bl[0], o_bl[0].count as usize, true);
+    // BinList 0x415/0x8415 (unconditional, aborts): main S9 list + aux bitmap.
+    // enGetEntryCharacterStatus (00cdcebc) hard-fails (returns 4) for EVERY element when the char-status
+    // BinList count (NLAsfBlock this+0x458) is 0 -> enGetAllElementProperties fails -> all candidates drop.
+    let char_status_count = o_bl[0].count;
+    if char_status_count != 0 {
+        let (ok, _, _) = std_decode(b, base, o_bl[0], char_status_count as usize, true);
         if !ok {
             return f(format!(
                 "0x8415 char-status decode fail (code {:#04x})",
@@ -859,6 +884,11 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
             ));
         }
         chk_ovr("0x8415", o_bl[0], &mut danger);
+    } else {
+        danger.push(format!(
+            "block{bi}: 0x8415 char-status count 0 -> enGetEntryCharacterStatus returns 4 \
+             (enGetAllElementProperties fails) -> all {ne} elements dropped"
+        ));
     }
     let _ = binary(o_bl[1], "0x415", &mut danger)?; // aux bitmap result ignored... (device runs it, result used for 0x490 obj)
 
@@ -904,6 +934,8 @@ pub fn check_block_load(name: &str, b: &[u8], h: &NlHeader, bi: usize) -> Result
         letters,
         valid_dest_popcount: pc_40d,
         valid_bits: bits_40d,
+        char_status_count,
+        perm_dropped,
         danger,
     })
 }
@@ -1036,13 +1068,8 @@ pub fn check_city_list(
 ) -> Result<CityList, Gate> {
     use crate::rel::{get_relations, RelIndex};
     let h = check_name_list_header("city.lid", lid)?;
-    let mut valid: Vec<bool> = Vec::new();
     let mut danger = Vec::new();
-    for bi in 0..h.nb as usize {
-        let bl = check_block_load("city.lid", lid, &h, bi)?;
-        valid.extend_from_slice(&bl.valid_bits);
-        danger.extend(bl.danger);
-    }
+    let (valid, perm_drop, char_ok) = collect_element_domain(lid, &h, &mut danger)?;
     let ne = valid.len();
     let mut keys = std::collections::BTreeSet::new();
     for (id, bytes, bys) in rels {
@@ -1066,6 +1093,10 @@ pub fn check_city_list(
         candidates += 1;
         if (k as usize) >= ne {
             dropped.push((k, "bGoToElement"));
+        } else if !char_ok[k as usize] {
+            dropped.push((k, "enGetAllElementProperties(char-status count 0)"));
+        } else if perm_drop[k as usize] {
+            dropped.push((k, "permutation(+8 != -1)"));
         } else if !valid[k as usize] {
             dropped.push((k, "validDestination"));
         } else {
@@ -1080,6 +1111,31 @@ pub fn check_city_list(
         dropped,
         danger,
     })
+}
+
+/// Collect the element-domain column values that gate `vPopulateCityIndices` (`00c73b68`) across all
+/// blocks of a name-list file: per-element `validDestination` (0x40d), `perm_dropped` (0x40f
+/// permutation HasAttribute -> `NLElementProperties+8 != -1`), and `char_ok` (block 0x8415 char-status
+/// count > 0, else `enGetAllElementProperties` fails for the whole block).
+fn collect_element_domain(
+    lid: &[u8],
+    h: &NlHeader,
+    danger: &mut Vec<String>,
+) -> Result<(Vec<bool>, Vec<bool>, Vec<bool>), Gate> {
+    let mut valid = Vec::new();
+    let mut perm_drop = Vec::new();
+    let mut char_ok = Vec::new();
+    for bi in 0..h.nb as usize {
+        let bl = check_block_load("city.lid", lid, &h, bi)?;
+        let nbl = bl.valid_bits.len();
+        valid.extend_from_slice(&bl.valid_bits);
+        perm_drop.extend_from_slice(&bl.perm_dropped);
+        for _ in 0..nbl {
+            char_ok.push(bl.char_status_count != 0);
+        }
+        danger.extend(bl.danger);
+    }
+    Ok((valid, perm_drop, char_ok))
 }
 
 /// Faithful 2026-09-26e replica of the device city browser: candidates are the REGION ENTRY
@@ -1097,13 +1153,8 @@ pub fn check_city_list_entries(
 ) -> Result<CityList, Gate> {
     use crate::rel::{get_relations, RelIndex};
     let h = check_name_list_header("city.lid", lid)?;
-    let mut valid: Vec<bool> = Vec::new();
     let mut danger = Vec::new();
-    for bi in 0..h.nb as usize {
-        let bl = check_block_load("city.lid", lid, &h, bi)?;
-        valid.extend_from_slice(&bl.valid_bits);
-        danger.extend(bl.danger);
-    }
+    let (valid, perm_drop, char_ok) = collect_element_domain(lid, &h, &mut danger)?;
     let ne = valid.len();
     let mut keyed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     for (id, bytes, bys) in rels {
@@ -1129,6 +1180,10 @@ pub fn check_city_list_entries(
         candidates += 1;
         if (e as usize) >= ne {
             dropped.push((e, "bGoToElement"));
+        } else if !char_ok[e as usize] {
+            dropped.push((e, "enGetAllElementProperties(char-status count 0)"));
+        } else if perm_drop[e as usize] {
+            dropped.push((e, "permutation(+8 != -1)"));
         } else {
             list.push(e);
         }
@@ -1158,14 +1213,8 @@ pub fn check_region_browse(
 ) -> Result<CityList, Gate> {
     use crate::rel::{get_relations, RelIndex};
     let h = check_name_list_header("city.lid", lid)?;
-    let mut valid: Vec<bool> = Vec::new();
     let mut danger = Vec::new();
-    for bi in 0..h.nb as usize {
-        let bl = check_block_load("city.lid", lid, &h, bi)?;
-        valid.extend_from_slice(&bl.valid_bits);
-        danger.extend(bl.danger);
-    }
-    let _ = valid;
+    let (valid, perm_drop, char_ok) = collect_element_domain(lid, &h, &mut danger)?;
     let ne = valid.len();
     let idx = RelIndex::parse(rel6).map_err(|e| Gate(format!("REL00006: parse: {e}")))?;
     let mut seen = std::collections::BTreeSet::new();
@@ -1182,6 +1231,10 @@ pub fn check_region_browse(
     for &t in &seen {
         if (t as usize) >= ne {
             dropped.push((t, "bGoToElement"));
+        } else if !char_ok[t as usize] {
+            dropped.push((t, "enGetAllElementProperties(char-status count 0)"));
+        } else if perm_drop[t as usize] {
+            dropped.push((t, "permutation(+8 != -1)"));
         } else {
             list.push(t);
         }
