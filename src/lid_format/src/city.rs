@@ -41,6 +41,35 @@ impl CityEntry {
             lat_pau: (lat_deg * PAU) as i32,
         }
     }
+
+    /// Return a copy whose stored name carries an ASCII-folded **search key** as the first
+    /// TAB-separated line (line 1 = sort/type-in key, line 2 = diacritic display form), exactly
+    /// as stock carries diacritic city names (`GDANSK\tGDAŃSK`, `KRAKOW\tKRAKÓW`). The device
+    /// searches line 1 (ASCII-folded type-in), so this makes a diacritic city match an ASCII
+    /// query (`GDANSK`) while still displaying the diacritic form. Non-diacritic names are
+    /// returned unchanged. Element count is preserved (one element per logical city).
+    pub fn with_ascii_fold(&self) -> CityEntry {
+        let folded = fold_polish(&self.name);
+        if folded == self.name {
+            self.clone()
+        } else {
+            CityEntry {
+                name: format!("{folded}\t{}", self.name),
+                lon_pau: self.lon_pau,
+                lat_pau: self.lat_pau,
+            }
+        }
+    }
+
+    /// The ASCII-folded search/sort key = the first TAB-separated line of the stored name.
+    pub fn search_key(&self) -> String {
+        fold_polish(self.name.split('\t').next().unwrap_or(&self.name))
+    }
+
+    /// The display form = everything after the first TAB (or the whole name when there is none).
+    pub fn display_name(&self) -> &str {
+        self.name.split('\t').nth(1).unwrap_or(&self.name)
+    }
 }
 
 struct TNode {
@@ -336,7 +365,7 @@ fn city_match(cities: &[CityEntry], ax: i32, ay: i32, name: &str) -> Option<usiz
     let folded = fold_polish(&name.to_uppercase());
     let mut best: Option<(f64, usize)> = None;
     for (i, c) in cities.iter().enumerate() {
-        if fold_polish(&c.name.to_uppercase()) != folded {
+        if c.search_key() != folded {
             continue;
         }
         let (clon, clat) = (c.lon_pau as f64 / deg, c.lat_pau as f64 / deg);
@@ -575,8 +604,9 @@ pub fn selfcheck(data: &[u8], stock: &[u8], cities: &[CityEntry]) -> Result<(), 
     let oy = i32::from_le_bytes(stock[119 + 20..119 + 24].try_into().unwrap()) as i64;
     let q = 1i64 << CITY_POS_SHIFT;
     for (e, w) in nl.elements.iter().zip(want.iter()) {
-        if e.name != w.name {
-            return Err(format!("name {} != expected {}", e.name, w.name));
+        // `e.name` is the display form (post-first-TAB); compare against the entry's display line.
+        if e.name != w.display_name() {
+            return Err(format!("name {} != expected {}", e.name, w.display_name()));
         }
         let ax = ox + ((e.x_pau as i64) << CITY_POS_SHIFT);
         let ay = oy + ((e.y_pau as i64) << CITY_POS_SHIFT);

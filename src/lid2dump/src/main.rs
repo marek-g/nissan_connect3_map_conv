@@ -834,6 +834,7 @@ fn dump_binary(
                         "element_count": nl.element_count,
                         "block_count": nl.block_count,
                         "origin": nl.origin,
+                        "categories": nl.categories,
                         "filtered": !filters.is_empty(),
                         "elements": nl.elements.iter().enumerate()
                             .filter(|(_, e)| name_keep(&e.name))
@@ -842,6 +843,7 @@ fn dump_binary(
                                 "block": e.block,
                                 "name": e.name,
                                 "sort_name": e.sort_name,
+                                "category": e.category,
                                 "display": e.name != e.sort_name,
                                 "x_pau": e.x_pau,
                                 "y_pau": e.y_pau,

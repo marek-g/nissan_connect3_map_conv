@@ -39,9 +39,12 @@ fn main() {
             ("ŁÓDŹ", 19.4560, 51.7592),
         ]
         .iter()
-        .map(|(n, lo, la)| CityEntry::from_deg(n, *lo, *la))
-        .collect(),
+            .map(|(n, lo, la)| CityEntry::from_deg(n, *lo, *la))
+            .collect(),
     };
+    // Give diacritic cities an ASCII-folded search key as line 1 + the diacritic display form as
+    // line 2 (stock shape `GDANSK\tGDAŃSK`); the device searches line 1 (ASCII type-in).
+    let cities: Vec<CityEntry> = cities.iter().map(|c| c.with_ascii_fold()).collect();
     let mut sorted: Vec<&CityEntry> = cities.iter().collect();
     sorted.sort_unstable_by_key(|c| c.name.as_bytes());
     println!(
