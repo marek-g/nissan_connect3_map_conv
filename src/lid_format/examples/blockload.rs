@@ -12,6 +12,14 @@ fn main() {
             }
         };
         let nb = h.nb as usize;
+        println!(
+            "{short} HDR: nrel={} rel_files={:?} cats={:?} nrec={} (nb*nrel={})",
+            h.nrel,
+            h.rel_files,
+            h.cats,
+            h.nrec,
+            h.nb as u32 * h.nrel as u32
+        );
         let mut fails = Vec::new();
         for bi in 0..nb.min(if short.contains("LID20001") || short.contains("STOCK") {
             3

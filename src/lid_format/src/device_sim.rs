@@ -1040,6 +1040,358 @@ pub fn walk_ui(bl: &BlockLoad) -> UiWalk {
     w
 }
 
+/// Replicate the device's `NLAsfBlock::CalculateFirstEdgeIndex`/`ProcessNode` (00cdc018/00cdbf88):
+/// forward-preorder traversal from node 0. `first_edge[n]` = cumulative out-degree of all nodes
+/// visited before n; node n's children live at derived ids `[first_target[n], first_target[n]+deg[n])`
+/// with `first_target[n] = edge_base + first_edge[n]` (edge_base=1 for the tree rooted at 0, bumped
+/// per forest component). Target of flat edge e belonging to node n = `e + first_target[n] - first_edge[n]`.
+fn first_edge_target(degs: &[u32]) -> (Vec<usize>, Vec<usize>) {
+    let nc = degs.len();
+    let mut fe = vec![0usize; nc];
+    let mut ft = vec![0usize; nc];
+    let mut acc = 0usize;
+    let mut seen = vec![false; nc];
+    fn rec(
+        n: usize,
+        edge_base: usize,
+        degs: &[u32],
+        fe: &mut Vec<usize>,
+        ft: &mut Vec<usize>,
+        acc: &mut usize,
+        seen: &mut Vec<bool>,
+    ) -> usize {
+        if n >= degs.len() || seen[n] {
+            return 0;
+        }
+        seen[n] = true;
+        fe[n] = *acc;
+        let d = degs[n] as usize;
+        ft[n] = edge_base + *acc;
+        *acc += d;
+        let mut cnt = 1usize;
+        for i in 0..d {
+            cnt += rec(ft[n] + i, edge_base, degs, fe, ft, acc, seen);
+        }
+        cnt
+    }
+    let mut node = 0usize;
+    let mut edge_base = 1usize;
+    while node < nc {
+        let sz = rec(node, edge_base, degs, &mut fe, &mut ft, &mut acc, &mut seen);
+        if sz == 0 {
+            break;
+        }
+        node += sz;
+        edge_base += 1;
+    }
+    (fe, ft)
+}
+
+/// Faithful replica of the FLI city name-search trie walk over one block:
+/// `bGetNextValidCharacters` -> `bGoToBestMatchingEdge` -> `u32FindBestMatchingEdge`, using the
+/// device's numbering (`CalculateFirstEdgeIndex`/`ProcessNode`): node n's edges are flat indices
+/// `[first_edge[n], first_edge[n]+degs[n])`, flat edge e of node n -> child node
+/// `e + first_target[n] - first_edge[n]`, edge label = blob[offs[e]..offs[e+1]], element span =
+/// claims[e]. Walks `query` from the block root; reports each step and whether a leaf (a city,
+/// degs==0) is reached exactly when the query is consumed. Empty-label edges are never offered.
+pub struct WalkTrace {
+    pub steps: Vec<String>,
+    pub success: bool,
+    pub element_id: Option<u32>,
+    pub message: String,
+}
+
+pub fn walk_city_query(b: &[u8], h: &NlHeader, bi: usize, query: &str) -> Result<WalkTrace, Gate> {
+    let base = if bi == 0 {
+        h.blob_end
+    } else {
+        h.streams[1][bi] as usize
+    };
+    let nc = u16le(b, base) as usize;
+    let ndesc = u16le(b, base + 6) as usize;
+    let toc = base + 8;
+    let mut rows: Vec<(u16, u32, u32)> = Vec::with_capacity(ndesc + 1); // (tag,start,count)
+    for i in 0..=ndesc {
+        let o = toc + i * 12;
+        if o + 12 > b.len() {
+            break;
+        }
+        rows.push((u16le(b, o), u32le(b, o + 4), u32le(b, o + 8)));
+    }
+    let win_of = |i: usize| -> u32 {
+        if i + 1 < rows.len() {
+            rows[i + 1].1.wrapping_sub(rows[i].1)
+        } else {
+            let p = toc + rows.len() * 12 + 8;
+            let g = if p + 4 <= b.len() {
+                u32le(b, p)
+            } else {
+                u32::MAX
+            };
+            g.wrapping_sub(rows[i].1)
+        }
+    };
+    let mut o_loff: Option<Desc> = None; // 0x8403 edge offsets
+    let mut o_blob: Option<Desc> = None; // 0x0403 label blob (nib 0)
+    let mut o_claim: Option<Desc> = None; // 0x0406 claims
+    let mut o_deg: Option<Desc> = None; // 0x0401 out-degrees
+    for (i, r) in rows.iter().enumerate() {
+        let code = u16le(b, toc + i * 12 + 2) as u8;
+        let d = Desc {
+            start: r.1,
+            win: win_of(i),
+            count: r.2,
+            code,
+        };
+        match r.0 {
+            0x8403 => o_loff = Some(d),
+            0x0403 => o_blob = Some(d),
+            0x0406 => o_claim = Some(d),
+            0x0401 => o_deg = Some(d),
+            _ => {}
+        }
+    }
+    let (o_loff, o_blob, o_claim, o_deg) = match (o_loff, o_blob, o_claim, o_deg) {
+        (Some(a), Some(bb), Some(cc), Some(dd)) => (a, bb, cc, dd),
+        _ => return Err(Gate("walk: missing edge/blob/claim/deg descriptor".into())),
+    };
+    let (_, degs, _) = std_decode(b, base, o_deg, nc, false);
+    if degs.len() != nc {
+        return Err(Gate(format!("walk: degs {} != nc {}", degs.len(), nc)));
+    }
+    let nel = o_loff.count as usize;
+    let (ok, offs, _) = std_decode(b, base, o_loff, nel, true);
+    if !ok || offs.len() != nel {
+        return Err(Gate("walk: 0x8403 loffs decode fail".into()));
+    }
+    let (ok, claims, _) = std_decode(b, base, o_claim, o_claim.count as usize, true);
+    if !ok {
+        return Err(Gate("walk: 0x0406 claims decode fail".into()));
+    }
+    let blob_start = base + o_blob.start as usize;
+    let blob_len = o_blob.count as usize;
+    if blob_start + blob_len > b.len() {
+        return Err(Gate("walk: blob out of range".into()));
+    }
+    let blob = &b[blob_start..blob_start + blob_len];
+
+    let (fe, ft) = first_edge_target(&degs);
+    let label_span = |e: usize| -> (usize, usize) {
+        let a = offs[e] as usize;
+        let bb = if e + 1 < offs.len() {
+            offs[e + 1] as usize
+        } else {
+            blob_len
+        };
+        (a.min(blob_len), bb.min(blob_len))
+    };
+
+    let qb: Vec<u8> = query.bytes().collect();
+    let mut node = 0usize;
+    let mut qi = 0usize;
+    let mut span_start = 0usize;
+    let mut steps = Vec::new();
+    loop {
+        let d = degs[node] as usize;
+        if d == 0 {
+            return Ok(WalkTrace {
+                success: qi >= qb.len(),
+                element_id: if qi >= qb.len() { Some(span_start as u32) } else { None },
+                message: if qi >= qb.len() {
+                    format!("leaf node {node} reached with full query -> element {span_start}")
+                } else {
+                    format!(
+                        "STUCK: leaf node {node} reached but query not consumed (pos {qi}/{}): prefix-only, not an exact city",
+                        qb.len()
+                    )
+                },
+                steps,
+            });
+        }
+        let mut matched: Option<usize> = None;
+        for i in 0..d {
+            let e = fe[node] + i;
+            if e >= offs.len() {
+                break;
+            }
+            let (a, bb) = label_span(e);
+            let lab = &blob[a..bb];
+            if !lab.is_empty() && qi + lab.len() <= qb.len() && &qb[qi..qi + lab.len()] == lab {
+                matched = Some(e);
+                break;
+            }
+        }
+        match matched {
+            Some(e) => {
+                let (a, bb) = label_span(e);
+                let lab = String::from_utf8_lossy(&blob[a..bb]).to_string();
+                let child = e + ft[node] - fe[node];
+                if child >= nc {
+                    return Ok(WalkTrace {
+                        steps,
+                        success: false,
+                        element_id: None,
+                        message: format!("STUCK: edge {e} target node {child} out of range (nc={nc})"),
+                    });
+                }
+                let before: usize = (fe[node]..e)
+                    .filter(|&x| x < claims.len())
+                    .map(|x| claims[x] as usize)
+                    .sum();
+                steps.push(format!(
+                    "node {node} (deg {d}, elem-span {}) --'{lab}'--> edge {} -> node {} (claim {})",
+                    span_start,
+                    e,
+                    child,
+                    claims.get(e).copied().unwrap_or(0)
+                ));
+                span_start += before;
+                node = child;
+                qi += bb - a;
+            }
+            None => {
+                if qi >= qb.len() {
+                    // Query fully consumed at a non-leaf node: prefix match. The device surfaces the
+                    // elements in this node's subtree as candidates (e.g. "GDANSK" -> "GDAŃSK": line-1
+                    // ASCII is a prefix of the full "FOLDED\tDIACRITIC" entry, next edge is '\t').
+                    let sub: usize = (0..d)
+                        .filter_map(|i| claims.get(fe[node] + i).copied())
+                        .map(|c| c as usize)
+                        .sum();
+                    return Ok(WalkTrace {
+                        success: true,
+                        element_id: Some(span_start as u32),
+                        message: format!(
+                            "PREFIX MATCH at node {node} (deg {d}): query consumed; {} element(s) under this node (span start {span_start}) — device surfaces them as candidates",
+                            sub
+                        ),
+                        steps,
+                    });
+                }
+                let ch = qb
+                    .get(qi)
+                    .map(|c| format!("{:#02x}", c))
+                    .unwrap_or_else(|| "<eof>".into());
+                let avail: Vec<String> = (0..d)
+                    .filter_map(|i| {
+                        let e = fe[node] + i;
+                        if e >= offs.len() {
+                            return None;
+                        }
+                        let (a, bb) = label_span(e);
+                        Some(format!(
+                            "'{}'(c{})",
+                            String::from_utf8_lossy(&blob[a..bb]),
+                            claims.get(e).copied().unwrap_or(0)
+                        ))
+                    })
+                    .collect();
+                return Ok(WalkTrace {
+                    steps,
+                    success: false,
+                    element_id: None,
+                    message: format!(
+                        "STUCK at node {node}: no offered edge matches query byte {ch} (pos {qi}/{}); available = {:?}",
+                        qb.len(),
+                        avail
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Decode a block's edge structure into `node -> [(label, child_node, claim)]` using the device's
+/// faithful numbering (`CalculateFirstEdgeIndex`/`ProcessNode`: first_edge = cumulative out-degree
+/// in forward-preorder; edge e of node n -> child `e + first_target[n] - first_edge[n]`). Diagnostic
+/// for isolating whether our 0x8403/0x0403/0x0406 streams encode each node's children in the order
+/// the device reads them.
+pub fn dump_block_edges(b: &[u8], h: &NlHeader, bi: usize) -> Result<Vec<(usize, Vec<(String, usize, u32)>)>, Gate> {
+    let base = if bi == 0 {
+        h.blob_end
+    } else {
+        h.streams[1][bi] as usize
+    };
+    let nc = u16le(b, base) as usize;
+    let ndesc = u16le(b, base + 6) as usize;
+    let toc = base + 8;
+    let mut rows: Vec<(u16, u32, u32)> = Vec::with_capacity(ndesc + 1);
+    for i in 0..=ndesc {
+        let o = toc + i * 12;
+        if o + 12 > b.len() {
+            break;
+        }
+        rows.push((u16le(b, o), u32le(b, o + 4), u32le(b, o + 8)));
+    }
+    let win_of = |i: usize| -> u32 {
+        if i + 1 < rows.len() {
+            rows[i + 1].1.wrapping_sub(rows[i].1)
+        } else {
+            let p = toc + rows.len() * 12 + 8;
+            let g = if p + 4 <= b.len() {
+                u32le(b, p)
+            } else {
+                u32::MAX
+            };
+            g.wrapping_sub(rows[i].1)
+        }
+    };
+    let mut o_loff: Option<Desc> = None;
+    let mut o_blob: Option<Desc> = None;
+    let mut o_claim: Option<Desc> = None;
+    let mut o_deg: Option<Desc> = None;
+    for (i, r) in rows.iter().enumerate() {
+        let code = u16le(b, toc + i * 12 + 2) as u8;
+        let d = Desc {
+            start: r.1,
+            win: win_of(i),
+            count: r.2,
+            code,
+        };
+        match r.0 {
+            0x8403 => o_loff = Some(d),
+            0x0403 => o_blob = Some(d),
+            0x0406 => o_claim = Some(d),
+            0x0401 => o_deg = Some(d),
+            _ => {}
+        }
+    }
+    let (o_loff, o_blob, o_claim, o_deg) = match (o_loff, o_blob, o_claim, o_deg) {
+        (Some(a), Some(bb), Some(cc), Some(dd)) => (a, bb, cc, dd),
+        _ => return Err(Gate("dump: missing descriptor".into())),
+    };
+    let (_, degs, _) = std_decode(b, base, o_deg, nc, false);
+    let nel = o_loff.count as usize;
+    let (_, offs, _) = std_decode(b, base, o_loff, nel, true);
+    let (_, claims, _) = std_decode(b, base, o_claim, o_claim.count as usize, true);
+    let blob_start = base + o_blob.start as usize;
+    let blob_len = o_blob.count as usize;
+    let blob = &b[blob_start..blob_start + blob_len.min(b.len() - blob_start)];
+    let (fe, ft) = first_edge_target(&degs);
+    let mut out = Vec::with_capacity(nc);
+    for n in 0..nc {
+        let d = degs.get(n).copied().unwrap_or(0) as usize;
+        let mut edges = Vec::new();
+        for i in 0..d {
+            let e = fe[n] + i;
+            if e >= offs.len() {
+                break;
+            }
+            let a = offs[e] as usize;
+            let bb = if e + 1 < offs.len() {
+                offs[e + 1] as usize
+            } else {
+                blob_len
+            };
+            let (a, bb) = (a.min(blob.len()), bb.min(blob.len()));
+            let lab = String::from_utf8_lossy(&blob[a..bb]).to_string();
+            edges.push((lab, e + ft[n] - fe[n], claims.get(e).copied().unwrap_or(0)));
+        }
+        out.push((n, edges));
+    }
+    Ok(out)
+}
+
 /// Replica of `LISA_tclAddressSearch::vPopulateCityIndices` `00c73b68` candidate collection +
 /// keep-gates, given the city name-list, its REL matrices and the RSI context ranges.
 /// Device chain (all CONFIRMED 2026-09-25): RSI ranges -> `bUpdateRange` `00c8c23c` ->
